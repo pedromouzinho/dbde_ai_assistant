@@ -9,6 +9,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -186,6 +187,47 @@ function renderInline(text) {
     return text;
 }
 
+function renderPlotlyChart(containerId, chartSpec) {
+    // chartSpec = { type, data: [{x,y,type,...}], layout: {title,...}, config: {...} }
+    if (!window.Plotly) {
+        console.warn("[Chart] Plotly not loaded yet");
+        return;
+    }
+    const el = document.getElementById(containerId);
+    if (!el) return;
+
+    const defaultLayout = {
+        font: { family: "Montserrat, sans-serif", size: 12 },
+        paper_bgcolor: "transparent",
+        plot_bgcolor: "transparent",
+        margin: { l: 50, r: 20, t: 40, b: 40 },
+        height: 350,
+        colorway: ["#DE3163", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4", "#F44336", "#8BC34A"],
+    };
+
+    const defaultConfig = {
+        displayModeBar: true,
+        modeBarButtonsToRemove: ["lasso2d", "select2d"],
+        displaylogo: false,
+        responsive: true,
+        toImageButtonOptions: { format: "svg", filename: chartSpec.layout?.title?.text || "chart" },
+    };
+
+    const layout = { ...defaultLayout, ...(chartSpec.layout || {}) };
+    const config = { ...defaultConfig, ...(chartSpec.config || {}) };
+
+    try {
+        if (el.data) {
+            window.Plotly.react(el, chartSpec.data || [], layout, config);
+        } else {
+            window.Plotly.newPlot(el, chartSpec.data || [], layout, config);
+        }
+    } catch (e) {
+        console.warn("[Chart] Plotly render error, retrying with newPlot:", e);
+        window.Plotly.newPlot(el, chartSpec.data || [], layout, config);
+    }
+}
+
 // ─── Export conversation as HTML file ────────────────────────────────────────
 function exportConversation(messages, title) {
     const msgs = messages.filter(m => m.role === "user" || m.role === "assistant");
@@ -253,6 +295,18 @@ function getFirstExportableData(toolResults) {
 
 function messageHasExportableData(message) {
     return !!getFirstExportableData(message?.tool_results);
+}
+
+function getChartSpecs(toolResults) {
+    if (!Array.isArray(toolResults)) return [];
+    const charts = [];
+    for (const tr of toolResults) {
+        const parsed = _parseToolResult(tr);
+        if (parsed && parsed._chart) {
+            charts.push(parsed._chart);
+        }
+    }
+    return charts;
 }
 
 // ─── Feedback widget ────────────────────────────────────────────────────────
@@ -355,6 +409,60 @@ function TypingIndicator({ text }) {
     );
 }
 
+function ChartBlock({ chartSpec, chartId }) {
+    const containerRef = useRef(null);
+
+    useEffect(() => {
+        if (!containerRef.current || !chartSpec) return undefined;
+        let cancelled = false;
+        // Pequeno delay para garantir que o DOM está pronto
+        const timer = setTimeout(() => {
+            if (!cancelled) renderPlotlyChart(chartId, chartSpec);
+        }, 100);
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+            if (window.Plotly) {
+                const el = document.getElementById(chartId);
+                if (el) window.Plotly.purge(el);
+            }
+        }
+    }, [chartSpec, chartId]);
+
+    return React.createElement("div", {
+        style: { margin: "12px 0", background: "white", borderRadius: 12, padding: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }
+    },
+        chartSpec.layout?.title?.text && React.createElement("div", {
+            style: { fontSize: 13, fontWeight: 600, color: "#333", marginBottom: 8 }
+        }, chartSpec.layout.title.text),
+        React.createElement("div", {
+            id: chartId,
+            ref: containerRef,
+            style: { width: "100%", minHeight: 300 }
+        }),
+        React.createElement("div", {
+            style: { display: "flex", gap: 6, marginTop: 8 }
+        },
+            React.createElement("button", {
+                className: "export-btn",
+                onClick: () => {
+                    const el = document.getElementById(chartId);
+                    if (el && window.Plotly) window.Plotly.downloadImage(el, { format: "svg", filename: (chartSpec.layout?.title?.text || "chart").replace(/[^a-zA-Z0-9]/g, "_") });
+                },
+                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif" }
+            }, "⬇ SVG"),
+            React.createElement("button", {
+                className: "export-btn",
+                onClick: () => {
+                    const el = document.getElementById(chartId);
+                    if (el && window.Plotly) window.Plotly.downloadImage(el, { format: "png", width: 1200, height: 600, filename: (chartSpec.layout?.title?.text || "chart").replace(/[^a-zA-Z0-9]/g, "_") });
+                },
+                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif" }
+            }, "⬇ PNG")
+        )
+    );
+}
+
 // ─── Message bubble ─────────────────────────────────────────────────────────
 function MessageBubble({ message, isLastAssistant, conversationId, messageIndex, onFeedback, onExport }) {
     const isUser = message.role === "user";
@@ -392,6 +500,14 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
                 style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", wordBreak: "break-word" },
                 dangerouslySetInnerHTML: { __html: renderMarkdown(content) },
             }),
+            // Charts
+            getChartSpecs(message.tool_results).map((spec, ci) =>
+                React.createElement(ChartBlock, {
+                    key: "chart-" + ci,
+                    chartSpec: spec,
+                    chartId: "chart-" + messageIndex + "-" + ci,
+                })
+            ),
             messageHasExportableData(message) && React.createElement("div", {
                 style: { display: "flex", gap: 4, marginTop: 8, flexWrap: "wrap" }
             },
@@ -748,7 +864,7 @@ function App() {
     async function switchMode(newMode) {
         setAgentMode(newMode);
         if (active && active.id) {
-            try { await fetch(API_URL + "/api/mode/switch", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: active.id, mode: newMode }) }); } catch {}
+            try { await fetch(API_URL + "/api/mode/switch", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: active.id, mode: newMode }) }); } catch (e) { console.warn("Mode switch sync failed:", e); }
         }
         if (active) {
             const label = newMode === "userstory" ? "User Story Writer" : "Assistente Geral";
@@ -876,7 +992,7 @@ function App() {
                             if (toolDetails && toolDetails.length > 0) {
                                 for (const td of toolDetails) {
                                     if (td.result_json) {
-                                        try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch {}
+                                        try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch (e) { console.warn("Tool result parse failed (stream):", e); }
                                     }
                                 }
                             }
@@ -930,7 +1046,7 @@ function App() {
                     if (data.tool_details) {
                         for (const td of data.tool_details) {
                             if (td.result_json) {
-                                try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch {}
+                                try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch (e) { console.warn("Tool result parse failed (sync):", e); }
                             }
                         }
                     }
@@ -1019,7 +1135,7 @@ function App() {
     async function submitFeedback(convId, msgIdx, rating, note) {
         try {
             await fetch(API_URL + "/feedback", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: convId, message_index: msgIdx, rating, note: note || "" }) });
-        } catch {}
+        } catch (e) { console.warn("Submit feedback failed:", e); }
     }
 
     function handleKeyDown(e) {

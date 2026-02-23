@@ -1,19 +1,16 @@
-
 ---
-title: "My Document"
 output:
   pdf_document:
     latex_engine: xelatex
 ---
 
 
-
-# DBDE AI Assistant v7.0.4 — Complete Project Handoff
+# DBDE AI Assistant v7.0.5 — Complete Project Handoff
 
 > **Documento de contexto completo para continuacao do projecto.**
 > Ultima actualizacao: 2026-02-23
 > Autor: Pedro Mousinho, DIT/ADMChannels, Millennium BCP
-> Versao actual em producao: **v7.0.4** (Fase 1B Quick Wins Completa)
+> Versao actual em producao: **v7.0.5** (Fase 3.1/3.2/3.3 + hotfixes de auditoria deployados em 2026-02-23; faltam 3.4/3.5)
 
 ---
 
@@ -33,7 +30,7 @@ Assistente de IA interno do Millennium BCP para a equipa DIT/ADMChannels. Permit
 
 ```
 app.py (487 linhas)        -- FastAPI routes, wiring, feedback indexing, endpoints
-agent.py (391 linhas)      -- Agent loop (sync + SSE streaming), ephemeral injection, tool execution
+agent.py (~520 linhas)     -- Agent loop (sync + SSE streaming), ephemeral injection, tool execution, persistent memory (write-through + lazy-load)
 auth.py (103 linhas)       -- JWT encode/decode, password hashing, FastAPI dependency
 config.py (142 linhas)     -- TODAS as env vars e constantes centralizadas
 export_engine.py (331)     -- Export CSV/XLSX/PDF/SVG/HTML
@@ -41,7 +38,7 @@ learning.py (119 linhas)   -- Aprendizagem adaptativa: regras, few-shot, cache (
 llm_provider.py (691)      -- Abstraccao multi-modelo (Azure OpenAI + Anthropic)
 models.py (175 linhas)     -- Pydantic models (request/response)
 storage.py (206 linhas)    -- Azure Table Storage REST API (sem SDK)
-tools.py (411 linhas)      -- 7 tools + system prompts + tool definitions
+tools.py (~600 linhas)     -- 9 tools (incl. create_workitem + generate_chart) + system prompts + tool definitions
 ```
 
 **Cadeia de imports (sem circularidades):**
@@ -56,7 +53,7 @@ app.py -> agent.py -> learning.py -> tools.py -> llm_provider.py -> config.py
 static/index.html (1256 linhas) -- React app, CDN-loaded, zero build step
 ```
 
-React 18 via CDN (`unpkg.com`), Babel standalone, Montserrat font. Componentes: LoginScreen, UserMenu, FeedbackWidget (1-10), MessageBubble, ToolBadges, ModelTierSelector. SSE streaming com fallback sync.
+React 18 via CDN (`unpkg.com`), Babel standalone, Montserrat font. Plotly.js 2.35.2 via CDN (`cdn.plot.ly`, defer). Componentes: LoginScreen, UserMenu, FeedbackWidget (1-10), MessageBubble, ToolBadges, ModelTierSelector, **ChartBlock** (Plotly render + SVG/PNG download). SSE streaming com fallback sync. Funcoes de chart: `renderPlotlyChart()`, `getChartSpecs()` (extrai `_chart` de tool_results), `ChartBlock` (useRef+useEffect para render async).
 
 ### 2.3 Fluxo de dados
 
@@ -82,7 +79,7 @@ Browser -> POST /chat/agent (ou /chat/agent/stream para SSE)
 
 **NOTA IMPORTANTE:** Os modelos Anthropic requerem `ANTHROPIC_API_KEY` configurado. Actualmente **nao esta activo** -- a quota no Azure AI Foundry ainda nao foi aprovada. O sistema faz fallback para Azure OpenAI (GPT-4.1-mini). Quando a key estiver disponivel, basta adicionar `ANTHROPIC_API_KEY` nas App Settings.
 
-### 2.5 7 Tools disponiveis
+### 2.5 9 Tools disponiveis
 
 | Tool | Funcao |
 |------|--------|
@@ -93,6 +90,8 @@ Browser -> POST /chat/agent (ou /chat/agent/stream para SSE)
 | `generate_user_stories` | Gera USs novas baseadas em padroes reais |
 | `query_hierarchy` | Hierarquias parent/child (Epic->Feature->US->Task) |
 | `compute_kpi` | KPIs, rankings, distribuicoes, tendencias (ate 1000 items) |
+| `create_workitem` | **NOVO v7.0.5** — Cria work items no DevOps via JSON Patch. Requer confirmacao explicita do user. |
+| `generate_chart` | **NOVO Fase 3** — Gera graficos interactivos (bar/pie/line/scatter/histogram/hbar). Retorna `_chart` Plotly spec. Multi-series suportado. |
 
 ---
 
@@ -322,7 +321,7 @@ Os modelos Claude (Sonnet/Opus) requerem `ANTHROPIC_API_KEY`. A quota no Azure A
 
 ### 8.2 Conversas in-memory (parcialmente resolvido em v7.0.3)
 
-As conversas do agent vivem em memoria via `ConversationStore` (implementado na Tarefa 1.3). O store tem MAX_CONVERSATIONS=200, TTL=4h e eviction LRU. Ao reiniciar a app, conversas perdem-se (write-through para Table Storage planeado na Fase 2, Tarefa 2.2-2.3). O frontend envia dados directamente no pedido de export como fallback.
+As conversas do agent vivem em memoria via `ConversationStore` (implementado na Tarefa 1.3). O store tem MAX_CONVERSATIONS=200, TTL=4h e eviction LRU. **A partir de v7.0.5 (hotfix 2026-02-23)**, as conversas sao persistidas no Azure Table Storage (`ChatHistory`, PK=`user_id`, RK=`conv_id`) via write-through apos cada turno (Tarefa 2.2 + hardening posterior). Ao reiniciar a app, conversas sao lazy-loaded do storage quando o frontend envia o mesmo `conv_id` (Tarefa 2.3). `_persist_conversation()` comprime tool results, reduz conteudo multimodal (base64 omitido) e limita o payload ao limite do Table Storage. `_load_conversation_from_storage()` substitui o system prompt pelo actual (pode ter mudado entre deploys). O frontend envia dados directamente no pedido de export como fallback.
 
 ### 8.3 Rate limiting (resolvido em v7.0.3)
 
@@ -360,11 +359,11 @@ O streaming SSE funciona para texto puro, mas quando ha tool calls, o fluxo e: c
 
 ### 9.4 Backlog (longo prazo)
 
-- **Criar work items no DevOps** -- actualmente so le, nao cria. Requer cuidado com permissoes e validacao
+- ~~**Criar work items no DevOps**~~ -- FEITO em v7.0.5 (tool `create_workitem`)
 - **Excel Add-in** -- sidebar nativa no Excel que chama a API do assistente. Requer deployment AppSource ou sideloading corporativo. MVP: 2-4 semanas
 - **Dashboard admin** -- visualizacao de metricas de utilizacao, feedback trends, gestao de regras
 - **Multi-tenant** -- suporte para multiplas equipas com areas DevOps diferentes
-- **Persistent conversations server-side** -- migrar de in-memory para Table Storage no backend
+- ~~**Persistent conversations server-side**~~ -- FEITO em v7.0.5 (write-through + lazy-load)
 
 ### 9.5 Descartado / Baixo ROI
 
@@ -436,6 +435,48 @@ O streaming SSE funciona para texto puro, mas quando ha tool calls, o fluxo e: c
 **Validacao:** `/api/info` v7.0.4, `/health` healthy, resposta directa sem tools para perguntas conceptuais, upload SVG aceite, tabelas com scroll horizontal, export por mensagem funcional (sync e streaming)
 **Nota:** Hotfix aplicado pelo Pedro durante validacao — SSE path nao persistia tool_details na mensagem final
 **Data:** 2026-02-23
+
+### v7.0.4 -> v7.0.5 (Fase 2 — DevOps Write + Memoria Persistente)
+
+| # | Tarefa | Fix | Ficheiros |
+|---|--------|-----|-----------|
+| 2.1 | **Tool create_workitem** — agente passa de leitor a escritor | Nova `tool_create_workitem()` com JSON Patch (`application/json-patch+json`), retry inline (3 tentativas), extrai `_links.html.href`. TOOLS array com 8 entries. System prompt com routing rule 8 e regra critica de confirmacao | `tools.py` |
+| 2.2 | **Write-through para Table Storage** — conversas sobrevivem a restarts | `_persist_conversation()` fire-and-forget via `asyncio.create_task`. Comprime tool results (>500 chars → summary), limita user/assistant a 8000 chars, fallback para ultimas 10 msgs se >60KB. Upsert real: query→insert/merge (table_merge nao cria entidades novas) | `agent.py` |
+| 2.3 | **Lazy-load de conversas** — continuidade apos restart | `_load_conversation_from_storage()` carrega de ChatHistory (PK=chat, RK=conv_id). System prompt substituido pelo actual (pode mudar entre deploys). `_ensure_conversation()` agora async. Call sites actualizados com await em sync e stream | `agent.py` |
+| — | **Hotfix: PDF export 500** — fpdf2 crashava com Unicode fora de Latin-1 | `_latin1_safe()` sanitiza strings para core fonts. `to_pdf()` envolvido em try/except com fallback PDF minimo. `safe_filename` em todos os Content-Disposition headers | `export_engine.py`, `app.py` |
+| — | **Hotfix: Export inteligente** — botoes de export apareciam em respostas sem dados | `messageHasExportableData()` + `getFirstExportableData()` verificam payload real. Botoes de export removidos do header, ficam apenas inline por mensagem | `static/index.html` |
+| — | **Hotfix: XLSX sheet title** — caracteres invalidos no titulo da worksheet | `_safe_sheet_title()` sanitiza `[]:*?/\`, fallback "Export", limita 31 chars | `export_engine.py` |
+
+**Ficheiros alterados:** `tools.py`, `agent.py`, `export_engine.py`, `app.py`, `static/index.html`, `config.py`
+**Ficheiros intocados:** `learning.py`, `llm_provider.py`, `models.py`, `storage.py`, `auth.py`
+**Deploy:** Kudu VFS PUT (6 ficheiros) + restart via `restartTrigger.txt` em `/site/wwwroot/`
+**Validacao:** Chat normal OK, exports CSV/XLSX/PDF/HTML OK (titulo com caracteres especiais), create_workitem com fluxo confirmacao OK, persistencia em ChatHistory OK, lazy-load apos restart OK, SSE streaming OK, `/api/info` v7.0.5
+**Data:** 2026-02-23
+
+### v7.0.5 -> (Fase 3 — Charts e Visualizacao, EM PROGRESSO)
+
+| # | Tarefa | Fix | Ficheiros | Estado |
+|---|--------|-----|-----------|--------|
+| 3.1 | **Plotly.js no Frontend** — CDN `plotly-2.35.2.min.js` defer, `renderPlotlyChart()` com branding Millennium (colorway), `ChartBlock` com useRef/useEffect + botoes SVG/PNG, `getChartSpecs()` extrai `_chart` de tool_results | `static/index.html` | FECHADA |
+| 3.2 | **Tool generate_chart** — `tool_generate_chart()` com 6 tipos (bar/pie/line/scatter/histogram/hbar), multi-series via param `series`, retorna `_chart` Plotly spec. TOOLS com 9 entries. System prompt regra 9: "compute_kpi DEPOIS generate_chart" | `tools.py` | FECHADA |
+| 3.3 | **Upload enrichment para charts** — `col_analysis` no endpoint `/upload` com deteccao de tipo (numeric/text por heuristica >60%). `_inject_file_context()` inclui bloco "ANALISE DE COLUNAS" + instrucao para generate_chart | `app.py`, `agent.py` | FECHADA |
+| 3.4 | **Export de charts** — botoes SVG/PNG via `Plotly.downloadImage`. Parcialmente implementado no ChartBlock da 3.1 — pode precisar apenas de validacao | `static/index.html` | PENDENTE |
+| 3.5 | **File generation via prompts** — tool `generate_file` para gerar CSV/XLSX/PDF a partir de dados estruturados | `tools.py`, `app.py`, `export_engine.py`, `static/index.html` | PENDENTE |
+
+**Nota:** 3.1-3.3 implementadas pelo Codex, validadas arquiteturalmente pelo Claude e **deployadas em producao** (2026-02-23). Tarefas 3.4-3.5 ainda nao foram enviadas ao Codex.
+**Deploy executado:** Kudu VFS PUT (`tools.py`, `agent.py`, `app.py`, `learning.py`, `static/index.html`) + restart via `restartTrigger.txt`.
+
+### v7.0.5 hotfix (2026-02-23, pos-auditoria de robustez)
+
+| Tipo | Fix | Ficheiros |
+|------|-----|-----------|
+| Seguranca | Confirmacao de `create_workitem` reforcada: negações bloqueiam (`nao confirmo`, `nunca`), aprovacoes comuns aceites (`sim`, `avanca`, `podes criar`, `podes avancar`, `claro`, `yep`) | `agent.py` |
+| Dados | `col_analysis` no upload usa delimitador dinamico detectado no CSV (`sep`) em vez de split hardcoded por virgula | `app.py` |
+| Estado | Isolamento por utilizador no ChatHistory (`PartitionKey=user_id`), lock por conversa em sync+stream, compactacao multimodal no write-through | `agent.py` |
+| Frontend | Plotly hardening (`Plotly.react` + `Plotly.purge`) para evitar leaks em sessoes longas | `static/index.html` |
+| Resiliencia | Hardening de `create_workitem` (whitelist de tipo, sanitizacao, `quote`, retry de `RequestError`) | `tools.py` |
+
+**Validacao pos-deploy (executada):** `GET /api/info` -> version `7.0.5`, status `running`; `GET /health` -> status `healthy`, embeddings `ok`, search devops/omni `ok`.
 
 ---
 
@@ -579,34 +620,35 @@ Para updates com novas dependencias:
 
 ---
 
-### FASE 2 — Criar no DevOps + Memoria Persistente (Semana 3, ~10-14 Mar)
+### FASE 2 — Criar no DevOps + Memoria Persistente (Semana 3, ~10-14 Mar) ✅ COMPLETA
 
 **Objectivo:** O agente passa de leitor a escritor. Conversas sobrevivem a restarts.
 
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 2.1 | **Nova tool `create_workitem`** — POST para DevOps API com campos (Title, Description, AcceptanceCriteria, AreaPath, WorkItemType, AssignedTo, Tags). Usa JSON Patch format. O LLM pede confirmacao ao user antes de criar ("Vou criar esta US. Confirmas?") | `tools.py` | 3h | Nenhuma |
-| 2.2 | Tool definition no TOOLS + instrucao no system prompt: "Quando o user confirmar criacao, usa create_workitem. Pergunta SEMPRE antes de criar" | `tools.py` | 1h | 2.1 |
-| 2.3 | **Write-through para Table Storage** — apos cada turno do agent (par user+assistant), serializar `conversations[conv_id]` para `ChatHistory`. Mesmo formato que o frontend usa | `agent.py` | 3h | Fase 1A (ConversationStore) |
-| 2.4 | **Lazy-load em `_ensure_conversation()`** — se conv_id nao esta em memoria mas existe na tabela, fazer load. Conversas sobrevivem a restarts e prepara multi-worker | `agent.py` | 2h | 2.3 |
+| # | Tarefa | Ficheiros | Estado |
+|---|--------|-----------|--------|
+| 2.1 | **Nova tool `create_workitem`** — POST JSON Patch com retry inline, tool definition + routing rule 8 + confirmacao obrigatoria | `tools.py` | FECHADA |
+| 2.2 | **Write-through para Table Storage** — `_persist_conversation()` fire-and-forget, compressao, upsert real (query→insert/merge) | `agent.py` | FECHADA |
+| 2.3 | **Lazy-load em `_ensure_conversation()`** — `_load_conversation_from_storage()`, async conversion, system prompt refresh | `agent.py` | FECHADA |
 
-**Deploy:** Kudu VFS PUT (tools.py, agent.py) + restart
-**Validacao:** "Gera uma US sobre notificacoes push e cria no board" → work item criado no DevOps. Restart app → conversa anterior carrega do storage.
-**Resultado:** v7.0.5
+**Nota:** Tarefas 2.1+2.2 do roadmap original foram consolidadas na Tarefa 2.1 (tool + definition + prompt numa so tarefa). Tarefas 2.3+2.4 originais mapearam para 2.2 (write-through) e 2.3 (lazy-load).
+
+**Deploy:** Kudu VFS PUT (tools.py, agent.py, export_engine.py, app.py, static/index.html, config.py) + restart
+**Validacao:** Todos os 7 testes PASS. v7.0.5 em producao.
+**Data:** 2026-02-23
 
 ---
 
-### FASE 3 — Charts e Visualizacao (Semana 4-5, ~17-28 Mar)
+### FASE 3 — Charts e Visualizacao (Semana 4-5, ~17-28 Mar) EM PROGRESSO
 
 **Objectivo:** Sistema generico de visualizacao. Upload de dados → pedir qualquer tipo de grafico → renderizado no chat.
 
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 3.1 | Adicionar Plotly.js via CDN ao frontend — script tag defer + funcao `renderPlotlyChart(containerId, chartSpec)` generica | `static/index.html` | 3-4h | Nenhuma |
-| 3.2 | Nova tool `generate_chart` — o LLM decide tipo (pie/bar/line/scatter/sankey/heatmap), eixos, dados e devolve JSON chart_spec. Frontend renderiza. A tool NAO gera imagem — so devolve spec | `tools.py`, `static/index.html` | 6-8h | 3.1 |
-| 3.3 | Charts a partir de file upload — enriquecer contexto de upload com nomes de colunas e amostra (10 linhas). User pede "faz um pie chart da coluna X por Y" | `app.py`, `agent.py` | 4-6h | 3.1, 3.2 |
-| 3.4 | Export de charts — botoes "Download SVG" e "Download PNG" em cada grafico (Plotly.downloadImage nativo) | `static/index.html` | 2h | 3.1 |
-| 3.5 | File generation via prompts — tool `generate_file` que o LLM invoca para gerar CSV/XLSX/PDF a partir de dados estruturados. Backend usa `export_engine.py` | `tools.py`, `app.py`, `export_engine.py`, `static/index.html` | 4-6h | Nenhuma |
+| # | Tarefa | Ficheiros | Esforco | Estado |
+|---|--------|-----------|---------|--------|
+| 3.1 | Plotly.js via CDN (2.35.2 defer) + `renderPlotlyChart()` + `ChartBlock` + `getChartSpecs()` | `static/index.html` | 3-4h | ✅ FECHADA |
+| 3.2 | Tool `generate_chart` (bar/pie/line/scatter/histogram/hbar, multi-series, `_chart` spec) + regra 9 system prompt | `tools.py` | 6-8h | ✅ FECHADA |
+| 3.3 | Upload enrichment: `col_analysis` com tipo numeric/text + `_inject_file_context` com instrucao generate_chart | `app.py`, `agent.py` | 4-6h | ✅ FECHADA |
+| 3.4 | Export de charts — botoes SVG/PNG (parcialmente feito no ChartBlock da 3.1, validar) | `static/index.html` | 2h | PENDENTE |
+| 3.5 | File generation via prompts — tool `generate_file` para CSV/XLSX/PDF a partir de dados estruturados | `tools.py`, `app.py`, `export_engine.py`, `static/index.html` | 4-6h | PENDENTE |
 
 **Deploy:** Kudu VFS PUT (todos) + restart. Nao ha dependencias novas (Plotly.js e CDN)
 **Validacao:** Upload Excel → pedir pie chart → ver grafico → download SVG. Query DevOps → pedir bar chart. "Gera-me um Excel com..." → download ficheiro.
@@ -676,13 +718,14 @@ Fev 24-28    Mar 3-7      Mar 10-14     Mar 17-28      Mar 31-Abr4   Abr 7-18   
  FASE 1A      FASE 1B      FASE 2        FASE 3         FASE 4        FASE 5         FASE 6
  Bug Fixes    UX Wins      DevOps Write  Charts &       US Writer     Figma+Miro     Deep
  v7.0.3       v7.0.4       + Memoria     Visualizacao   Pro           + Polish       Analysis
-                           v7.0.5        v7.1.0         v7.1.1        v7.2.0         v7.2.1
+ ✅ DONE      ✅ DONE      ✅ DONE       ⏳ 3/5 DONE   v7.1.1        v7.2.0         v7.2.1
+                           v7.0.5        v7.1.0
 
- [tier fix]   [prompt]     [create_wi]   [Plotly CDN]   [draft→final] [tool registry] [PDF chunk]
- [retry]      [largura]    [write-thru]  [gen_chart]    [profiles]    [figma tool]    [search_doc]
- [logging]    [exports]    [lazy-load]   [upload→chart]  [upload pre] [miro tool]     [digest]
- [eviction]   [SVG input]                [chart export] [PPT]         [streaming opt]
- [fs cache]   [Anthropic?]               [gen_file]                   [fb_mem cap]
+ [tier fix]   [prompt]     [create_wi]   [Plotly CDN]✅  [draft→final] [tool registry] [PDF chunk]
+ [retry]      [largura]    [write-thru]  [gen_chart]✅   [profiles]    [figma tool]    [search_doc]
+ [logging]    [exports]    [lazy-load]   [upload→chart]✅ [upload pre]  [miro tool]     [digest]
+ [eviction]   [SVG input]                [chart export]  [PPT]         [streaming opt]
+ [fs cache]   [Anthropic?]               [gen_file]                    [fb_mem cap]
 ```
 
 ### NOTAS
@@ -876,34 +919,39 @@ DEPLOY: Kudu VFS PUT agent.py + restart
 
 ---
 
-### FASE 3 — CHARTS E VISUALIZACAO (executar por ordem)
+### FASE 3 — CHARTS E VISUALIZACAO (3.1-3.3 FECHADAS, 3.4-3.5 PENDENTES)
 
-#### TAREFA 3.1 — Plotly.js no Frontend
+#### TAREFA 3.1 — Plotly.js no Frontend ✅ FECHADA
+```
+IMPLEMENTADO: Plotly.js 2.35.2 CDN defer. renderPlotlyChart() com Millennium branding (colorway).
+ChartBlock com useRef/useEffect async render + botoes Download SVG/PNG via Plotly.downloadImage.
+getChartSpecs() extrai _chart de tool_results. MessageBubble renderiza charts entre markdown e exports.
+```
+
+#### TAREFA 3.2 — Tool generate_chart ✅ FECHADA
+```
+IMPLEMENTADO: tool_generate_chart() com 6 tipos (bar/pie/line/scatter/histogram/hbar).
+Multi-series via param "series" (array de objetos). Retorna _chart com Plotly spec completo.
+TOOLS array com 9 entries. System prompt regra 9: "compute_kpi DEPOIS generate_chart".
+Dispatch atualizado com generate_chart. Frontend ja suporta _chart da 3.1.
+```
+
+#### TAREFA 3.3 — Charts a Partir de File Upload ✅ FECHADA
+```
+IMPLEMENTADO: app.py /upload: col_analysis com deteccao numeric/text (heuristica >60%).
+col_analysis=[] inicializado defensivamente antes do bloco if. Guardado no uploaded_files_store.
+agent.py _inject_file_context: bloco "ANALISE DE COLUNAS (para graficos)" + instrucao generate_chart.
+```
+
+#### TAREFA 3.4 — Export de Charts (PENDENTE — pode ja estar feita via 3.1)
 ```
 FICHEIROS: static/index.html
-ACCAO: Script tag Plotly.js CDN (defer). Funcao renderPlotlyChart(). Componente React ChartBlock
-        com botoes Download SVG/PNG. MessageBubble detecta campo "_chart" no tool_result.
+ACCAO: Validar que os botoes SVG/PNG do ChartBlock (implementados na 3.1) funcionam correctamente.
+        Se funcionam, marcar como fechada. Se nao, ajustar.
 DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
 ```
 
-#### TAREFA 3.2 — Tool generate_chart
-```
-FICHEIROS: tools.py, static/index.html
-ACCAO: Nova tool "generate_chart" — parametros: chart_type, title, data.
-        Devolve { "_chart": { type, data, layout } }. Frontend renderiza via Plotly.js.
-        System prompt: "Para graficos/charts/visualizacoes de qualquer tipo, usa generate_chart."
-DEPLOY: Kudu VFS PUT tools.py + index.html + restart
-```
-
-#### TAREFA 3.3 — Charts a Partir de File Upload
-```
-FICHEIROS: app.py, agent.py
-ACCAO: Enriquecer contexto de upload com nomes de colunas e amostra (10 linhas).
-        O LLM usa generate_chart com os dados do upload.
-DEPLOY: Kudu VFS PUT app.py + agent.py + restart
-```
-
-#### TAREFA 3.4 — File Generation via Prompts
+#### TAREFA 3.5 — File Generation via Prompts (PENDENTE)
 ```
 FICHEIROS: tools.py, app.py, export_engine.py, static/index.html
 ACCAO: Nova tool "generate_file" (format, title, data, columns).
@@ -911,7 +959,7 @@ ACCAO: Nova tool "generate_file" (format, title, data, columns).
 DEPLOY: Kudu VFS PUT (4 ficheiros) + restart
 ```
 
-**Apos completar 3.1-3.4:** Bump APP_VERSION para "7.1.0" em config.py.
+**Apos completar 3.4-3.5:** Bump APP_VERSION para "7.1.0" em config.py.
 
 ---
 

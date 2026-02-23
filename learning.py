@@ -81,8 +81,8 @@ async def get_learned_rules():
                 top=30,
             )
             _prompt_rules_cache["last_refresh"] = now
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("[Learning] get_learned_rules refresh failed: %s", e)
 
     if not _prompt_rules_cache["rules"]:
         return ""
@@ -142,5 +142,6 @@ async def get_few_shot_examples(question):
             _few_shot_cache.pop(oldest_key, None)
 
         return txt
-    except Exception:
+    except Exception as e:
+        logging.warning("[Learning] get_few_shot_examples failed: %s", e)
         return ""

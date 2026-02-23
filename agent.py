@@ -10,8 +10,10 @@ import json
 import uuid
 import asyncio
 import logging
+import re
+import unicodedata
 from datetime import datetime
-from typing import Dict, List, Any, Optional, AsyncGenerator, Callable, Iterator
+from typing import Dict, List, Optional, AsyncGenerator, Callable, Iterator
 from collections.abc import MutableMapping
 
 from config import (
@@ -19,11 +21,11 @@ from config import (
     AGENT_HISTORY_LIMIT, LLM_DEFAULT_TIER,
 )
 from models import (
-    AgentChatRequest, AgentChatResponse, LLMToolCall, StreamEvent,
+    AgentChatRequest, AgentChatResponse, LLMToolCall,
 )
 from llm_provider import (
     get_provider, llm_with_fallback,
-    make_tool_result_message, make_assistant_message_from_response,
+    make_assistant_message_from_response,
 )
 from learning import get_learned_rules, get_few_shot_examples
 from tools import (
@@ -66,7 +68,7 @@ class ConversationStore(MutableMapping[str, List[dict]]):
         self._last_accessed.pop(key, None)
         if self._on_evict:
             self._on_evict(key)
-        print(f"[ConversationStore] Evicted {key} ({reason})")
+        logging.getLogger(__name__).info("[ConversationStore] Evicted %s (%s)", key, reason)
 
     def _is_expired(self, key: str, now: datetime) -> bool:
         last = self._last_accessed.get(key)
@@ -146,11 +148,13 @@ class ConversationStore(MutableMapping[str, List[dict]]):
 
 conversation_meta: Dict[str, Dict] = {}
 uploaded_files_store: Dict[str, Dict] = {}
+_conversation_locks: Dict[str, asyncio.Lock] = {}
 
 
 def _cleanup_conversation_related_state(conv_id: str) -> None:
     conversation_meta.pop(conv_id, None)
     uploaded_files_store.pop(conv_id, None)
+    _conversation_locks.pop(conv_id, None)
 
 
 conversations = ConversationStore(
@@ -159,6 +163,25 @@ conversations = ConversationStore(
     on_evict=_cleanup_conversation_related_state,
 )
 logger = logging.getLogger(__name__)
+
+
+def _odata_escape(value: str) -> str:
+    return (value or "").replace("'", "''")
+
+
+def _user_partition_key(user: Optional[dict]) -> str:
+    raw = (user or {}).get("sub") or (user or {}).get("username") or "anon"
+    # Azure Table key hygiene: avoid problematic characters for filters/URLs.
+    safe = "".join(c if c.isalnum() or c in "._-@" else "_" for c in str(raw))
+    return (safe or "anon")[:100]
+
+
+def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
+    lock = _conversation_locks.get(conv_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conversation_locks[conv_id] = lock
+    return lock
 
 # =============================================================================
 # HISTORY MANAGEMENT
@@ -205,22 +228,40 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
     """Injeta contexto de ficheiro uploaded na conversa."""
     file_data = uploaded_files_store.get(conv_id)
     if file_data and not conversation_meta.get(conv_id, {}).get("file_injected"):
+        # Mantém só o contexto do último ficheiro para evitar bloat de system prompts.
+        messages[:] = [
+            m for m in messages
+            if not (
+                m.get("role") == "system"
+                and isinstance(m.get("content"), str)
+                and m.get("content", "").startswith("FICHEIRO CARREGADO:")
+            )
+        ]
         ctx = (
             f"FICHEIRO CARREGADO:\nFicheiro: {file_data['filename']}\n"
             f"Linhas: {file_data['row_count']}\nColunas: {', '.join(file_data['col_names'])}\n"
-            f"{'NOTA: Dados truncados.' if file_data.get('truncated') else ''}\n\n"
-            f"CONTEÚDO:\n{file_data['data_text'][:50000]}"
+            f"{'NOTA: Dados truncados.' if file_data.get('truncated') else ''}\n"
         )
+        # Adicionar análise de colunas se disponível
+        col_analysis = file_data.get("col_analysis")
+        if col_analysis:
+            ctx += "\nANÁLISE DE COLUNAS (para gráficos):\n"
+            for ca in col_analysis:
+                ctx += f"  - {ca['name']} ({ca['type']}): ex. {', '.join(ca['sample'][:3])}\n"
+            ctx += "\nNOTA: O utilizador pode pedir gráficos destes dados. Usa generate_chart com os valores extraídos do ficheiro.\n"
+        ctx += f"\nCONTEÚDO:\n{file_data['data_text'][:50000]}"
         messages.append({"role": "system", "content": ctx})
         conversation_meta.setdefault(conv_id, {})["file_injected"] = True
 
 
-async def _load_conversation_from_storage(conv_id: str) -> bool:
+async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> bool:
     """Tenta carregar conversa do Table Storage. Retorna True se encontrou."""
     try:
+        safe_pk = _odata_escape(partition_key)
+        safe_conv = _odata_escape(conv_id)
         rows = await table_query(
             "ChatHistory",
-            f"PartitionKey eq 'chat' and RowKey eq '{conv_id}'",
+            f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
             top=1,
         )
         if not rows:
@@ -257,12 +298,12 @@ async def _load_conversation_from_storage(conv_id: str) -> bool:
         return False
 
 
-async def _ensure_conversation(conv_id: str, mode: str) -> str:
+async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> str:
     """Garante que a conversa existe — tenta lazy-load do Table Storage se não estiver em memória."""
     conversations.cleanup_expired()
     if conv_id not in conversations:
         # Tentar carregar do Table Storage
-        loaded = await _load_conversation_from_storage(conv_id)
+        loaded = await _load_conversation_from_storage(conv_id, partition_key)
         if not loaded:
             # Conversa nova
             sp = get_userstory_system_prompt() if mode == "userstory" else get_agent_system_prompt()
@@ -290,61 +331,162 @@ async def _build_llm_messages(conv_id: str, question: str) -> List[dict]:
     return base
 
 
-async def _persist_conversation(conv_id: str) -> None:
+def _compact_message_for_storage(message: dict) -> dict:
+    compact = dict(message)
+    role = compact.get("role")
+    content = compact.get("content", "")
+
+    if role == "tool":
+        if len(content) > 500:
+            try:
+                data = json.loads(content)
+                summary = {
+                    "total_count": data.get("total_count", "?"),
+                    "items_returned": len(data.get("items", [])),
+                    "_persisted_summary": True,
+                }
+                content = json.dumps(summary, ensure_ascii=False)
+            except (json.JSONDecodeError, TypeError):
+                content = str(content)[:500] + "...(truncado)"
+        compact["content"] = content
+        return compact
+
+    if isinstance(content, str):
+        compact["content"] = content[:8000] + ("...(truncado)" if len(content) > 8000 else "")
+        return compact
+
+    if isinstance(content, list):
+        reduced = []
+        for part in content[:10]:
+            if not isinstance(part, dict):
+                reduced.append(str(part)[:200])
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                txt = str(part.get("text", ""))
+                if len(txt) > 2000:
+                    txt = txt[:2000] + "...(truncado)"
+                reduced.append({"type": "text", "text": txt})
+            elif ptype == "image_url":
+                reduced.append({"type": "image_url", "image_url": {"url": "[base64_omitted]"}})
+            else:
+                reduced.append({"type": str(ptype or "unknown")})
+        compact["content"] = reduced
+        return compact
+
+    if isinstance(content, dict):
+        compact["content"] = json.dumps(content, ensure_ascii=False, default=str)[:2000]
+        return compact
+
+    compact["content"] = str(content)[:2000]
+    return compact
+
+
+def _has_explicit_create_confirmation(conv_id: str) -> bool:
+    def _normalize(text: str) -> str:
+        lowered = (text or "").lower()
+        deaccented = unicodedata.normalize("NFKD", lowered)
+        return "".join(ch for ch in deaccented if not unicodedata.combining(ch))
+
+    approval_patterns = (
+        r"\bconfirmo\b",
+        r"\bconfirmado\b",
+        r"\bsim\b",
+        r"\bavanca\b",
+        r"\bpodes\s+criar\b",
+        r"\bpodes\s+avancar\b",
+        r"\bclaro\b",
+        r"\byep\b",
+        r"\bok,\s*cria\b",
+    )
+    explicit_negative_patterns = (
+        r"\bnao\s+confirmo\b",
+        r"\bnao\s+avanc(?:a|ar|o|es)\b",
+        r"\bnunca\s+confirmo\b",
+        r"\bnunca\s+avanc(?:a|ar|o|es)\b",
+    )
+    negation_tokens = r"\b(nao|nunca|jamais)\b"
+
+    for msg in reversed(conversations.get(conv_id, [])):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            txt = " ".join(
+                str(p.get("text", ""))
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            txt = str(content)
+
+        normalized = _normalize(txt)
+
+        if any(re.search(p, normalized) for p in explicit_negative_patterns):
+            return False
+
+        for pattern in approval_patterns:
+            for match in re.finditer(pattern, normalized):
+                # Bloqueia aprovações com negação imediatamente antes (ex: "não confirmo")
+                prefix = normalized[max(0, match.start() - 24):match.start()]
+                if re.search(negation_tokens, prefix):
+                    return False
+                return True
+        return False
+    return False
+
+
+async def _persist_conversation(conv_id: str, partition_key: str) -> None:
     """Persiste conversa na tabela ChatHistory (fire-and-forget)."""
     try:
-        msgs = conversations.get(conv_id)
-        if not msgs:
-            return
+        async with _get_conversation_lock(conv_id):
+            msgs = conversations.get(conv_id)
+            if not msgs:
+                return
 
-        # Comprimir para caber no limite de 64KB do Table Storage
-        compact = []
-        for m in msgs:
-            if m.get("role") == "tool":
-                # Truncar tool results para reduzir tamanho
-                content = m.get("content", "")
-                if len(content) > 500:
-                    try:
-                        data = json.loads(content)
-                        summary = {
-                            "total_count": data.get("total_count", "?"),
-                            "items_returned": len(data.get("items", [])),
-                            "_persisted_summary": True,
-                        }
-                        content = json.dumps(summary, ensure_ascii=False)
-                    except (json.JSONDecodeError, TypeError):
-                        content = content[:500] + "...(truncado)"
-                compact.append({**m, "content": content})
-            else:
-                # User e assistant msgs: limitar conteúdo a 8000 chars
-                c = m.get("content", "")
-                if isinstance(c, str) and len(c) > 8000:
-                    compact.append({**m, "content": c[:8000] + "...(truncado)"})
-                else:
-                    compact.append(m)
-
-        messages_json = json.dumps(compact, ensure_ascii=False, default=str)
-
-        # Verificar se cabe (Azure Table Storage: 64KB por propriedade)
-        if len(messages_json.encode("utf-8")) > 60000:
-            # Manter apenas as últimas N mensagens
-            compact = [compact[0]] + compact[-10:]  # system + últimas 10
+            compact = [_compact_message_for_storage(m) for m in msgs]
             messages_json = json.dumps(compact, ensure_ascii=False, default=str)
 
-        meta = conversation_meta.get(conv_id, {})
-        entity = {
-            "PartitionKey": "chat",
-            "RowKey": conv_id,
-            "Messages": messages_json,
-            "Mode": meta.get("mode", "general"),
-            "CreatedAt": meta.get("created_at", datetime.now().isoformat()),
-            "UpdatedAt": datetime.now().isoformat(),
-            "MessageCount": len(compact),
-        }
+            # Verificar se cabe (Azure Table Storage: 64KB por propriedade)
+            if len(messages_json.encode("utf-8")) > 60000:
+                compact = [compact[0]] + compact[-10:] if compact else []
+                messages_json = json.dumps(compact, ensure_ascii=False, default=str)
 
+            if len(messages_json.encode("utf-8")) > 60000:
+                head = compact[:1]
+                tail = compact[-4:] if len(compact) > 1 else []
+                compact = head + tail
+                slimmed = []
+                for m in compact:
+                    c = m.get("content", "")
+                    if isinstance(c, str) and len(c) > 1200:
+                        c = c[:1200] + "...(truncado)"
+                    elif isinstance(c, list):
+                        c = [{"type": "summary", "text": "conteúdo multimodal omitido"}]
+                    slimmed.append({"role": m.get("role", ""), "content": c})
+                compact = slimmed
+                messages_json = json.dumps(compact, ensure_ascii=False, default=str)
+
+            if len(messages_json.encode("utf-8")) > 60000:
+                compact = [{"role": "system", "content": "Histórico truncado para persistência."}]
+                messages_json = json.dumps(compact, ensure_ascii=False, default=str)
+
+            meta = conversation_meta.get(conv_id, {})
+            entity = {
+                "PartitionKey": partition_key,
+                "RowKey": conv_id,
+                "Messages": messages_json,
+                "Mode": meta.get("mode", "general"),
+                "CreatedAt": meta.get("created_at", datetime.now().isoformat()),
+                "UpdatedAt": datetime.now().isoformat(),
+                "MessageCount": len(compact),
+            }
+
+        safe_pk = _odata_escape(partition_key)
+        safe_conv = _odata_escape(conv_id)
         existing = await table_query(
             "ChatHistory",
-            f"PartitionKey eq 'chat' and RowKey eq '{conv_id}'",
+            f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
             top=1,
         )
         if existing:
@@ -374,6 +516,16 @@ async def _execute_tool_calls(
         file_data = uploaded_files_store.get(conv_id)
         if tc.name == "generate_user_stories" and file_data and not args.get("context"):
             args["context"] = file_data.get("data_text", "")[:20000]
+        if tc.name == "create_workitem":
+            if _has_explicit_create_confirmation(conv_id):
+                args["confirmed"] = True
+            else:
+                return tc, {
+                    "error": (
+                        "Confirmação explícita necessária para criar work item. "
+                        "Pede ao utilizador para responder 'confirmo' e tenta novamente."
+                    )
+                }
         result = await execute_tool(tc.name, args)
         return tc, result
     
@@ -384,7 +536,7 @@ async def _execute_tool_calls(
     
     for res in results:
         if isinstance(res, Exception):
-            print(f"Tool error: {res}")
+            logger.error("[Agent] Tool execution failed: %s", res)
             continue
         tc, tool_result = res
         tools_used.append(tc.name)
@@ -422,69 +574,71 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
-    
-    await _ensure_conversation(conv_id, mode)
-    _inject_file_context(conv_id, conversations[conv_id])
-    
-    conversations[conv_id].append(_build_user_message(request))
-    conversations[conv_id] = _trim_history(conversations[conv_id])
-    
+    partition_key = _user_partition_key(user)
+
     tools_used = []
     tool_details = []
     total_usage = {}
     model_used = ""
     has_exportable = False
     export_idx = None
-    
-    try:
-        # Agent loop
-        ephemeral = await _build_llm_messages(conv_id, request.question)
-        response = await llm_with_fallback(
-            ephemeral, tools=TOOLS, tier=tier,
-            temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-        )
-        model_used = response.model
-        total_usage = response.usage
-        
-        iteration = 0
-        while response.tool_calls and iteration < AGENT_MAX_ITERATIONS:
-            iteration += 1
-            
-            # Add assistant message with tool calls to history
-            conversations[conv_id].append(
-                make_assistant_message_from_response(response)
-            )
-            
-            # Execute tools
-            tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
-            tools_used.extend(tu)
-            tool_details.extend(td)
-            
-            # Check for exportable data
-            for d in td:
-                if d["result_summary"].get("items_returned", 0) > 0:
-                    has_exportable = True
-                    export_idx = len(tool_details) - 1
-            
-            # Next LLM call
+
+    async with _get_conversation_lock(conv_id):
+        await _ensure_conversation(conv_id, mode, partition_key)
+        _inject_file_context(conv_id, conversations[conv_id])
+
+        conversations[conv_id].append(_build_user_message(request))
+        conversations[conv_id] = _trim_history(conversations[conv_id])
+
+        try:
+            # Agent loop
             ephemeral = await _build_llm_messages(conv_id, request.question)
             response = await llm_with_fallback(
                 ephemeral, tools=TOOLS, tier=tier,
                 temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
             )
-            for k, v in response.usage.items():
-                if isinstance(v, (int, float)):
-                    total_usage[k] = total_usage.get(k, 0) + v
-        
-        answer = response.content or "Não consegui processar a tua pergunta."
-        conversations[conv_id].append({"role": "assistant", "content": answer})
+            model_used = response.model
+            total_usage = response.usage
 
-        # Persist to Table Storage (fire-and-forget)
-        asyncio.create_task(_persist_conversation(conv_id))
-        
-    except Exception as e:
-        logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
-        answer = f"Erro: {str(e)}"
+            iteration = 0
+            while response.tool_calls and iteration < AGENT_MAX_ITERATIONS:
+                iteration += 1
+
+                # Add assistant message with tool calls to history
+                conversations[conv_id].append(
+                    make_assistant_message_from_response(response)
+                )
+
+                # Execute tools
+                tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
+                tools_used.extend(tu)
+                tool_details.extend(td)
+
+                # Check for exportable data
+                for d in td:
+                    if d["result_summary"].get("items_returned", 0) > 0:
+                        has_exportable = True
+                        export_idx = len(tool_details) - 1
+
+                # Next LLM call
+                ephemeral = await _build_llm_messages(conv_id, request.question)
+                response = await llm_with_fallback(
+                    ephemeral, tools=TOOLS, tier=tier,
+                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                )
+                for k, v in response.usage.items():
+                    if isinstance(v, (int, float)):
+                        total_usage[k] = total_usage.get(k, 0) + v
+
+            answer = response.content or "Não consegui processar a tua pergunta."
+            conversations[conv_id].append({"role": "assistant", "content": answer})
+
+            # Persist to Table Storage (fire-and-forget)
+            asyncio.create_task(_persist_conversation(conv_id, partition_key))
+
+        except Exception as e:
+            logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
+            answer = f"Erro: {str(e)}"
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
     
@@ -512,12 +666,8 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
-    
-    await _ensure_conversation(conv_id, mode)
-    _inject_file_context(conv_id, conversations[conv_id])
-    conversations[conv_id].append(_build_user_message(request))
-    conversations[conv_id] = _trim_history(conversations[conv_id])
-    
+    partition_key = _user_partition_key(user)
+
     tools_used = []
     tool_details = []
     total_usage = {}
@@ -526,83 +676,89 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     def _sse(event: dict) -> str:
         return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     
-    # Emit conversation_id immediately
-    yield _sse({"type": "init", "conversation_id": conv_id, "mode": mode})
-    
-    try:
-        provider = get_provider(tier)
-        model_used = getattr(provider, 'model', getattr(provider, 'deployment', ''))
-        
-        iteration = 0
-        need_final_response = True
-        
-        while iteration <= AGENT_MAX_ITERATIONS and need_final_response:
-            iteration += 1
-            
-            yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
-            
-            # Non-streaming call for tool detection
-            ephemeral = await _build_llm_messages(conv_id, request.question)
-            response = await llm_with_fallback(
-                ephemeral, tools=TOOLS, tier=tier,
-                temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-            )
-            for k, v in response.usage.items():
-                if isinstance(v, (int, float)):
-                    total_usage[k] = total_usage.get(k, 0) + v
-            
-            if response.tool_calls:
-                # Add assistant msg with tool calls
-                conversations[conv_id].append(
-                    make_assistant_message_from_response(response)
-                )
-                
-                # Signal tool execution
-                for tc in response.tool_calls:
-                    yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
-                
-                # Execute tools
-                tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
-                tools_used.extend(tu)
-                tool_details.extend(td)
-                
-                for d in td:
-                    count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
-                    yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
-                
-                # Continue loop for next LLM call
-                need_final_response = True
-            else:
-                # Final text response — stream it
-                need_final_response = False
-                
-                if response.content:
-                    # Try to re-do as streaming for token-by-token delivery
-                    # Remove tools so we get pure text streaming
-                    try:
-                        ephemeral_stream = await _build_llm_messages(conv_id, request.question)
-                        async for event in provider.chat_stream(
-                            ephemeral_stream, tools=None,
-                            temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-                        ):
-                            if event.type == "token" and event.text:
-                                yield _sse({"type": "token", "text": event.text})
-                            elif event.type == "done":
-                                break
-                    except Exception as e:
-                        logger.warning("[Agent] streaming failed, falling back to non-streaming: %s", e)
-                        # Fallback: send full content at once
-                        yield _sse({"type": "token", "text": response.content})
-                    
-                    conversations[conv_id].append({"role": "assistant", "content": response.content})
+    async with _get_conversation_lock(conv_id):
+        await _ensure_conversation(conv_id, mode, partition_key)
+        _inject_file_context(conv_id, conversations[conv_id])
+        conversations[conv_id].append(_build_user_message(request))
+        conversations[conv_id] = _trim_history(conversations[conv_id])
 
-                    # Persist to Table Storage (fire-and-forget)
-                    asyncio.create_task(_persist_conversation(conv_id))
+        # Emit conversation_id immediately
+        yield _sse({"type": "init", "conversation_id": conv_id, "mode": mode})
+
+        try:
+            provider = get_provider(tier)
+            model_used = getattr(provider, 'model', getattr(provider, 'deployment', ''))
+
+            iteration = 0
+            need_final_response = True
+
+            while iteration <= AGENT_MAX_ITERATIONS and need_final_response:
+                iteration += 1
+
+                yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
+
+                # Non-streaming call for tool detection
+                ephemeral = await _build_llm_messages(conv_id, request.question)
+                response = await llm_with_fallback(
+                    ephemeral, tools=TOOLS, tier=tier,
+                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                )
+                for k, v in response.usage.items():
+                    if isinstance(v, (int, float)):
+                        total_usage[k] = total_usage.get(k, 0) + v
+
+                if response.tool_calls:
+                    # Add assistant msg with tool calls
+                    conversations[conv_id].append(
+                        make_assistant_message_from_response(response)
+                    )
+
+                    # Signal tool execution
+                    for tc in response.tool_calls:
+                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
+
+                    # Execute tools
+                    tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
+                    tools_used.extend(tu)
+                    tool_details.extend(td)
+
+                    for d in td:
+                        count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
+                        yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
+
+                    # Continue loop for next LLM call
+                    need_final_response = True
                 else:
-                    yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
-        
-    except Exception as e:
-        yield _sse({"type": "error", "text": str(e)})
+                    # Final text response — stream it
+                    need_final_response = False
+
+                    if response.content:
+                        # Try to re-do as streaming for token-by-token delivery
+                        # Remove tools so we get pure text streaming
+                        try:
+                            ephemeral_stream = await _build_llm_messages(conv_id, request.question)
+                            async for event in provider.chat_stream(
+                                ephemeral_stream, tools=None,
+                                temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                            ):
+                                if event.type == "token" and event.text:
+                                    yield _sse({"type": "token", "text": event.text})
+                                elif event.type == "done":
+                                    break
+                        except Exception as e:
+                            logger.warning("[Agent] streaming failed, falling back to non-streaming: %s", e)
+                            # Fallback: send full content at once
+                            yield _sse({"type": "token", "text": response.content})
+
+                        conversations[conv_id].append({"role": "assistant", "content": response.content})
+
+                        # Persist to Table Storage (fire-and-forget)
+                        asyncio.create_task(_persist_conversation(conv_id, partition_key))
+                    else:
+                        yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
+
+        except Exception as e:
+            yield _sse({"type": "error", "text": str(e)})
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
     

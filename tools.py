@@ -4,8 +4,8 @@
 
 import json, base64, asyncio, logging
 from datetime import datetime
-from typing import Dict, List, Any, Optional
 from collections import deque
+from urllib.parse import quote
 import httpx
 
 from config import (
@@ -21,7 +21,7 @@ _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
 def _log(msg):
     _devops_debug_log.append({"ts": datetime.now().isoformat(), "msg": msg})
-    print(f"[Tools] {msg}")
+    logging.info("[Tools] %s", msg)
 
 # --- DevOps helpers ---
 async def _devops_request_with_retry(client, method, url, headers, json_body=None, max_retries=5):
@@ -388,8 +388,27 @@ async def tool_create_workitem(
     area_path: str = "",
     assigned_to: str = "",
     tags: str = "",
+    confirmed: bool = False,
 ):
     """Cria um Work Item no Azure DevOps via JSON Patch."""
+    normalized_type = (work_item_type or "User Story").strip().lower()
+    allowed_types = {
+        "user story": "User Story",
+        "bug": "Bug",
+        "task": "Task",
+        "feature": "Feature",
+    }
+    work_item_type = allowed_types.get(normalized_type, "User Story")
+
+    title = (title or "").strip()[:250]
+    description = (description or "").strip()[:12000]
+    acceptance_criteria = (acceptance_criteria or "").strip()[:12000]
+    area_path = (area_path or "").strip()[:300]
+    assigned_to = (assigned_to or "").strip()[:200]
+    tags = (tags or "").strip()[:500]
+
+    if not confirmed:
+        return {"error": "Confirmação explícita necessária (envia confirmed=true após 'confirmo')."}
     if not title:
         return {"error": "Título é obrigatório"}
 
@@ -409,7 +428,7 @@ async def tool_create_workitem(
     if tags:
         patch_doc.append({"op": "add", "path": "/fields/System.Tags", "value": tags})
 
-    wi_type_encoded = work_item_type.replace(" ", "%20")
+    wi_type_encoded = quote(work_item_type, safe="")
     url = _devops_url(f"wit/workitems/${wi_type_encoded}?api-version=7.1")
     headers = _devops_headers()
     headers["Content-Type"] = "application/json-patch+json"
@@ -439,6 +458,10 @@ async def tool_create_workitem(
                 if attempt == 2:
                     return {"error": "DevOps timeout ao criar work item"}
                 await asyncio.sleep(2 * (attempt + 1))
+            except httpx.RequestError as e:
+                if attempt == 2:
+                    return {"error": f"DevOps request error ao criar work item: {str(e)}"}
+                await asyncio.sleep(2 * (attempt + 1))
             except Exception as e:
                 return {"error": f"Erro ao criar work item: {str(e)}"}
         else:
@@ -456,6 +479,88 @@ async def tool_create_workitem(
         "title": title,
         "work_item_type": work_item_type,
         "area_path": area_path or "(default)",
+    }
+
+
+async def tool_generate_chart(
+    chart_type: str = "bar",
+    title: str = "Chart",
+    x_values: list = None,
+    y_values: list = None,
+    labels: list = None,
+    values: list = None,
+    series: list = None,
+    x_label: str = "",
+    y_label: str = "",
+):
+    """Gera um chart spec para Plotly.js. Retorna _chart no resultado."""
+    chart_type = (chart_type or "bar").lower().strip()
+    supported = ["bar", "pie", "line", "scatter", "histogram", "hbar"]
+    if chart_type not in supported:
+        chart_type = "bar"
+
+    data = []
+    layout = {
+        "title": {"text": title, "font": {"size": 16}},
+        "font": {"family": "Montserrat, sans-serif"},
+    }
+
+    # Multi-series via 'series' param
+    if series and isinstance(series, list):
+        for s in series:
+            trace = {"type": s.get("type", chart_type), "name": s.get("name", "")}
+            if s.get("x"): trace["x"] = s["x"]
+            if s.get("y"): trace["y"] = s["y"]
+            if s.get("labels"): trace["labels"] = s["labels"]
+            if s.get("values"): trace["values"] = s["values"]
+            if trace["type"] == "pie":
+                trace.pop("x", None); trace.pop("y", None)
+            data.append(trace)
+    elif chart_type == "pie":
+        data.append({
+            "type": "pie",
+            "labels": labels or x_values or [],
+            "values": values or y_values or [],
+            "textinfo": "label+percent",
+            "hole": 0.3,
+        })
+    elif chart_type == "hbar":
+        data.append({
+            "type": "bar",
+            "y": x_values or [],
+            "x": y_values or [],
+            "orientation": "h",
+            "name": title,
+        })
+        layout["yaxis"] = {"title": x_label, "automargin": True}
+        layout["xaxis"] = {"title": y_label}
+    elif chart_type == "histogram":
+        data.append({
+            "type": "histogram",
+            "x": x_values or y_values or [],
+            "name": title,
+        })
+        layout["xaxis"] = {"title": x_label}
+        layout["yaxis"] = {"title": y_label or "Frequência"}
+    else:
+        # bar, line, scatter
+        data.append({
+            "type": chart_type if chart_type != "bar" else "bar",
+            "x": x_values or [],
+            "y": y_values or [],
+            "name": title,
+        })
+        if x_label: layout["xaxis"] = {"title": x_label}
+        if y_label: layout["yaxis"] = {"title": y_label}
+
+    chart_spec = {"data": data, "layout": layout, "config": {"responsive": True}}
+
+    return {
+        "chart_generated": True,
+        "chart_type": chart_type,
+        "title": title,
+        "data_points": len(x_values or labels or []),
+        "_chart": chart_spec,
     }
 
 # =============================================================================
@@ -479,6 +584,18 @@ async def execute_tool(tool_name, arguments):
             arguments.get("area_path", ""),
             arguments.get("assigned_to", ""),
             arguments.get("tags", ""),
+            arguments.get("confirmed", False),
+        ),
+        "generate_chart": lambda: tool_generate_chart(
+            arguments.get("chart_type", "bar"),
+            arguments.get("title", "Chart"),
+            arguments.get("x_values"),
+            arguments.get("y_values"),
+            arguments.get("labels"),
+            arguments.get("values"),
+            arguments.get("series"),
+            arguments.get("x_label", ""),
+            arguments.get("y_label", ""),
         ),
     }
     fn = dispatch.get(tool_name)
@@ -491,7 +608,8 @@ def truncate_tool_result(result_str):
         if isinstance(data, dict) and "items" in data:
             data["items"] = data["items"][:AGENT_TOOL_RESULT_KEEP_ITEMS]; data["_truncated"]=True; data["_original_items"]=len(data.get("items",[]))
             return json.dumps(data, ensure_ascii=False)
-    except: pass
+    except Exception as e:
+        logging.warning("[Tools] truncate_tool_result fallback: %s", e)
     return result_str[:AGENT_TOOL_RESULT_MAX_SIZE] + "\n...(truncado)"
 
 # =============================================================================
@@ -505,7 +623,8 @@ TOOLS = [
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
     {"type":"function","function":{"name":"query_hierarchy","description":"Query hierárquica parent/child. OBRIGATÓRIO para 'Epic', 'dentro de', 'filhos de'.","parameters":{"type":"object","properties":{"parent_id":{"type":"integer","description":"ID do pai."},"parent_type":{"type":"string","description":"Default: 'Epic'."},"child_type":{"type":"string","description":"Default: 'User Story'."},"area_path":{"type":"string"}}}}},
     {"type":"function","function":{"name":"compute_kpi","description":"Calcula KPIs (até 1000 items). OBRIGATÓRIO para rankings, distribuições, tendências.","parameters":{"type":"object","properties":{"wiql_where":{"type":"string"},"group_by":{"type":"string","description":"'state','type','assigned_to','created_by','area'"},"kpi_type":{"type":"string","description":"'count','timeline','distribution'"}},"required":["wiql_where"]}}},
-    {"type":"function","function":{"name":"create_workitem","description":"Cria um Work Item no Azure DevOps. USA APENAS quando o utilizador CONFIRMAR explicitamente a criação. PERGUNTA SEMPRE antes de criar.","parameters":{"type":"object","properties":{"work_item_type":{"type":"string","description":"Tipo: 'User Story', 'Bug', 'Task', 'Feature'. Default: 'User Story'."},"title":{"type":"string","description":"Título do Work Item."},"description":{"type":"string","description":"Descrição em HTML. Usa formato MSE."},"acceptance_criteria":{"type":"string","description":"Critérios de aceitação em HTML."},"area_path":{"type":"string","description":"AreaPath. Ex: 'IT.DIT\\\\DIT\\\\ADMChannels\\\\DBKS\\\\AM24\\\\RevampFEE MVP2'"},"assigned_to":{"type":"string","description":"Nome completo da pessoa. Ex: 'Pedro Mousinho'"},"tags":{"type":"string","description":"Tags separadas por ';'. Ex: 'MVP2;FEE;Sprint23'"}},"required":["title"]}}},
+    {"type":"function","function":{"name":"create_workitem","description":"Cria um Work Item no Azure DevOps. USA APENAS quando o utilizador CONFIRMAR explicitamente a criação. PERGUNTA SEMPRE antes de criar.","parameters":{"type":"object","properties":{"work_item_type":{"type":"string","description":"Tipo: 'User Story', 'Bug', 'Task', 'Feature'. Default: 'User Story'."},"title":{"type":"string","description":"Título do Work Item."},"description":{"type":"string","description":"Descrição em HTML. Usa formato MSE."},"acceptance_criteria":{"type":"string","description":"Critérios de aceitação em HTML."},"area_path":{"type":"string","description":"AreaPath. Ex: 'IT.DIT\\\\DIT\\\\ADMChannels\\\\DBKS\\\\AM24\\\\RevampFEE MVP2'"},"assigned_to":{"type":"string","description":"Nome completo da pessoa. Ex: 'Pedro Mousinho'"},"tags":{"type":"string","description":"Tags separadas por ';'. Ex: 'MVP2;FEE;Sprint23'"},"confirmed":{"type":"boolean","description":"true apenas após confirmação explícita do utilizador (ex: 'confirmo')."}},"required":["title"]}}},
+    {"type":"function","function":{"name":"generate_chart","description":"Gera gráfico interativo (bar, pie, line, scatter, histogram, hbar). USA SEMPRE que o utilizador pedir gráfico, chart, visualização ou distribuição visual. Extrai dados de tool_results anteriores ou de dados fornecidos.","parameters":{"type":"object","properties":{"chart_type":{"type":"string","description":"Tipo: 'bar','pie','line','scatter','histogram','hbar'. Default: 'bar'."},"title":{"type":"string","description":"Título do gráfico."},"x_values":{"type":"array","items":{"type":"string"},"description":"Valores eixo X (categorias ou datas). Ex: ['Active','Closed','New']"},"y_values":{"type":"array","items":{"type":"number"},"description":"Valores eixo Y (numéricos). Ex: [45, 30, 12]"},"labels":{"type":"array","items":{"type":"string"},"description":"Labels para pie chart. Ex: ['Bug','US','Task']"},"values":{"type":"array","items":{"type":"number"},"description":"Valores para pie chart. Ex: [20, 50, 30]"},"series":{"type":"array","items":{"type":"object"},"description":"Multi-series. Cada obj: {type,name,x,y,labels,values}"},"x_label":{"type":"string","description":"Label do eixo X"},"y_label":{"type":"string","description":"Label do eixo Y"}},"required":["title"]}}},
 ]
 
 # =============================================================================
@@ -569,6 +688,10 @@ REGRAS DE ROUTING (decide qual ferramenta usar):
    Exemplos: "cria esta US no DevOps", "coloca no board", "adiciona ao backlog"
    REGRA CRÍTICA: NUNCA criar sem confirmação explícita do utilizador.
    Fluxo: 1) Gerar/mostrar conteúdo → 2) Perguntar "Confirmas a criação?" → 3) Só criar após "sim/confirmo"
+9. Para GRÁFICOS, CHARTS, VISUALIZAÇÕES → usa generate_chart (OBRIGATÓRIO)
+   Exemplos: "mostra um gráfico de bugs por estado", "chart de USs por mês", "visualiza a distribuição"
+   REGRA: Primeiro obtém os dados (query_workitems/compute_kpi), depois chama generate_chart com os valores extraídos.
+   REGRA: Podes chamar compute_kpi + generate_chart em sequência (não em paralelo — precisas dos dados primeiro).
 
 QUANDO USAR query_workitems vs search_workitems vs compute_kpi (IMPORTANTE):
 - "Quantas USs existem no RevampFEE?" → query_workitems com top=0 (contagem rápida)
@@ -578,6 +701,8 @@ QUANDO USAR query_workitems vs search_workitems vs compute_kpi (IMPORTANTE):
 - "USs do Epic 12345" → query_hierarchy com parent_id=12345
 - "Distribuição de estados no MDSE" → compute_kpi com kpi_type="distribution"
 - Para CRIAR → usa create_workitem (pede SEMPRE confirmação)
+- "Mostra gráfico de bugs por estado" → compute_kpi DEPOIS generate_chart
+- "Visualiza distribuição de USs" → compute_kpi DEPOIS generate_chart
 
 CAMPOS ESPECIAIS (IMPORTANTE):
 - Para obter DESCRIÇÃO ou CRITÉRIOS DE ACEITAÇÃO, inclui fields: ["System.Id","System.Title","System.State","System.WorkItemType","System.Description","Microsoft.VSTS.Common.AcceptanceCriteria"]

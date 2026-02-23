@@ -2,8 +2,8 @@
 
 > **Ficheiro de referência rápida para recuperação de contexto.**
 > Usar quando: chat perdido, context window cheia, novo agente precisa de onboarding.
-> Última atualização: 2026-02-23 (Fase 1B completa, Fase 2 próxima)
-> Versão atual em produção: **v7.0.4**
+> Última atualização: 2026-02-23 (Fase 3 em progresso — 3.1/3.2/3.3 em produção + hotfixes pós-auditoria; faltam 3.4/3.5)
+> Versão atual em produção: **v7.0.5** (com hotfixes de segurança/robustez deployados em 2026-02-23)
 
 ---
 
@@ -78,7 +78,7 @@ Pedro define tarefa → Claude analisa e gera "MENSAGEM PARA O CODEX" → Pedro 
 7. **Sem dependências novas** (pip install) a menos que explicitamente indicado na tarefa.
 8. **Output limpo.** Entregar APENAS os ficheiros alterados, completos, prontos para Kudu VFS PUT.
 9. **Versioning.** Após cada fase: 1A→7.0.3, 1B→7.0.4, 2→7.0.5, 3→7.1.0, 4→7.1.1, 5→7.2.0, 6→7.2.1.
-10. **Não tocar em:** `auth.py`, `models.py` a menos que explicitamente pedido. `storage.py` só na tarefa 4.2. `learning.py` só nas tarefas 1.1 e 1.2.
+10. **Não tocar em:** `auth.py`, `models.py` a menos que explicitamente pedido. `storage.py` só quando explicitamente pedido. `learning.py` só quando explicitamente pedido.
 
 ---
 
@@ -125,10 +125,14 @@ curl -X PUT -u "$AUTH" \
 - Ordem idêntica em todos os renders
 - Violação = ecrã branco após login
 
-### 5.3 ConversationStore (v7.0.3)
+### 5.3 ConversationStore (v7.0.3) + Persistent Memory (v7.0.5)
 - MAX_CONVERSATIONS = 200, TTL = 4h, LRU eviction
 - `on_evict` limpa `conversation_meta` e `uploaded_files_store`
 - Interface MutableMapping — código existente trata como dict
+- **v7.0.5+hotfix:** Write-through para ChatHistory com isolamento por utilizador (PK=user_id, RK=conv_id) via `_persist_conversation()` fire-and-forget
+- **v7.0.5:** Lazy-load via `_load_conversation_from_storage()` — system prompt sempre substituído pelo actual
+- **v7.0.5:** `_ensure_conversation()` agora é `async` — todos os call sites usam `await`
+- **ATENÇÃO:** `table_merge` do `storage.py` NÃO faz upsert de criação — `_persist_conversation` usa query→insert/merge
 
 ### 5.4 Cache de Few-Shot (v7.0.3)
 - MD5 hash normalizado, TTL 30min, cap 50 entradas
@@ -162,8 +166,32 @@ curl -X PUT -u "$AUTH" \
 **Deploy:** v7.0.4 em produção, confirmado via `/api/info` e `/health`
 **Nota:** Hotfix SSE aplicado pelo Pedro — streaming path não persistia tool_details na mensagem final
 
-### Fase 2 — DevOps Write + Memória Persistente → v7.0.5 ⏭️ PRÓXIMA
-### Fase 3 — Charts e Visualização → v7.1.0
+### Fase 2 — DevOps Write + Memória Persistente → v7.0.5 ✅ COMPLETA (2026-02-23)
+| Tarefa | Descrição | Status |
+|--------|-----------|--------|
+| 2.1 | Tool create_workitem (JSON Patch, retry, confirmação, 8 tools no TOOLS) | DONE |
+| 2.2 | Write-through Table Storage (_persist_conversation, fire-and-forget, compressão) | DONE |
+| 2.3 | Lazy-load conversas (_load_conversation_from_storage, async _ensure_conversation) | DONE |
+| — | Hotfix PDF 500 (_latin1_safe, try/except fallback) | DONE |
+| — | Hotfix export inteligente (messageHasExportableData, remoção header export) | DONE |
+| — | Hotfix XLSX sheet title (_safe_sheet_title) | DONE |
+
+**Deploy:** v7.0.5 em produção, 7 testes PASS
+**Nota:** table_merge não é upsert — _persist_conversation usa query→insert/merge. _ensure_conversation agora async.
+
+### Fase 3 — Charts e Visualização → v7.1.0 ⏳ EM PROGRESSO
+| Tarefa | Descrição | Estado |
+|--------|-----------|--------|
+| 3.1 | Plotly.js CDN (2.35.2 defer) + renderPlotlyChart + ChartBlock + getChartSpecs | ✅ FECHADA |
+| 3.2 | Tool generate_chart (6 tipos + multi-series, _chart Plotly spec, regra 9 system prompt, TOOLS 9 entries) | ✅ FECHADA |
+| 3.3 | Upload enrichment: col_analysis (numeric/text) + _inject_file_context com instrução generate_chart | ✅ FECHADA |
+| 3.4 | Export de charts (SVG/PNG) — parcialmente feito no ChartBlock da 3.1, validar | PENDENTE |
+| 3.5 | File generation via prompts — tool generate_file para CSV/XLSX/PDF | PENDENTE |
+
+**Nota:** 3.1-3.3 implementadas, auditadas e **deployadas em produção** (Kudu VFS PUT + restart em 2026-02-23). Hotfixes pós-auditoria também deployados: confirmação robusta no `create_workitem`, parsing de delimitador dinâmico no `col_analysis`, locks por conversa e hardening de persistência multimodal.
+**Detalhe técnico 3.2:** `tool_generate_chart()` aceita chart_type, title, x_values, y_values, labels, values, series, x_label, y_label. Multi-series via `series` param (array de objetos). Retorna `{ _chart: { data, layout, config } }`.
+**Detalhe técnico 3.3:** `col_analysis` inicializado como `[]` antes do bloco if (defensivo). Heurística >60% numérico para tipo. Guardado em `uploaded_files_store[conv_id]["col_analysis"]`. `_inject_file_context` enriquecida com bloco "ANÁLISE DE COLUNAS".
+
 ### Fase 4 — US Writer Pro → v7.1.1
 ### Fase 5 — Integrações + Polish → v7.2.0
 ### Fase 6 — Análise Profunda → v7.2.1
@@ -202,3 +230,15 @@ MENSAGEM PARA O CLAUDE
 | 2026-02-23 | SSE streaming path e sync path têm fluxos de dados diferentes — validar AMBOS em cada tarefa que toque em tool_details/tool_results |
 | 2026-02-23 | "Quantas USs ativas?" devolve contagem textual (sem tabela) — comportamento correto do system prompt. Para tabela, usar "Lista as USs ativas" |
 | 2026-02-23 | Na última tarefa de cada fase: incluir bump APP_VERSION + lista de validações em produção no handoff do Codex |
+| 2026-02-23 | `table_merge` em `storage.py` NÃO é upsert — só funciona para entidades existentes. Para upsert: query existência → insert se novo, merge se existe |
+| 2026-02-23 | `_ensure_conversation()` agora é `async` — qualquer novo call site DEVE usar `await` |
+| 2026-02-23 | fpdf2 com fontes core (Helvetica) só suporta Latin-1 — usar `_latin1_safe()` para qualquer texto passado a `pdf.cell()` |
+| 2026-02-23 | Content-Disposition headers precisam de filename sanitizado — `safe_filename` em `app.py` export endpoint |
+| 2026-02-23 | `generate_chart` é LOCAL (sem API calls) — o LLM fornece dados e a tool constrói o Plotly spec. Sequência correcta: compute_kpi → generate_chart (não paralelo) |
+| 2026-02-23 | `_chart` key no tool result é o contrato frontend↔backend para charts. Frontend `getChartSpecs()` procura `parsed._chart` em cada tool_result |
+| 2026-02-23 | `col_analysis` no upload: tipo detectado por heurística (>60% valores parseable como número = numeric). Não é perfeito mas suficiente para guiar o LLM |
+| 2026-02-23 | Pedro pediu "duas tarefas em simultâneo" pela primeira vez na Fase 3 — workflow pode ser paralelo quando as tarefas são independentes |
+| 2026-02-23 | ChartBlock da 3.1 já inclui botões SVG/PNG — 3.4 pode ser apenas validação em produção em vez de implementação |
+| 2026-02-23 | Hotfix de segurança: `create_workitem` só avança com confirmação explícita robusta (negações bloqueiam; aprovações comuns aceites) |
+| 2026-02-23 | Hotfix de dados: `col_analysis` no upload passou a usar delimitador dinâmico (`sep`) em vez de split hardcoded por vírgula |
+| 2026-02-23 | Deploy técnico confirmado por Codex: PUT de `agent.py`, `app.py`, `tools.py`, `learning.py`, `static/index.html` + `restartTrigger.txt` + validação `/api/info` e `/health` |

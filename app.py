@@ -9,7 +9,6 @@ import io
 import json
 import uuid
 import asyncio
-import base64
 import logging
 from datetime import datetime
 from typing import Optional
@@ -24,7 +23,6 @@ from config import (
     APP_VERSION, APP_TITLE, APP_DESCRIPTION,
     DEVOPS_INDEX, OMNI_INDEX, EXAMPLES_INDEX,
     SEARCH_SERVICE, SEARCH_KEY, API_VERSION_SEARCH,
-    AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, CHAT_DEPLOYMENT, API_VERSION_CHAT,
     LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO,
 )
 from models import (
@@ -38,7 +36,7 @@ from storage import (
     init_http_client, ensure_tables_exist,
     table_insert, table_query, table_merge, table_delete,
 )
-from tools import get_embedding, get_devops_debug_log, TOOLS
+from tools import get_embedding, get_devops_debug_log
 from learning import invalidate_prompt_rules_cache
 from agent import (
     agent_chat as _agent_chat, agent_chat_stream,
@@ -69,14 +67,14 @@ async def startup_event():
     global http_client
     http_client = httpx.AsyncClient(timeout=60)
     init_http_client(http_client)
-    print("🌐 HTTP client OK")
+    logger.info("HTTP client OK")
     try:
         await asyncio.wait_for(ensure_tables_exist(), timeout=15)
     except asyncio.TimeoutError:
-        print("⚠️ Table init timeout (15s) — continuing anyway")
+        logger.warning("Table init timeout (15s) — continuing anyway")
     except Exception as e:
-        print(f"⚠️ Table init error: {e} — continuing anyway")
-    print(f"✅ DBDE AI Agent v{APP_VERSION} ready")
+        logger.warning("Table init error: %s — continuing anyway", e)
+    logger.info("DBDE AI Agent v%s ready", APP_VERSION)
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -163,6 +161,8 @@ async def upload_file(file: UploadFile = File(...), conversation_id: Optional[st
     
     try:
         data_text, row_count, col_names, truncated = "", 0, [], False
+        col_analysis = []
+        detected_delimiter = ","
         
         if filename.endswith((".xlsx",".xls")):
             import openpyxl
@@ -172,6 +172,7 @@ async def upload_file(file: UploadFile = File(...), conversation_id: Optional[st
             col_names = [str(c) if c else f"Col{i}" for i,c in enumerate(rows[0])]
             row_count = len(rows)-1
             data_text = "\t".join(col_names)+"\n" + "\n".join("\t".join(str(c) if c is not None else "" for c in r) for r in rows[1:])
+            detected_delimiter = "\t"
             wb.close()
         elif filename.endswith(".csv"):
             text = content.decode("utf-8", errors="replace")
@@ -179,6 +180,7 @@ async def upload_file(file: UploadFile = File(...), conversation_id: Optional[st
             sep = "," if "," in lines[0] else ";"
             col_names = [c.strip().strip('"') for c in lines[0].split(sep)]
             row_count = len(lines)-1; data_text = text
+            detected_delimiter = sep
         elif filename.lower().endswith(".pdf"):
             try:
                 from pypdf import PdfReader
@@ -198,9 +200,34 @@ async def upload_file(file: UploadFile = File(...), conversation_id: Optional[st
         if len(data_text) > 100000: data_text = data_text[:100000]; truncated = True
         
         uploaded_files_store[conv_id] = {"filename":filename,"data_text":data_text,"row_count":row_count,"col_names":col_names,"truncated":truncated,"uploaded_at":datetime.now().isoformat()}
+        # Análise de colunas para charts (Excel e CSV)
+        if filename.endswith((".xlsx", ".xls", ".csv")):
+            sample_lines = data_text.split("\n")[1:11]  # Primeiras 10 linhas de dados
+            for ci, cname in enumerate(col_names):
+                vals = []
+                for sl in sample_lines:
+                    parts = sl.split(detected_delimiter)
+                    if ci < len(parts):
+                        v = parts[ci].strip().strip('"')
+                        if v:
+                            vals.append(v)
+                # Tentar detectar tipo
+                numeric_count = sum(1 for v in vals if v.replace(".", "").replace("-", "").replace(",", "").isdigit())
+                is_numeric = numeric_count > len(vals) * 0.6 and len(vals) > 0
+                col_analysis.append({
+                    "name": cname,
+                    "type": "numeric" if is_numeric else "text",
+                    "sample": vals[:5],
+                })
+            uploaded_files_store[conv_id]["col_analysis"] = col_analysis
         if conv_id in conversation_meta: conversation_meta[conv_id]["file_injected"] = False
         
-        return {"status":"ok","conversation_id":conv_id,"filename":filename,"rows":row_count,"columns":col_names,"truncated":truncated,"preview":"\n".join(data_text.split("\n")[:6])}
+        return {
+            "status":"ok","conversation_id":conv_id,"filename":filename,
+            "rows":row_count,"columns":col_names,"truncated":truncated,
+            "preview":"\n".join(data_text.split("\n")[:6]),
+            "col_analysis": col_analysis if col_analysis else None,
+        }
     except HTTPException: raise
     except Exception as e: raise HTTPException(400, str(e))
 
