@@ -10,12 +10,14 @@ import secrets
 import logging
 import hmac as _hmac
 import hashlib as _hashlib
-from datetime import datetime
+from contextvars import ContextVar, Token
+from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import HTTPException, Depends
+from fastapi import HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from config import JWT_SECRET, JWT_EXPIRATION_HOURS
+from config import JWT_SECRET, JWT_EXPIRATION_HOURS, AUTH_COOKIE_NAME
 logger = logging.getLogger(__name__)
 
 
@@ -36,8 +38,11 @@ def _b64url_decode(s: str) -> bytes:
 # =============================================================================
 
 def jwt_encode(payload: dict, secret: str = JWT_SECRET) -> str:
+    data = dict(payload or {})
+    if "exp" not in data:
+        data["exp"] = (datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)).isoformat()
     header = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    pay = _b64url_encode(json.dumps(payload, default=str).encode())
+    pay = _b64url_encode(json.dumps(data, default=str).encode())
     sig_input = f"{header}.{pay}".encode()
     sig = _b64url_encode(_hmac.new(secret.encode(), sig_input, _hashlib.sha256).digest())
     return f"{header}.{pay}.{sig}"
@@ -55,10 +60,14 @@ def jwt_decode(token: str, secret: str = JWT_SECRET) -> dict:
         if not _hmac.compare_digest(sig_b64, expected_sig):
             raise ValueError("Invalid signature")
         payload = json.loads(_b64url_decode(payload_b64))
-        if "exp" in payload:
-            exp = datetime.fromisoformat(payload["exp"])
-            if datetime.utcnow() > exp:
-                raise ValueError("Token expired")
+        if "exp" not in payload:
+            raise ValueError("Token missing exp")
+        exp_raw = payload["exp"]
+        if not isinstance(exp_raw, str):
+            raise ValueError("Token exp inválido")
+        exp = datetime.fromisoformat(exp_raw)
+        if datetime.utcnow() > exp:
+            raise ValueError("Token expired")
         return payload
     except (ValueError, json.JSONDecodeError, Exception) as e:
         raise ValueError(f"JWT decode error: {e}")
@@ -93,14 +102,33 @@ def verify_password(password: str, stored_hash: str) -> bool:
 # =============================================================================
 
 security = HTTPBearer(auto_error=False)
+_request_cookie_token_ctx: ContextVar[str] = ContextVar("dbde_request_cookie_token", default="")
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+def set_request_cookie_token(token: str) -> Token:
+    return _request_cookie_token_ctx.set(token or "")
+
+
+def reset_request_cookie_token(token_ref: Token) -> None:
+    _request_cookie_token_ctx.reset(token_ref)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    request: Optional[Request] = None,
+) -> dict:
     """FastAPI dependency — extrai user do JWT token."""
-    if credentials is None:
+    token = ""
+    if request is not None:
+        token = (request.cookies.get(AUTH_COOKIE_NAME) or "").strip()
+    if not token:
+        token = (_request_cookie_token_ctx.get("") or "").strip()
+    if not token and credentials is not None:
+        token = (credentials.credentials or "").strip()
+    if not token:
         raise HTTPException(status_code=401, detail="Token de autenticação em falta")
     try:
-        payload = jwt_decode(credentials.credentials)
+        payload = jwt_decode(token)
         return payload
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Token inválido ou expirado: {e}")

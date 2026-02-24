@@ -1,101 +1,111 @@
----
-output:
-  pdf_document:
-    latex_engine: xelatex
----
 
+# DBDE AI Assistant v7.2.0 — Complete Project Handoff
 
-# DBDE AI Assistant v7.0.5 — Complete Project Handoff
-
-> **Documento de contexto completo para continuacao do projecto.**
-> Ultima actualizacao: 2026-02-23
-> Autor: Pedro Mousinho, DIT/ADMChannels, Millennium BCP
-> Versao actual em producao: **v7.0.5** (Fase 3.1/3.2/3.3 + hotfixes de auditoria deployados em 2026-02-23; faltam 3.4/3.5)
+> **Documento de contexto completo para continuação do projecto.**
+> Última atualização: 2026-02-23
+> Autor: Pedro Mousinho, DIT/DBDE, Millennium BCP
+> Versão atual em produção: **v7.2.0** (Fases 1A, 1B, 2, 3 completas; Fase 4.7 Security Sprint completa; Fase 5 completa)
 
 ---
 
-## 1. O QUE E ESTE PROJECTO
+## 1. O QUE É ESTE PROJECTO
 
-Assistente de IA interno do Millennium BCP para a equipa DIT/ADMChannels. Permite consultar Azure DevOps (backlog, work items, user stories) via linguagem natural, pesquisar documentacao interna, analisar padroes de escrita, gerar User Stories, e exportar dados. Corre como Azure App Service (Linux, Python 3.12).
+Assistente de IA interno do Millennium BCP para a equipa DIT/DBDE. Permite consultar Azure DevOps (backlog, work items, user stories) via linguagem natural, pesquisar documentação interna, analisar padrões de escrita, gerar User Stories, criar work items, gerar gráficos interativos, pesquisar no Figma e Miro, e exportar dados. Corre como Azure App Service (Linux, Python 3.12).
 
-**URL de producao:** `https://dbdeai.pt` (custom domain) -> `https://millennium-ai-assistant-epa7d7b4defabwbn.swedencentral-01.azurewebsites.net`
+**URL de produção:** `https://dbdeai.pt` (custom domain) → `https://millennium-ai-assistant-epa7d7b4defabwbn.swedencentral-01.azurewebsites.net`
 
-**Stack:** FastAPI + React (CDN, sem build step) + Azure OpenAI + Anthropic Claude + Azure AI Search + Azure Table Storage + Azure DevOps REST API.
+**Stack:** FastAPI + React (CDN, sem build step) + Azure OpenAI + Anthropic Claude + Azure AI Search + Azure Table Storage + Azure DevOps REST API + Figma REST API + Miro REST API.
 
 ---
 
-## 2. ARQUITECTURA v7.0.2
+## 2. ARQUITECTURA v7.2.0
 
-### 2.1 Modulos Python (backend)
+### 2.1 Módulos Python (backend)
 
 ```
-app.py (487 linhas)        -- FastAPI routes, wiring, feedback indexing, endpoints
-agent.py (~520 linhas)     -- Agent loop (sync + SSE streaming), ephemeral injection, tool execution, persistent memory (write-through + lazy-load)
-auth.py (103 linhas)       -- JWT encode/decode, password hashing, FastAPI dependency
-config.py (142 linhas)     -- TODAS as env vars e constantes centralizadas
-export_engine.py (331)     -- Export CSV/XLSX/PDF/SVG/HTML
-learning.py (119 linhas)   -- Aprendizagem adaptativa: regras, few-shot, cache (NOVO em v7.0.2)
-llm_provider.py (691)      -- Abstraccao multi-modelo (Azure OpenAI + Anthropic)
-models.py (175 linhas)     -- Pydantic models (request/response)
-storage.py (206 linhas)    -- Azure Table Storage REST API (sem SDK)
-tools.py (~600 linhas)     -- 9 tools (incl. create_workitem + generate_chart) + system prompts + tool definitions
+app.py (~600 linhas)         -- FastAPI routes, CORS middleware, rate limiting (slowapi), httpOnly cookies, feedback deque
+agent.py (~520 linhas)       -- Agent loop (sync + SSE streaming), ephemeral injection, tool execution, persistent memory (write-through + lazy-load)
+auth.py (~120 linhas)        -- JWT encode/decode, password hashing, cookie token resolution, FastAPI dependency
+config.py (176 linhas)       -- TODAS as env vars e constantes centralizadas (incl. Figma/Miro tokens, CORS, cookie config)
+export_engine.py (331)       -- Export CSV/XLSX/PDF/SVG/HTML com html.escape hardening
+learning.py (~120 linhas)    -- Aprendizagem adaptativa: regras, few-shot, cache, lock de refresh
+llm_provider.py (691)        -- Abstração multi-modelo (Azure OpenAI + Anthropic)
+models.py (175 linhas)       -- Pydantic models (request/response)
+storage.py (~210 linhas)     -- Azure Table Storage REST API (sem SDK), admin password env var
+tools.py (~1100 linhas)      -- 10 tools builtin + system prompts + tool definitions + WIQL sanitization + dynamic registry
+tool_registry.py (54 linhas) -- Registry dinâmico de tools (register/execute/list)
+tools_figma.py (259 linhas)  -- Figma read-only integration (REST API v1)
+tools_miro.py (222 linhas)   -- Miro read-only integration (REST API v2)
 ```
 
 **Cadeia de imports (sem circularidades):**
 ```
-app.py -> agent.py -> learning.py -> tools.py -> llm_provider.py -> config.py
-                                  -> storage.py -> config.py
+app.py → agent.py → learning.py → tools.py → llm_provider.py → config.py
+                                  → tool_registry.py
+                                  → storage.py → config.py
+       → tool_registry.py (get_registered_tool_names)
+tools.py → tool_registry.py (register_tool, has_tool, execute_tool, get_all_tool_definitions)
+tools_figma.py → config.py + tool_registry.py (auto-regista no import)
+tools_miro.py  → config.py + tool_registry.py (auto-regista no import)
 ```
 
 ### 2.2 Frontend
 
 ```
-static/index.html (1256 linhas) -- React app, CDN-loaded, zero build step
+static/index.html (~1500 linhas) -- React app, CDN-loaded, zero build step
 ```
 
-React 18 via CDN (`unpkg.com`), Babel standalone, Montserrat font. Plotly.js 2.35.2 via CDN (`cdn.plot.ly`, defer). Componentes: LoginScreen, UserMenu, FeedbackWidget (1-10), MessageBubble, ToolBadges, ModelTierSelector, **ChartBlock** (Plotly render + SVG/PNG download). SSE streaming com fallback sync. Funcoes de chart: `renderPlotlyChart()`, `getChartSpecs()` (extrai `_chart` de tool_results), `ChartBlock` (useRef+useEffect para render async).
+React 18 via CDN (`unpkg.com`), Babel standalone, Montserrat font. Plotly.js 2.35.2 via CDN (`cdn.plot.ly`, defer). DOMPurify 3.2.6 via CDN (XSS prevention). Componentes: LoginScreen, UserMenu, FeedbackWidget (1-10), MessageBubble, ToolBadges, ModelTierSelector, ChartBlock (Plotly render + SVG/PNG download). SSE streaming com incremental rendering (só re-renderiza bloco ativo). Sem localStorage — autenticação via httpOnly cookie (`credentials: "include"`).
 
 ### 2.3 Fluxo de dados
 
 ```
-Browser -> POST /chat/agent (ou /chat/agent/stream para SSE)
-  -> agent.py: _ensure_conversation() -> _build_llm_messages() [efemero] -> llm_with_fallback()
-    -> llm_provider.py: resolve tier -> AzureOpenAIProvider ou AnthropicProvider
-      -> tool_calls? -> tools.py: execute_tool() -> Azure DevOps / AI Search
-      -> loop ate max 5 iteracoes ou resposta final
-  -> resposta ao browser (JSON ou SSE events)
+Browser → POST /chat/agent (ou /chat/agent/stream para SSE)
+  [httpOnly cookie resolve token via middleware → context var]
+  → agent.py: _ensure_conversation() → _build_llm_messages() [efémero] → llm_with_fallback()
+    → llm_provider.py: resolve tier → AzureOpenAIProvider ou AnthropicProvider
+      → tool_calls? → tool_registry.py: execute_tool() → tools.py / tools_figma.py / tools_miro.py
+      → loop até max 5 iterações ou resposta final
+  → resposta ao browser (JSON ou SSE events)
 ```
 
-**NOTA v7.0.2:** A injecao de regras aprendidas e few-shot examples e feita via `_build_llm_messages()` que cria uma **copia efemera** do historico. As mensagens de learning NUNCA persistem em `conversations[]` -- sao recalculadas a cada chamada ao LLM. Isto unifica o comportamento entre sync e streaming e elimina o bloating do historico.
+**NOTA v7.2.0:** O sistema de tools usa um registry dinâmico. Cada módulo (tools.py, tools_figma.py, tools_miro.py) regista as suas tools via `register_tool()` no import. O `agent.py` usa `get_all_tool_definitions()` e `execute_tool()` do registry, sem dispatch manual.
+
+**NOTA v7.0.2:** A injeção de regras aprendidas e few-shot examples é feita via `_build_llm_messages()` que cria uma **cópia efémera** do histórico. As mensagens de learning NUNCA persistem em `conversations[]` — são recalculadas a cada chamada ao LLM.
 
 ### 2.4 Multi-modelo (LLM Tiers)
 
 | Tier | Provider:Model | Uso |
 |------|---------------|-----|
-| `fast` | `azure_openai:gpt-4.1-mini` | Analises internas, classificacao |
+| `fast` | `azure_openai:gpt-4.1-mini` | Análises internas, classificação |
 | `standard` | `anthropic:claude-sonnet-4-6` | Default para chat |
-| `pro` | `anthropic:claude-opus-4-6` | Qualidade maxima |
-| `fallback` | `azure_openai:dbde_access_chatbot` | Se provider primario falhar |
+| `pro` | `anthropic:claude-opus-4-6` | Qualidade máxima |
+| `fallback` | `azure_openai:dbde_access_chatbot` | Se provider primário falhar |
 
-**NOTA IMPORTANTE:** Os modelos Anthropic requerem `ANTHROPIC_API_KEY` configurado. Actualmente **nao esta activo** -- a quota no Azure AI Foundry ainda nao foi aprovada. O sistema faz fallback para Azure OpenAI (GPT-4.1-mini). Quando a key estiver disponivel, basta adicionar `ANTHROPIC_API_KEY` nas App Settings.
+**NOTA:** Os modelos Anthropic requerem `ANTHROPIC_API_KEY` configurado. O sistema faz fallback automático para Azure OpenAI (GPT-4.1-mini) se a key não estiver disponível.
 
-### 2.5 9 Tools disponiveis
+### 2.5 12 Tools disponíveis (v7.2.0)
 
-| Tool | Funcao |
-|------|--------|
-| `query_workitems` | Query WIQL directa ao Azure DevOps. Contagens, listagens, filtros. |
-| `search_workitems` | Pesquisa semantica vectorial (Azure AI Search, index `millennium-devops-index`) |
-| `search_website` | Pesquisa no conteudo do site MSE (index `millennium-omni-index`) |
-| `analyze_patterns` | Busca exemplos + analise LLM de padroes de escrita |
-| `generate_user_stories` | Gera USs novas baseadas em padroes reais |
-| `query_hierarchy` | Hierarquias parent/child (Epic->Feature->US->Task) |
-| `compute_kpi` | KPIs, rankings, distribuicoes, tendencias (ate 1000 items) |
-| `create_workitem` | **NOVO v7.0.5** — Cria work items no DevOps via JSON Patch. Requer confirmacao explicita do user. |
-| `generate_chart` | **NOVO Fase 3** — Gera graficos interactivos (bar/pie/line/scatter/histogram/hbar). Retorna `_chart` Plotly spec. Multi-series suportado. |
+| Tool | Módulo | Função |
+|------|--------|--------|
+| `query_workitems` | tools.py | Query WIQL direta ao Azure DevOps. Contagens, listagens, filtros. **WIQL sanitizada** (blocklist regex + whitelist types). |
+| `search_workitems` | tools.py | Pesquisa semântica vetorial (Azure AI Search, index `millennium-devops-index`) |
+| `search_website` | tools.py | Pesquisa no conteúdo do site MSE (index `millennium-omni-index`) |
+| `analyze_patterns` | tools.py | Busca exemplos + análise LLM de padrões de escrita |
+| `generate_user_stories` | tools.py | Gera USs novas baseadas em padrões reais |
+| `query_hierarchy` | tools.py | Hierarquias parent/child (Epic→Feature→US→Task) |
+| `compute_kpi` | tools.py | KPIs, rankings, distribuições, tendências (até 1000 items) |
+| `create_workitem` | tools.py | Cria work items no DevOps via JSON Patch. Requer confirmação explícita do user. |
+| `generate_chart` | tools.py | Gráficos interativos (bar/pie/line/scatter/histogram/hbar). Retorna `_chart` Plotly spec. |
+| `generate_file` | tools.py | Gera ficheiros CSV/XLSX/PDF a partir de dados estruturados |
+| `search_figma` | tools_figma.py | Pesquisa no Figma (read-only). Ficheiros recentes, frames, nós. |
+| `search_miro` | tools_miro.py | Pesquisa no Miro (read-only). Boards, sticky notes, conteúdo. |
+
+**Routing dinâmico no system prompt:** O `get_agent_system_prompt()` constrói a lista de `data_sources` dinamicamente com `has_tool()`. As regras de routing para Figma/Miro só aparecem se as tools estiverem registadas com token válido.
 
 ---
 
-## 3. AZURE -- RECURSOS E CONFIGURACAO
+## 3. AZURE — RECURSOS E CONFIGURAÇÃO
 
 ### 3.1 Resource Group
 
@@ -105,72 +115,86 @@ Tudo no resource group do projecto DBDE em Sweden Central.
 
 - **Nome:** `millennium-ai-assistant`
 - **Plan:** Linux, Python 3.12
-- **Regiao:** Sweden Central
+- **Região:** Sweden Central
 - **URL:** `millennium-ai-assistant-epa7d7b4defabwbn.swedencentral-01.azurewebsites.net`
 - **Custom domain:** `dbdeai.pt`
 - **Startup command:** `startup.sh` (usa uvicorn, port 8000, 1 worker)
 
-### 3.3 App Settings (Variaveis de Ambiente)
+### 3.3 App Settings (Variáveis de Ambiente)
 
-Estas sao as variaveis que DEVEM estar configuradas no Azure App Service -> Configuration -> Application settings:
+Estas são as variáveis que DEVEM estar configuradas no Azure App Service → Configuration → Application settings:
 
 ```
+# Azure OpenAI
 AZURE_OPENAI_ENDPOINT     = https://dbdeaccess.openai.azure.com
 AZURE_OPENAI_KEY          = (no Azure portal)
 CHAT_DEPLOYMENT           = dbde_access_chatbot
 EMBEDDING_DEPLOYMENT      = text-embedding-3-small
 API_VERSION_CHAT          = 2024-02-15-preview
 
+# Azure AI Search
 SEARCH_SERVICE            = dbdeacessrag
 SEARCH_KEY                = (no Azure portal)
 
+# Azure DevOps
 DEVOPS_PAT                = (Azure DevOps Personal Access Token)
 DEVOPS_ORG                = ptbcp
 DEVOPS_PROJECT            = IT.DIT
 
+# Azure Table Storage
 STORAGE_ACCOUNT           = dbdeaccessstorage
 STORAGE_KEY               = (no Azure portal)
 
+# Auth
 JWT_SECRET                = (custom secret)
+ADMIN_INITIAL_PASSWORD    = (password admin — lida no startup, não hardcoded)
 
-# Opcional (quando Anthropic estiver disponivel):
-ANTHROPIC_API_KEY         = (API key directa ou Azure Foundry key)
-ANTHROPIC_FOUNDRY_RESOURCE = (nome do recurso Foundry, se aplicavel)
+# CORS
+ALLOWED_ORIGINS           = https://dbdeai.pt,https://millennium-ai-assistant-...
+
+# Integrações externas (opcionais)
+FIGMA_ACCESS_TOKEN        = (Figma Personal Access Token — read permissions)
+MIRO_ACCESS_TOKEN         = (Miro OAuth token — boards:read)
+
+# Opcional (quando Anthropic estiver disponível):
+ANTHROPIC_API_KEY         = (API key direta ou Azure Foundry key)
+ANTHROPIC_FOUNDRY_RESOURCE = (nome do recurso Foundry, se aplicável)
 ```
 
 ### 3.4 Azure AI Search (Cognitive Search)
 
 - **Service:** `dbdeacessrag`
 - **Indexes:**
-  - `millennium-devops-index` -- work items indexados com embeddings
-  - `millennium-omni-index` -- conteudo do site MSE
-  - `millennium-examples-index` -- exemplos de feedback para few-shot learning
+  - `millennium-devops-index` — work items indexados com embeddings
+  - `millennium-omni-index` — conteúdo do site MSE
+  - `millennium-examples-index` — exemplos de feedback para few-shot learning
 
 ### 3.5 Azure Table Storage
 
 - **Account:** `dbdeaccessstorage`
 - **Tables criadas automaticamente no startup:**
-  - `Users` -- autenticacao (PartitionKey: "user", RowKey: username)
-  - `ChatHistory` -- conversas persistidas (PartitionKey: user_id, RowKey: conversation_id)
-  - `feedback` -- ratings 1-10 com notas
-  - `examples` -- exemplos positivos/negativos indexados
-  - `PromptRules` -- regras aprendidas pelo admin
-  - `AuditLog` -- log de utilizacao
+  - `Users` — autenticação (PartitionKey: "user", RowKey: username)
+  - `ChatHistory` — conversas persistidas (PartitionKey: "chat", RowKey: conversation_id)
+  - `feedback` — ratings 1-10 com notas
+  - `examples` — exemplos positivos/negativos indexados
+  - `PromptRules` — regras aprendidas pelo admin
+  - `AuditLog` — log de utilização
+  - `WriterProfiles` — perfis de estilo por autor
 
 ### 3.6 Azure OpenAI
 
 - **Resource:** `dbdeaccess`
 - **Deployments:**
-  - `dbde_access_chatbot` -- GPT-4.1 (ou GPT-4.1-mini, conforme configurado)
-  - `text-embedding-3-small` -- embeddings para pesquisa semantica
+  - `dbde_access_chatbot` — GPT-4.1 (ou GPT-4.1-mini, conforme configurado)
+  - `text-embedding-3-small` — embeddings para pesquisa semântica
 
 ---
 
 ## 4. DEPLOY
 
-### 4.1 Deploy via ZIP (recomendado para novas dependencias)
+### 4.1 Deploy via ZIP (OBRIGATÓRIO para produção)
 
-O ZIP deve conter o virtualenv `antenv/` completo (bin/, lib/, pyvenv.cfg) para que o Oryx do Azure o reconheca e nao tente fazer `pip install`:
+**IMPORTANTE (lição aprendida v7.2.0):** Usar SEMPRE ZIP deploy para produção. O VFS PUT (Kudu) **NÃO persiste** após restart porque o Oryx usa o ZIP artifact como source of truth e sobrescreve ficheiros individuais.
 
 ```bash
 curl -X POST \
@@ -180,901 +204,329 @@ curl -X POST \
   --data-binary @./dbde-ai-v7-patched.zip
 ```
 
-### 4.2 Deploy de ficheiros individuais (via Kudu VFS)
+**Deploy password (Kudu):** `uq6Gt0NK9L9pBGiJ0r7Wl2FfG0c6vMExcwyPf76HBTiDulJ1qp2rQm7AYLyM`
+**Deploy username:** `$millennium-ai-assistant`
 
-Para updates rapidos sem restart de dependencias:
+### 4.2 Deploy de ficheiros individuais (via Kudu VFS) — SÓ PARA DEBUG
+
+**ATENÇÃO:** VFS PUT NÃO persiste após restart em App Service com Oryx. Usar apenas para testes rápidos que não precisem sobreviver a um restart.
 
 ```bash
 BASE="https://millennium-ai-assistant-epa7d7b4defabwbn.scm.swedencentral-01.azurewebsites.net/api/vfs/site/wwwroot"
 AUTH="\$millennium-ai-assistant:<deploy-password>"
-
-# Backend
 curl -X PUT -u "$AUTH" --data-binary @./app.py "$BASE/app.py"
-curl -X PUT -u "$AUTH" --data-binary @./agent.py "$BASE/agent.py"
-curl -X PUT -u "$AUTH" --data-binary @./learning.py "$BASE/learning.py"
-curl -X PUT -u "$AUTH" --data-binary @./tools.py "$BASE/tools.py"
-
-# Frontend
-curl -X PUT -u "$AUTH" --data-binary @./index.html "$BASE/static/index.html"
 ```
 
-**Deploy password (Kudu):** `uq6Gt0NK9L9pBGiJ0r7Wl2FfG0c6vMExcwyPf76HBTiDulJ1qp2rQm7AYLyM`
-**Deploy username:** `$millennium-ai-assistant`
+### 4.3 Restart após deploy
 
-### 4.3 Restart apos deploy (KuduLite Linux)
-
-**IMPORTANTE:** O App Service Linux usa KuduLite, que **NAO** tem `/api/restart` nem suporta `DELETE /api/processes/0`. Metodos de restart que funcionam:
-
-**Metodo 1 -- restartTrigger (recomendado, via Kudu):**
+**Método 1 — restartTrigger (recomendado):**
 ```bash
-# ATENCAO: No KuduLite Linux, o path correcto e /site/wwwroot/ (NAO /site/config/)
-# Confirmado em producao em 2026-02-22 (deploy Fase 1A v7.0.3)
 curl -X PUT -u "$AUTH" \
   --data "$(date)" \
   "https://millennium-ai-assistant-epa7d7b4defabwbn.scm.swedencentral-01.azurewebsites.net/api/vfs/site/wwwroot/restartTrigger.txt"
 ```
 
-**Metodo 2 -- Azure CLI:**
+**Método 2 — Azure CLI:**
 ```bash
 az webapp restart --name millennium-ai-assistant --resource-group <RESOURCE_GROUP_NAME>
 ```
 
-**Metodo 3 -- Azure Portal:**
-Overview -> botao "Restart", ou Configuration -> General settings -> "Save" (sem alterar nada).
+**Método 3 — Azure Portal:**
+Overview → botão "Restart".
 
 ### 4.4 Notas importantes de deploy
 
-- O ZIP DEVE conter `antenv/` com o virtualenv completo (~11MB)
-- NAO criar ZIPs no macOS com o Finder -- causa corruption no virtualenv
+- NÃO criar ZIPs no macOS com o Finder — causa corruption
 - Usar `zip -r` no terminal
-- Apos ZIP deploy, o Oryx detecta `antenv/` e arranca o uvicorn via `startup.sh`
-- Frontend individual pode ser atualizado sem restart (so Kudu PUT + Ctrl+Shift+R no browser)
-- Backend individual requer restart apos PUT
-- **Validacao pos-restart:** `GET /health` (200=healthy) + `GET /api/info` (200=import chain OK)
+- Após ZIP deploy, o Oryx faz build (pode demorar 2-5 min)
+- **Validação pós-deploy:** `GET /health` + `GET /api/info` (versão + `active_tools`)
+- **NÃO incluir no ZIP:** `*.md`, `__pycache__/`, `.git/`
+
+### 4.5 Checklist de validação pós-deploy (v7.2.0)
+
+1. `GET /health` → 200
+2. `GET /api/info` → "7.2.0" + `active_tools` com search_figma/search_miro
+3. `POST /api/auth/login` → Set-Cookie `dbde_token` (HttpOnly, Secure, SameSite=Lax)
+4. `GET /api/auth/me` (com cookie) → 200
+5. `POST /chat/agent` → 200 com tool_calls
+6. Rate limit: 6× login rápido → 429
+7. CORS: `Origin: https://evil.com` → 403
+8. Figma/Miro: dados ou erro controlado
+9. `POST /chat/agent/stream` → SSE funcional
+10. Streaming incremental funcional
 
 ---
 
-## 5. AUTENTICACAO
+## 5. AUTENTICAÇÃO (v7.2.0)
 
-### 5.1 JWT
+### 5.1 JWT + httpOnly Cookies
 
-- Tokens JWT com HMAC-SHA256, implementacao manual (sem bibliotecas externas)
+- Tokens JWT com HMAC-SHA256, implementação manual
 - Expira em 10 horas (`JWT_EXPIRATION_HOURS`)
-- O `get_current_user()` e uma funcao SYNC (nao async) -- dependency do FastAPI
+- **v7.2.0:** Token armazenado em httpOnly cookie (`dbde_token`), NÃO em localStorage
+- Cookie flags: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`
+- Middleware em `app.py` extrai token do cookie e injeta em context var
+- `auth.py` resolve token: cookie → context var → bearer header (backward compat)
 
 ### 5.2 Users
 
-- Admin default: `pedro.mousinho` / `Millennium2026!` (criado no startup se nao existir)
-- Gestao de users via endpoints `/api/auth/create-user`, `/api/auth/users`, etc.
-- Passwords hasheadas com PBKDF2-SHA256, 100k iteracoes
+- Admin default: `pedro.mousinho` (password via `ADMIN_INITIAL_PASSWORD` env var)
+- Gestão de users via endpoints `/api/auth/*`
+- Passwords hasheadas com PBKDF2-SHA256, 100k iterações
 
 ---
 
-## 6. FUNCIONALIDADES DO FRONTEND
+## 6. SEGURANÇA (v7.2.0 — Fase 4.7 Security Sprint)
 
-### 6.1 Chat
+### 6.1 WIQL Sanitization
+- Blocklist regex: `;`, `--`, `/*`, `*/`, `SELECT`, `DROP`, `DELETE`, `UPDATE`, `INSERT`, `MERGE`, `EXEC`, `UNION`
+- Whitelist para work item types + validação de `parent_id` como inteiro
 
-- SSE streaming com fallback para request/response sincrono
+### 6.2 CORS Whitelist
+- `ALLOWED_ORIGINS` env var + middleware custom retorna 403
+
+### 6.3 XSS Prevention (DOMPurify)
+- DOMPurify 3.2.6, `sanitizeHtmlOutput()`, `sanitizeLinkUrl()`, `escapeHtml()`
+- Backend: `html.escape()` em `export_engine.py`
+
+### 6.4 Rate Limiting (slowapi)
+- Login: 5/min por IP; Chat: 10/min partilhado; Exports: 10/min
+- Admin boost: 5×
+
+### 6.5 httpOnly Cookies
+- JWT migrado de localStorage para cookie httpOnly
+- Frontend: `credentials: "include"` em todos os fetch
+
+---
+
+## 7. FUNCIONALIDADES DO FRONTEND
+
+### 7.1 Chat
+- SSE streaming com incremental rendering
 - Model tier selector (Fast / Standard / Pro)
-- Tool badges visuais (mostra quais ferramentas foram usadas)
-- Suporte a imagens (paste, drag & drop, file input)
-- Upload de ficheiros (Excel, CSV, PDF, texto)
-- Modo dual: "general" e "userstory" (User Story Writer)
+- Tool badges visuais
+- Upload de ficheiros (Excel, CSV, PDF, texto, SVG, PPT)
+- Gráficos interativos inline (Plotly.js)
+- Modo dual: "general" e "userstory"
 
-### 6.2 Feedback Widget
+### 7.2 Feedback Widget
+Rating 1-10. Ratings ≤3 e ≥7 indexados como exemplos few-shot. `feedback_memory = deque(maxlen=100)`.
 
-Rating 1-10 com circulos coloridos:
+### 7.3 Exports
+CSV/XLSX/PDF/SVG/HTML via `export_engine.py`. Botões inline por mensagem.
 
-- Verde (7-10): submete directamente
-- Amarelo (5-6): submete directamente
-- Vermelho (1-4): abre campo de texto "O que correu mal?" com opcao Enviar/Saltar
-
-Ratings <=3 e >=7 sao automaticamente indexados no AI Search como exemplos negativos/positivos para few-shot learning.
-
-### 6.3 Exports
-
-- **HTML:** Export client-side da conversa completa (frontend)
-- **CSV/XLSX/PDF/SVG/HTML:** Export server-side dos dados de tool results (backend `export_engine.py`)
-- O frontend envia os dados da tool result directamente no pedido de export (nao depende da memoria do servidor)
-
-### 6.4 Persistencia de conversas
-
-- Conversas guardadas no Azure Table Storage (`ChatHistory`)
-- Auto-save com debounce de 3 segundos
-- Carregamento ao login via `/api/chats/{user_id}`
-- Mensagens limitadas a 60KB JSON por conversa (trim automatico)
+### 7.4 Persistência
+Write-through para Azure Table Storage. Lazy-load ao retomar. ConversationStore MAX=200, TTL=4h.
 
 ---
 
-## 7. SISTEMA DE APRENDIZAGEM ADAPTATIVA
+## 8. SISTEMA DE APRENDIZAGEM ADAPTATIVA
 
-### 7.1 Arquitectura (v7.0.2)
+Módulo `learning.py`. Injeção efémera via `_build_llm_messages()`:
+1. **Regras aprendidas** — tabela `PromptRules`, cache 1h com lock
+2. **Exemplos semânticos** — AI Search, 3 positivos + 2 negativos
 
-O sistema de aprendizagem adaptativa vive no modulo `learning.py` e e invocado de forma **efemera** pelo `agent.py`. Antes de cada chamada ao LLM (tanto no path sync como no streaming), o `_build_llm_messages()` cria uma copia do historico e insere:
+Feedback pipeline: rating → Table Storage → se ≤3 ou ≥7 → indexa no AI Search com embedding.
 
-1. **Regras aprendidas** -- da tabela `PromptRules`, com cache de 1h em memoria. Admin pode criar/apagar via API. Cache invalidado automaticamente nos endpoints `POST/DELETE /api/learning/rules`.
-2. **Exemplos semanticos** -- pesquisa vectorial no index `millennium-examples-index` com 3 exemplos positivos (rating >=7) e 2 negativos (rating <=3) mais similares a pergunta actual. Embedding calculado via `get_embedding()` do `tools.py`.
+---
 
-**Principio chave:** As mensagens de learning sao inseridas na posicao 1 da lista de mensagens (logo apos o system prompt, antes do historico conversacional) e **nunca persistem** em `conversations[]`. Cada chamada ao LLM recebe context fresco. Isto evita bloating acumulativo e garante comportamento identico entre sync e streaming.
+## 9. TOOL REGISTRY (v7.2.0)
 
-### 7.2 Feedback pipeline
-
-```
-User clica rating -> POST /feedback -> guarda em Table Storage
-  -> se rating >=7 ou <=3:
-    -> guarda em tabela 'examples'
-    -> indexa no AI Search com embedding da pergunta
-    -> fica disponivel como few-shot example para futuras perguntas
+### 9.1 API
+```python
+register_tool(name, handler, definition)
+has_tool(name) → bool
+get_all_tool_definitions() → List[dict]
+get_registered_tool_names() → List[str]
+execute_tool(name, arguments) → Any
 ```
 
-### 7.3 Performance (v7.0.3)
+### 9.2 Auto-registo
+- `tools.py`: `_register_builtin_tools()` — 10 tools builtin
+- `tools_figma.py`: regista `search_figma` (mesmo sem token — erro controlado)
+- `tools_miro.py`: regista `search_miro` (mesmo sem token — erro controlado)
 
-O `get_few_shot_examples(question)` usa cache local em memoria (MD5 hash da pergunta normalizada, TTL 30min, max 50 entradas). Cache hit evita completamente as 3 chamadas HTTP (1 embedding + 2 AI Search). Cache miss: ~130ms. Implementado na Tarefa 1.4 da Fase 1A. A funcao `invalidate_few_shot_cache()` permite limpeza explicita.
-
----
-
-## 8. LIMITACOES ACTUAIS E PROBLEMAS CONHECIDOS
-
-### 8.1 Anthropic nao activo
-
-Os modelos Claude (Sonnet/Opus) requerem `ANTHROPIC_API_KEY`. A quota no Azure AI Foundry ainda nao foi aprovada. Ate la, tudo corre em GPT-4.1-mini via Azure OpenAI.
-
-### 8.2 Conversas in-memory (parcialmente resolvido em v7.0.3)
-
-As conversas do agent vivem em memoria via `ConversationStore` (implementado na Tarefa 1.3). O store tem MAX_CONVERSATIONS=200, TTL=4h e eviction LRU. **A partir de v7.0.5 (hotfix 2026-02-23)**, as conversas sao persistidas no Azure Table Storage (`ChatHistory`, PK=`user_id`, RK=`conv_id`) via write-through apos cada turno (Tarefa 2.2 + hardening posterior). Ao reiniciar a app, conversas sao lazy-loaded do storage quando o frontend envia o mesmo `conv_id` (Tarefa 2.3). `_persist_conversation()` comprime tool results, reduz conteudo multimodal (base64 omitido) e limita o payload ao limite do Table Storage. `_load_conversation_from_storage()` substitui o system prompt pelo actual (pode ter mudado entre deploys). O frontend envia dados directamente no pedido de export como fallback.
-
-### 8.3 Rate limiting (resolvido em v7.0.3)
-
-A API do DevOps tem retry com backoff exponencial (ate 5 tentativas, wait max 30s). **Desde v7.0.3**, o Azure AI Search tambem tem retry resiliente via `_search_request_with_retry()` (3 tentativas, 429 com Retry-After, 5xx backoff) — implementado na Tarefa 1.1. Falhas sao agora logadas em vez de silenciosas (Tarefa 1.2).
-
-### 8.4 Streaming com tool calls
-
-O streaming SSE funciona para texto puro, mas quando ha tool calls, o fluxo e: chamada non-streaming para detectar tools -> executar tools -> nova chamada -> eventualmente streaming do texto final. Nao e token-a-token puro durante a fase de tool calling.
+### 9.3 Observabilidade
+`GET /api/info` → `"active_tools": [...]`
 
 ---
 
-## 9. ROADMAP / FUNCIONALIDADES PLANEADAS
+## 10. INTEGRAÇÕES EXTERNAS (v7.2.0)
 
-### 9.1 Sprint 1 — Quick Wins (dias)
+### 10.1 Figma (read-only)
+- `tools_figma.py`, Figma REST API v1, cache 5min, retry 3×
+- `_get_figma_token()` verifica 3 fontes (config → env → APPSETTING_)
 
-- **Activar Anthropic** -- quando a quota for aprovada, adicionar `ANTHROPIC_API_KEY` e testar os 3 tiers
-- **System prompt mais abrangente** -- permitir respostas directas sem tools para perguntas gerais, conceptuais, redaccao de emails/textos. ~1h, zero codigo, valor alto
-- **Largura variavel no chat** -- texto a 900px (de 800px), tabelas/graficos expandiveis a full-width. Toggle "expandir" por mensagem. ~2-3h
-- **Polish dos exports** -- CSV, XLSX, PDF, SVG ja existem no `export_engine.py`; melhorar integracao com frontend (botoes visiveis junto de cada tabela/resultado)
-- **Cache de few-shot por request** -- optimizacao menor para evitar embedding redundante no tool loop
+### 10.2 Miro (read-only)
+- `tools_miro.py`, Miro REST API v2, cache 5min, retry 3×
+- OAuth tokens expiram ~60min — requer refresh manual
 
-### 9.2 Sprint 2 — Visualizacao e Dados (1 semana)
-
-- **Charts interactivos no frontend** -- Plotly.js ou Chart.js via CDN. O objectivo NAO e so Sankey -- e ser um sistema generico de visualizacao: o utilizador faz upload de um Excel, pede "faz um pie chart de X por Y" e o assistente gera o grafico directamente no chat. Inclui: pie, bar, line, scatter, sankey, heatmap, etc. O `compute_kpi` e file uploads ja devolvem dados estruturados; o frontend renderiza. Zero peso no backend.
-- **SVG como input e output** -- Aceitar ficheiros SVG no upload (adicionar `.svg` aos tipos aceites) para o assistente analisar diagramas, fluxos, arquitecturas. Como output, SVG e nativo do Plotly.js. Bidirecional.
-- **File generation via prompts** -- gerar CSV/XLSX/PDF directamente a partir de perguntas ("gera-me um Excel com todas as USs activas do RevampFEE")
-
-### 9.3 Sprint 3 — Integracoes Externas Leves (2-3 semanas)
-
-- **Integracoes read-only com plataformas externas** -- O conceito e simples: adicionar tools que fazem GET a APIs externas para trazer contexto para o assistente, sem modificar nada nessas plataformas. NAO e um sistema de plugins rebuscado -- sao integracoes leves, read-only, com APIs que ja expoe REST/webhooks. Exemplos concretos:
-  - **Figma** (API REST) -- buscar metadados de ficheiros, listar frames/componentes, trazer contexto de design para conversas sobre USs. O assistente pode responder "esta US refere-se a este ecra no Figma" com link directo.
-  - **Miro** (API REST) -- ler boards, sticky notes, mindmaps. Util para contexto de workshops e planning sessions. O assistente sabe o que foi discutido no Miro sem o utilizador ter de copiar tudo.
-  - Outros candidatos futuros: SharePoint (documentacao), Teams (mensagens de canais), Confluence.
-- **Arquitectura:** Cada integracao e um modulo Python independente em `tools.py` (ou ficheiro separado) com a sua tool definition e implementacao. O `agent.py` carrega tools activas dinamicamente. Credenciais via App Settings (API keys/tokens). Sem OAuth complexo -- tokens estaticos ou PATs.
-
-### 9.4 Backlog (longo prazo)
-
-- ~~**Criar work items no DevOps**~~ -- FEITO em v7.0.5 (tool `create_workitem`)
-- **Excel Add-in** -- sidebar nativa no Excel que chama a API do assistente. Requer deployment AppSource ou sideloading corporativo. MVP: 2-4 semanas
-- **Dashboard admin** -- visualizacao de metricas de utilizacao, feedback trends, gestao de regras
-- **Multi-tenant** -- suporte para multiplas equipas com areas DevOps diferentes
-- ~~**Persistent conversations server-side**~~ -- FEITO em v7.0.5 (write-through + lazy-load)
-
-### 9.5 Descartado / Baixo ROI
-
-- **Plotly+Kaleido no backend** -- +110MB no ZIP de deploy, inaceitavel. Charts ficam no frontend via CDN
-- **WeasyPrint para PDFs** -- +100MB, problemas em App Service. `export_engine.py` ja resolve
-- **Selector manual de modelo OpenAI** -- os tiers Fast/Standard/Pro ja cobrem isto; quando Anthropic activar, Standard e Pro sao Claude automaticamente
-- **VBA macros para Excel** -- demasiado nicho, ninguem vai usar
-- **Web search generico** -- complexidade alta para valor marginal fora do scope do assistente
-
----
-
-## 10. HISTORICO DE VERSOES
-
-### v7.0 -> v7.0.1 (Bug fixes)
-
-| # | Bug | Causa | Fix |
-|---|-----|-------|-----|
-| 1 | Ecra branco apos login | React hooks (useEffect/useRef) declarados apos early return `if(!auth)` -- violacao das regras do React | Movidos todos os hooks para antes do early return |
-| 2 | 500 em `/api/chats/` | `get_current_user` era `async def` mas chamado sem `await` nos endpoints | Convertido para `def` sync |
-| 3 | Feedback era so thumbs up/down | v7 simplificou demais o widget | Restaurado widget v6 com 1-10, nota quando <=4 |
-| 4 | Nao mostrava Descricao/AC | `query_workitems` ignorava o parametro `fields` | Usa `fields` custom quando fornecido |
-| 5 | LLM nao pedia Descricao/AC | Tool definition dizia "campos ignorado, usa default" | Actualizada tool definition e system prompt |
-| 6 | System prompt muito curto | v7 condensou prompt de ~60 para ~15 linhas | Restaurado prompt completo do v6 |
-| 7 | Sem few-shot examples | Agent loop v7 nao chamava `get_learned_rules()` nem `get_few_shot_examples()` | Adicionada injeccao no agent.py |
-| 8 | Export "Erro export" | Dependia de conversa in-memory (perde-se com restart) | Frontend envia dados directamente |
-
-### v7.0.1 -> v7.0.2 (Ephemeral Learning Injection)
-
-| # | Problema | Causa | Fix |
-|---|----------|-------|-----|
-| 9 | Bloating do historico com few-shot | `agent_chat()` fazia `.append()` de regras e few-shot em `conversations[]` -- acumulava system messages a cada turno | Criado `_build_llm_messages()` que constroi copia efemera; `conversations[]` so contem mensagens reais (user/assistant/tool) |
-| 10 | Streaming sem aprendizagem adaptativa | `agent_chat_stream()` nao tinha injeccao de regras nem few-shot | `_build_llm_messages()` usado nos 4 pontos de chamada LLM (sync initial, sync loop, stream loop, stream final) |
-| 11 | Circular import `from app import ...` | `agent.py` importava `get_learned_rules` e `get_few_shot_examples` de `app.py` dentro de try/except | Criado `learning.py` como modulo dedicado; imports limpos sem circularidade |
-
-**Ficheiros alterados:** `agent.py` (modificado), `app.py` (modificado), `learning.py` (novo)
-**Ficheiros intocados:** `tools.py`, `llm_provider.py`, `models.py`, `config.py`, `storage.py`, `export_engine.py`, `auth.py`, `index.html`
-**Deploy:** Kudu VFS PUT (3 ficheiros) + restart via `restartTrigger.txt`
-**Validacao:** `/health` 200, `/api/info` 200, chat sync OK, chat stream OK, bloating test PASS (+2 msgs/turno)
-
-### v7.0.2 -> v7.0.3 (Fase 1A — Bug Fixes da Auditoria)
-
-| # | Tarefa | Prioridade | Fix | Ficheiros |
-|---|--------|-----------|-----|-----------|
-| 1.0 | **Tier selector fix** — frontend enviava `tier` em vez de `model_tier`, Pydantic ignorava e usava default | P1 | Corrigido request body no POST do frontend: `tier` → `model_tier` | `static/index.html` |
-| 1.1 | **AI Search retry** — search functions falhavam silenciosamente no primeiro 429/timeout | P2 | Criado `_search_request_with_retry()` em `tools.py` (3 retries, 429/Retry-After, 5xx backoff). Aplicado a `tool_search_workitems`, `tool_search_website` e `learning._search_examples_semantic` | `tools.py`, `learning.py` |
-| 1.2 | **Silent failure logging** — 17 blocos except engoliam erros sem logging | P2 | Adicionado `logging.error`/`logging.warning` a 15 blocos em 5 ficheiros. `agent.py` main catch com `exc_info=True`. `storage.py` migrado de `print` para `logger.error` | `app.py`, `tools.py`, `agent.py`, `storage.py`, `auth.py` |
-| 1.3 | **Memory eviction** — conversas em memoria cresciam sem limite | P1 | `ConversationStore` com MAX=200, TTL=4h, LRU eviction. Limpa `conversation_meta` e `uploaded_files_store` junto | `agent.py` |
-| 1.4 | **Few-shot cache** — 3 HTTP calls por mensagem sem cache | P3 | Cache local por MD5 hash (TTL 30min, cap 50 entradas). `invalidate_few_shot_cache()` exposta | `learning.py` |
-
-**Ficheiros alterados:** `static/index.html`, `tools.py`, `learning.py`, `app.py`, `agent.py`, `storage.py`, `auth.py`
-**Ficheiros intocados:** `llm_provider.py`, `models.py`, `config.py`, `export_engine.py`
-**Deploy:** Kudu VFS PUT (7 ficheiros) + restart via `restartTrigger.txt`
-**Validacao:** Tier selector funcional (Fast→GPT-4.1-mini, Standard, Pro), AI Search retry com logging, falhas visiveis nos logs, memoria controlada com eviction, few-shot cache hit em perguntas repetidas
-**Data:** 2026-02-22
-
-### v7.0.3 -> v7.0.4 (Fase 1B — Quick Wins e UX)
-
-| # | Tarefa | Fix | Ficheiros |
-|---|--------|-----|-----------|
-| 1.5 | **System prompt mais abrangente** — LLM chamava tools para perguntas conceptuais/redaccao | Expandido bloco "RESPOSTA DIRECTA SEM FERRAMENTAS" com 6 categorias e exemplos concretos | `tools.py` |
-| 1.6 | **Largura variavel no chat** — tabelas e code blocks limitados a 900px | `.table-wrapper` e `pre` com `max-width: calc(100vw - 340px)`. Bolha streaming com `maxWidth: "min(900px, 100%)"` | `static/index.html` |
-| 1.7 | **Export buttons por mensagem** — exports so no header, dificeis de encontrar | Botoes CSV/XLSX/PDF/HTML junto de cada mensagem com dados. Nova funcao `exportMessageData()`. Hotfix: SSE path agora persiste `tool_details`/`tool_results` no evento `done` | `static/index.html` |
-| 1.8 | **SVG como input** — upload de SVGs nao aceite | Adicionado `.svg` ao `accept` do file input. Handler explicito em `app.py` com `col_names=["svg"]` | `static/index.html`, `app.py` |
-| 1.9 | **Ativar Anthropic** | CONGELADA — quota nao aprovada | — |
-
-**Ficheiros alterados:** `static/index.html`, `tools.py`, `app.py`, `config.py`
-**Ficheiros intocados:** `agent.py`, `learning.py`, `llm_provider.py`, `models.py`, `storage.py`, `export_engine.py`, `auth.py`
-**Deploy:** Kudu VFS PUT (4 ficheiros) + restart via `restartTrigger.txt` em `/site/wwwroot/`
-**Validacao:** `/api/info` v7.0.4, `/health` healthy, resposta directa sem tools para perguntas conceptuais, upload SVG aceite, tabelas com scroll horizontal, export por mensagem funcional (sync e streaming)
-**Nota:** Hotfix aplicado pelo Pedro durante validacao — SSE path nao persistia tool_details na mensagem final
-**Data:** 2026-02-23
-
-### v7.0.4 -> v7.0.5 (Fase 2 — DevOps Write + Memoria Persistente)
-
-| # | Tarefa | Fix | Ficheiros |
-|---|--------|-----|-----------|
-| 2.1 | **Tool create_workitem** — agente passa de leitor a escritor | Nova `tool_create_workitem()` com JSON Patch (`application/json-patch+json`), retry inline (3 tentativas), extrai `_links.html.href`. TOOLS array com 8 entries. System prompt com routing rule 8 e regra critica de confirmacao | `tools.py` |
-| 2.2 | **Write-through para Table Storage** — conversas sobrevivem a restarts | `_persist_conversation()` fire-and-forget via `asyncio.create_task`. Comprime tool results (>500 chars → summary), limita user/assistant a 8000 chars, fallback para ultimas 10 msgs se >60KB. Upsert real: query→insert/merge (table_merge nao cria entidades novas) | `agent.py` |
-| 2.3 | **Lazy-load de conversas** — continuidade apos restart | `_load_conversation_from_storage()` carrega de ChatHistory (PK=chat, RK=conv_id). System prompt substituido pelo actual (pode mudar entre deploys). `_ensure_conversation()` agora async. Call sites actualizados com await em sync e stream | `agent.py` |
-| — | **Hotfix: PDF export 500** — fpdf2 crashava com Unicode fora de Latin-1 | `_latin1_safe()` sanitiza strings para core fonts. `to_pdf()` envolvido em try/except com fallback PDF minimo. `safe_filename` em todos os Content-Disposition headers | `export_engine.py`, `app.py` |
-| — | **Hotfix: Export inteligente** — botoes de export apareciam em respostas sem dados | `messageHasExportableData()` + `getFirstExportableData()` verificam payload real. Botoes de export removidos do header, ficam apenas inline por mensagem | `static/index.html` |
-| — | **Hotfix: XLSX sheet title** — caracteres invalidos no titulo da worksheet | `_safe_sheet_title()` sanitiza `[]:*?/\`, fallback "Export", limita 31 chars | `export_engine.py` |
-
-**Ficheiros alterados:** `tools.py`, `agent.py`, `export_engine.py`, `app.py`, `static/index.html`, `config.py`
-**Ficheiros intocados:** `learning.py`, `llm_provider.py`, `models.py`, `storage.py`, `auth.py`
-**Deploy:** Kudu VFS PUT (6 ficheiros) + restart via `restartTrigger.txt` em `/site/wwwroot/`
-**Validacao:** Chat normal OK, exports CSV/XLSX/PDF/HTML OK (titulo com caracteres especiais), create_workitem com fluxo confirmacao OK, persistencia em ChatHistory OK, lazy-load apos restart OK, SSE streaming OK, `/api/info` v7.0.5
-**Data:** 2026-02-23
-
-### v7.0.5 -> (Fase 3 — Charts e Visualizacao, EM PROGRESSO)
-
-| # | Tarefa | Fix | Ficheiros | Estado |
-|---|--------|-----|-----------|--------|
-| 3.1 | **Plotly.js no Frontend** — CDN `plotly-2.35.2.min.js` defer, `renderPlotlyChart()` com branding Millennium (colorway), `ChartBlock` com useRef/useEffect + botoes SVG/PNG, `getChartSpecs()` extrai `_chart` de tool_results | `static/index.html` | FECHADA |
-| 3.2 | **Tool generate_chart** — `tool_generate_chart()` com 6 tipos (bar/pie/line/scatter/histogram/hbar), multi-series via param `series`, retorna `_chart` Plotly spec. TOOLS com 9 entries. System prompt regra 9: "compute_kpi DEPOIS generate_chart" | `tools.py` | FECHADA |
-| 3.3 | **Upload enrichment para charts** — `col_analysis` no endpoint `/upload` com deteccao de tipo (numeric/text por heuristica >60%). `_inject_file_context()` inclui bloco "ANALISE DE COLUNAS" + instrucao para generate_chart | `app.py`, `agent.py` | FECHADA |
-| 3.4 | **Export de charts** — botoes SVG/PNG via `Plotly.downloadImage`. Parcialmente implementado no ChartBlock da 3.1 — pode precisar apenas de validacao | `static/index.html` | PENDENTE |
-| 3.5 | **File generation via prompts** — tool `generate_file` para gerar CSV/XLSX/PDF a partir de dados estruturados | `tools.py`, `app.py`, `export_engine.py`, `static/index.html` | PENDENTE |
-
-**Nota:** 3.1-3.3 implementadas pelo Codex, validadas arquiteturalmente pelo Claude e **deployadas em producao** (2026-02-23). Tarefas 3.4-3.5 ainda nao foram enviadas ao Codex.
-**Deploy executado:** Kudu VFS PUT (`tools.py`, `agent.py`, `app.py`, `learning.py`, `static/index.html`) + restart via `restartTrigger.txt`.
-
-### v7.0.5 hotfix (2026-02-23, pos-auditoria de robustez)
-
-| Tipo | Fix | Ficheiros |
-|------|-----|-----------|
-| Seguranca | Confirmacao de `create_workitem` reforcada: negações bloqueiam (`nao confirmo`, `nunca`), aprovacoes comuns aceites (`sim`, `avanca`, `podes criar`, `podes avancar`, `claro`, `yep`) | `agent.py` |
-| Dados | `col_analysis` no upload usa delimitador dinamico detectado no CSV (`sep`) em vez de split hardcoded por virgula | `app.py` |
-| Estado | Isolamento por utilizador no ChatHistory (`PartitionKey=user_id`), lock por conversa em sync+stream, compactacao multimodal no write-through | `agent.py` |
-| Frontend | Plotly hardening (`Plotly.react` + `Plotly.purge`) para evitar leaks em sessoes longas | `static/index.html` |
-| Resiliencia | Hardening de `create_workitem` (whitelist de tipo, sanitizacao, `quote`, retry de `RequestError`) | `tools.py` |
-
-**Validacao pos-deploy (executada):** `GET /api/info` -> version `7.0.5`, status `running`; `GET /health` -> status `healthy`, embeddings `ok`, search devops/omni `ok`.
+### 10.3 Routing dinâmico
+System prompt constrói `data_sources` e regras com `has_tool()`. Prioridade: "pedidos sobre Figma/Miro DEVEM usar as respetivas tools".
 
 ---
 
 ## 11. ESTRUTURA DOS ENDPOINTS
 
 ### Chat/Agent
-- `POST /chat/agent` -- Chat sincrono (retorna `AgentChatResponse`)
-- `POST /chat/agent/stream` -- Chat SSE streaming
-- `POST /chat/file` -- Backward compat (redirige para /chat/agent)
+- `POST /chat/agent` — Chat síncrono. Rate limit: 10/min.
+- `POST /chat/agent/stream` — SSE streaming. Rate limit: 10/min.
 
 ### Auth
-- `POST /api/auth/login` -- Login (retorna JWT)
-- `POST /api/auth/create-user` -- Criar user (admin only)
-- `GET /api/auth/users` -- Listar users (admin only)
-- `DELETE /api/auth/users/{username}` -- Desactivar user
-- `POST /api/auth/change-password` -- Mudar password
-- `POST /api/auth/reset-password/{username}` -- Reset (admin)
-- `GET /api/auth/me` -- Info do user actual
+- `POST /api/auth/login` — Login (httpOnly cookie). Rate limit: 5/min.
+- `POST /api/auth/logout` — Logout (limpa cookie).
+- `POST /api/auth/create-user` — Criar user (admin)
+- `GET /api/auth/users` — Listar users (admin)
+- `DELETE /api/auth/users/{username}` — Desativar user
+- `POST /api/auth/change-password` — Mudar password
+- `POST /api/auth/reset-password/{username}` — Reset (admin)
+- `GET /api/auth/me` — Info do user atual
 
 ### Mode
-- `POST /api/mode/switch` -- Mudar modo (general/userstory)
+- `POST /api/mode/switch` — Mudar modo (general/userstory)
 
 ### File Upload
-- `POST /upload` -- Upload ficheiro (Excel, CSV, PDF, texto)
+- `POST /upload` — Upload ficheiro (Excel, CSV, PDF, texto, SVG, PPT)
 
 ### Export
-- `POST /api/export` -- Export dados (CSV, XLSX, PDF, SVG, HTML)
+- `POST /api/export` — Export dados (CSV, XLSX, PDF, SVG, HTML)
 
 ### Feedback
-- `POST /feedback` -- Submeter rating 1-10 + nota
-- `GET /feedback/stats` -- Estatisticas
+- `POST /feedback` — Submeter rating 1-10 + nota
+- `GET /feedback/stats` — Estatísticas
 
 ### Chat Persistence
-- `POST /api/chats/save` -- Guardar conversa
-- `GET /api/chats/{user_id}` -- Listar conversas
-- `GET /api/chats/{user_id}/{conversation_id}` -- Obter conversa
-- `DELETE /api/chats/{user_id}/{conversation_id}` -- Apagar conversa
+- `POST /api/chats/save` — Guardar conversa
+- `GET /api/chats/{user_id}` — Listar conversas
+- `GET /api/chats/{user_id}/{conversation_id}` — Obter conversa
+- `DELETE /api/chats/{user_id}/{conversation_id}` — Apagar conversa
 
 ### Learning
-- `POST /api/learning/rules` -- Adicionar regra (admin)
-- `GET /api/learning/rules` -- Listar regras
-- `DELETE /api/learning/rules/{rule_id}` -- Apagar regra
-- `POST /api/learning/analyze` -- Analisar feedback (admin)
+- `POST /api/learning/rules` — Adicionar regra (admin)
+- `GET /api/learning/rules` — Listar regras
+- `DELETE /api/learning/rules/{rule_id}` — Apagar regra
 
 ### Info/Debug
-- `GET /api/info` -- Info da app, modelos, capabilities
-- `GET /health` -- Health check com status dos servicos
-- `GET /debug/conversations` -- Debug conversas (admin)
-- `GET /` -- Serve o frontend
+- `GET /api/info` — Info da app + **active_tools**
+- `GET /health` — Health check
+- `GET /debug/conversations` — Debug (admin)
 
 ---
 
 ## 12. REGRAS IMPORTANTES PARA O AGENTE
 
-### 12.1 Workflow de deploy
-
-Para updates rapidos (sem novas dependencias):
-1. Output APENAS os ficheiros alterados
-2. Deploy via Kudu VFS PUT
-3. Restart via `restartTrigger.txt` (ver seccao 4.3)
-4. NAO criar ZIP packages desnecessarios
-
-Para updates com novas dependencias:
-1. Criar virtualenv `antenv/` com todas as deps
-2. ZIP tudo incluindo `antenv/`
-3. Deploy via zipdeploy
+### 12.1 Deploy
+**SEMPRE ZIP deploy para produção.** VFS PUT não persiste.
 
 ### 12.2 React no frontend
-
-- Sem build step -- React 18 via CDN + Babel standalone
-- `React.createElement()` em vez de JSX
-- Hooks DEVEM ser chamados ANTES de qualquer early return
-- A ordem dos hooks deve ser identica em todos os renders
+- CDN + Babel, sem build step
+- Hooks ANTES de early returns
+- DOMPurify para sanitização
 
 ### 12.3 Azure DevOps WIQL
-
-- Project e sempre `IT.DIT`
-- Areas sob `IT.DIT\DIT\ADMChannels\DBKS\AM24\`
-- Nomes de pessoas sao completos (ex: "Jorge Eduardo Rodrigues")
-- Campos extra (Description, AcceptanceCriteria) devem ser pedidos explicitamente no parametro `fields`
-- Rate limits: max 200 IDs por batch, retry com backoff
+- Project: `IT.DIT`, Áreas: `IT.DIT\DIT\ADMChannels\DBKS\AM24\*`
+- WIQL sanitizada via blocklist + whitelist
 
 ### 12.4 LLM Provider
+- Formato canónico OpenAI, tradução automática para Anthropic
+- Fallback automático
 
-- Formato canonico das mensagens: OpenAI format
-- Para Anthropic: traducao automatica em `llm_provider.py`
-- Tool definitions em formato OpenAI, traduzidas on-the-fly para Anthropic
-- Fallback automatico: se provider primario falhar, tenta fallback (Azure OpenAI)
+### 12.5 Learning
+- Toda a lógica em `learning.py`, injeção efémera, nunca mutar `conversations[]`
 
-### 12.5 Learning / Aprendizagem Adaptativa
+### 12.6 Tool Registry
+- Novas tools via `register_tool()`, auto-registo no import
+- System prompt dinâmico com `has_tool()`
+- `active_tools` em `/api/info`
 
-- Toda a logica de learning vive em `learning.py` (NAO em `app.py` nem `agent.py`)
-- A injeccao e sempre efemera via `_build_llm_messages()` -- nunca mutar `conversations[]` com dados de learning
-- Cache de regras invalida-se automaticamente via `invalidate_prompt_rules_cache()` nos endpoints de regras
-- O `app.py` mantem apenas `_index_example()` (indexacao de feedback no AI Search) porque depende dos endpoints de feedback
-
----
-
-## 13. ROADMAP DE 1-2 MESES (Fev-Abr 2026)
-
-> Plano de execucao unificado: bugs da auditoria + features novas + melhorias de arquitectura.
-> Cada fase so avanca quando a anterior esta estavel em producao.
-> Datas sao estimativas — dependem de aprovacoes (Anthropic quota) e disponibilidade.
-> Origem: merge da auditoria Codex (findings P1-P3) + investigacao de melhorias + novas features.
-
-### FASE 1A — Bug Fixes da Auditoria ~~(Semana 1, ~24 Fev - 28 Fev)~~ COMPLETA 2026-02-22
-
-**Objectivo:** Corrigir bugs reais identificados na auditoria. PRIORITARIO — fazer ANTES de qualquer feature nova.
-**STATUS: COMPLETA** — Todas as 5 tarefas (1.0-1.4) implementadas e validadas. Ver secção 10 para detalhes.
-
-| # | Tarefa | Prioridade | Ficheiros | Esforco | Notas |
-|---|--------|-----------|-----------|---------|-------|
-| 1.0 | **Fix tier selector** — frontend envia `tier` em vez de `model_tier`, o Pydantic ignora e usa sempre default. Mudar `tier: modelTier` para `model_tier: modelTier` no POST do frontend | P1 | `static/index.html` (~linha 754) | 15min | Sem isto, o seletor Fast/Standard/Pro nao funciona — e decorativo |
-| 1.1 | **AI Search retry** — criar `_search_with_retry()` em `tools.py` com 3 tentativas e backoff (1-3-5s para 429). Usar em `search_workitems`, `search_website`, e em `learning.py` no `_search_examples_semantic` | P2 | `tools.py`, `learning.py` | 2h | Sem isto, um 429 do AI Search devolve resultado vazio silenciosamente |
-| 1.2 | **Logging de falhas silenciosas** — substituir todos os `except: pass` e `except Exception: return []` por logging com `print(f"[modulo] descricao: {e}")`. Especialmente em `app.py` (`_index_example`) e `learning.py` (`_search_examples_semantic`) | P2 | `app.py`, `learning.py` | 1h | Sem isto, nao sabemos quando o learning falha |
-| 1.3 | **Eviction de conversas em memoria** — substituir os 3 dicts globais em `agent.py` por um `ConversationStore` com max 200 entries, TTL 4h, cleanup a cada 30min. Background task no `app.py` startup | P1 | `agent.py`, `app.py` | 3h | Sem isto, memoria cresce sem limite. Com ~10-20 users nao e OOM iminente mas conversas abandonadas nunca limpam e impede scale-out |
-| 1.4 | **Cache de few-shot por request** — cachear resultado de `get_few_shot_examples(question)` na primeira chamada dentro do mesmo request, reutilizar nas iteracoes seguintes | P3 | `agent.py` | 1-2h | Optimizacao de ~100ms por iteracao extra (~650ms worst case com 5 iteracoes) |
-
-**Deploy:** Kudu VFS PUT (index.html, tools.py, learning.py, app.py, agent.py) + restart
-**Validacao:** Seletor de tiers funcional (Fast devolve GPT-4.1-mini), AI Search retry nao falha silenciosamente, logs visiveis no App Service, memoria controlada
-**Resultado:** v7.0.3
+### 12.7 Segurança
+- httpOnly cookies, DOMPurify, CORS whitelist, rate limiting, WIQL sanitization
+- Tokens APENAS em App Settings
 
 ---
 
-### FASE 1B — Quick Wins e UX ~~(Semana 2, ~3 Mar - 7 Mar)~~ COMPLETA 2026-02-23
+## 13. HISTÓRICO DE VERSÕES
 
-**Objectivo:** Melhorias de UX e funcionalidade sem tocar na arquitectura. Zero risco.
-**STATUS: COMPLETA** — Tarefas 1.5-1.8 implementadas e validadas. Tarefa 1.9 congelada (quota Anthropic). Ver secção 10 para detalhes.
+### v7.0 → v7.0.1 (Bug fixes)
+8 bugs corrigidos: ecrã branco, 500 em chats, feedback widget, campos Description/AC, system prompt, few-shot, exports.
 
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 1.5 | System prompt mais abrangente — adicionar regras para respostas directas sem tools (perguntas gerais, conceptuais, redaccao de emails/textos) | `tools.py` (system prompt) | 1h | Nenhuma |
-| 1.6 | Largura variavel no chat — `maxWidth` de 800→900px para texto, tabelas/codigo expandiveis a full-width, toggle "expandir" por mensagem | `static/index.html` | 2-3h | Nenhuma |
-| 1.7 | Polish dos export buttons — botoes de export visiveis junto de cada tabela/resultado no chat (CSV, XLSX, PDF, HTML). O backend ja suporta, falta o frontend mostrar | `static/index.html` | 3-4h | Nenhuma |
-| 1.8 | SVG como input — adicionar `.svg` aos tipos aceites no upload. O conteudo SVG e texto, basta passar ao LLM como contexto | `app.py` (upload endpoint), `static/index.html` (file filter) | 1h | Nenhuma |
-| 1.9 | Activar Anthropic — adicionar `ANTHROPIC_API_KEY` nas App Settings e testar os 3 tiers | `config.py` (ja preparado), Azure Portal | 30min | Quota aprovada |
+### v7.0.1 → v7.0.2 (Ephemeral Learning)
+`_build_llm_messages()` efémero, `learning.py` como módulo dedicado.
 
-**Deploy:** Kudu VFS PUT (index.html, tools.py, app.py) + restart
-**Validacao:** Testar chat geral sem tools, testar exports, testar upload SVG, testar tiers
-**Resultado:** v7.0.4
+### v7.0.2 → v7.0.3 (Fase 1A — Auditoria)
+Tier selector fix, AI Search retry, logging de falhas, ConversationStore com eviction, few-shot cache.
 
----
+### v7.0.3 → v7.0.4 (Fase 1B — UX)
+System prompt abrangente, largura variável, export buttons inline, SVG input.
 
-### FASE 2 — Criar no DevOps + Memoria Persistente (Semana 3, ~10-14 Mar) ✅ COMPLETA
+### v7.0.4 → v7.0.5 (Fase 2 — DevOps Write + Memória)
+`create_workitem`, write-through, lazy-load.
 
-**Objectivo:** O agente passa de leitor a escritor. Conversas sobrevivem a restarts.
+### v7.0.5 → v7.1.0 (Fase 3 — Charts)
+Plotly.js frontend, `generate_chart` tool, upload enrichment para charts.
 
-| # | Tarefa | Ficheiros | Estado |
-|---|--------|-----------|--------|
-| 2.1 | **Nova tool `create_workitem`** — POST JSON Patch com retry inline, tool definition + routing rule 8 + confirmacao obrigatoria | `tools.py` | FECHADA |
-| 2.2 | **Write-through para Table Storage** — `_persist_conversation()` fire-and-forget, compressao, upsert real (query→insert/merge) | `agent.py` | FECHADA |
-| 2.3 | **Lazy-load em `_ensure_conversation()`** — `_load_conversation_from_storage()`, async conversion, system prompt refresh | `agent.py` | FECHADA |
+### v7.1.0 → v7.1.1 (Fase 4 — US Writer Pro)
+Ciclo Draft→Review→Final, WriterProfiles, upload pre-processing, PPT support.
 
-**Nota:** Tarefas 2.1+2.2 do roadmap original foram consolidadas na Tarefa 2.1 (tool + definition + prompt numa so tarefa). Tarefas 2.3+2.4 originais mapearam para 2.2 (write-through) e 2.3 (lazy-load).
+### v7.1.1 → v7.2.0 (Fase 4.7 Security + Fase 5)
 
-**Deploy:** Kudu VFS PUT (tools.py, agent.py, export_engine.py, app.py, static/index.html, config.py) + restart
-**Validacao:** Todos os 7 testes PASS. v7.0.5 em producao.
-**Data:** 2026-02-23
+**Security (4.7):** WIQL sanitization, CORS whitelist, DOMPurify XSS, httpOnly cookies, rate limiting (slowapi), admin password env var, feedback deque, html.escape, cache lock.
+
+**Fase 5:** tool_registry.py, tools_figma.py, tools_miro.py, streaming optimization, dynamic system prompt, active_tools observabilidade.
+
+**Ficheiros novos:** `tool_registry.py`, `tools_figma.py`, `tools_miro.py`
+**Deploy:** ZIP deploy (slowapi nova dependência). Data: 2026-02-23.
 
 ---
 
-### FASE 3 — Charts e Visualizacao (Semana 4-5, ~17-28 Mar) EM PROGRESSO
+## 14. ROADMAP (a partir de v7.2.0)
 
-**Objectivo:** Sistema generico de visualizacao. Upload de dados → pedir qualquer tipo de grafico → renderizado no chat.
+### Pendente
+- 3.4: Export de charts (SVG/PNG) — validar
+- 3.5: File generation via prompts
 
-| # | Tarefa | Ficheiros | Esforco | Estado |
-|---|--------|-----------|---------|--------|
-| 3.1 | Plotly.js via CDN (2.35.2 defer) + `renderPlotlyChart()` + `ChartBlock` + `getChartSpecs()` | `static/index.html` | 3-4h | ✅ FECHADA |
-| 3.2 | Tool `generate_chart` (bar/pie/line/scatter/histogram/hbar, multi-series, `_chart` spec) + regra 9 system prompt | `tools.py` | 6-8h | ✅ FECHADA |
-| 3.3 | Upload enrichment: `col_analysis` com tipo numeric/text + `_inject_file_context` com instrucao generate_chart | `app.py`, `agent.py` | 4-6h | ✅ FECHADA |
-| 3.4 | Export de charts — botoes SVG/PNG (parcialmente feito no ChartBlock da 3.1, validar) | `static/index.html` | 2h | PENDENTE |
-| 3.5 | File generation via prompts — tool `generate_file` para CSV/XLSX/PDF a partir de dados estruturados | `tools.py`, `app.py`, `export_engine.py`, `static/index.html` | 4-6h | PENDENTE |
+### Fase 6 — Análise Profunda (bonus)
+- 6.1: PDF chunking + indexação
+- 6.2: Tool search_uploaded_document
+- 6.3: Daily digest endpoint
 
-**Deploy:** Kudu VFS PUT (todos) + restart. Nao ha dependencias novas (Plotly.js e CDN)
-**Validacao:** Upload Excel → pedir pie chart → ver grafico → download SVG. Query DevOps → pedir bar chart. "Gera-me um Excel com..." → download ficheiro.
-**Resultado:** v7.1.0 (major: novas tools e frontend charting)
+### Backlog
+- Ativar Anthropic (quota pendente)
+- Excel Add-in
+- Dashboard admin
+- Multi-tenant
+- Refresh automático tokens Figma/Miro
 
----
-
-### FASE 4 — US Writer Pro (Semana 6, ~31 Mar - 4 Abr)
-
-**Objectivo:** Modo userstory torna-se inteligente — ciclo de refinamento, perfis de escritor, visual parsing.
-
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 4.1 | **System prompt rewrite do `get_userstory_system_prompt()`** — ciclo Draft→Review→Final: LLM gera draft, apresenta, se user dá feedback re-chama generate_user_stories com feedback como context. Instrucoes de visual parsing (imagens→CTAs, inputs, labels) | `tools.py` | 2h | Nenhuma |
-| 4.2 | **WriterProfiles table** — nova tabela no Table Storage. Cache de estilos por autor (output do analyze_patterns com analysis_type="author_style"). Carregamento em `generate_user_stories` para "gera USs como o Jorge escreve" sem refazer analyze do zero | `tools.py`, `storage.py` | 3h | Nenhuma |
-| 4.3 | **Upload pre-processing inteligente** — quando modo e userstory, pre-processar conteudo: Excel→lista estruturada de requisitos, PDF→seccoes e headings como contexto hierarquico | `agent.py` | 3h | Nenhuma |
-| 4.4 | **PPT support no upload** — adicionar `python-pptx` para extrair texto de slides como sequencia de requisitos | `app.py` | 2h | ZIP deploy (nova dependencia) |
-
-**Deploy:** ZIP deploy (python-pptx e nova dependencia)
-**Validacao:** Upload Figma screenshot + Excel requisitos → "gera USs como o Jorge escreve" → USs com estilo correcto e referencia a componentes visuais.
-**Resultado:** v7.1.1
+### Descartado
+- Plotly+Kaleido backend (+110MB)
+- WeasyPrint (+100MB)
+- VFS PUT para produção (não persiste)
+- VBA macros, web search genérico
 
 ---
 
-### FASE 5 — Integracoes Externas + Frontend Polish (Semana 7-8, ~7-18 Abr)
+## 15. MENSAGEM PARA O CODEX
 
-**Objectivo:** Trazer contexto de Figma e Miro. Optimizar frontend.
+### CONTEXTO OBRIGATÓRIO
+1. Ler este ficheiro completo
+2. Ler ficheiros que vai alterar
+3. Respeitar regras da secção 12
+4. Deploy SEMPRE via ZIP
+5. Novas tools via `register_tool()`
+6. Tokens APENAS em env vars
 
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 5.1 | **Registry de tools dinamico** — refactor de `tools.py` para suportar TOOL_REGISTRY. Cada integracao e um ficheiro separado. `agent.py` usa `get_tool_handler()` em vez de dispatch manual | `tools.py` (refactor), `agent.py` | 4-6h | Nenhuma |
-| 5.2 | **Integracao Figma (read-only)** — tool `search_figma` via Figma REST API v1. Buscar ficheiros, listar frames, devolver metadados + thumbnails + links directos | `tools_figma.py` (novo), `config.py` | 8-12h | 5.1 |
-| 5.3 | **Integracao Miro (read-only)** — tool `search_miro` via Miro REST API v2. Listar boards, ler sticky notes/shapes/text, devolver conteudo + links | `tools_miro.py` (novo), `config.py` | 8-12h | 5.1 |
-| 5.4 | System prompt update para Figma/Miro — "quando mencionar designs/mockups → Figma"; "quando mencionar workshops/brainstorms → Miro" | `tools.py` | 1-2h | 5.2, 5.3 |
-| 5.5 | **Streaming optimization** — `React.memo` no MessageBubble, so re-render do ultimo bloco durante streaming. Com respostas >2000 chars o re-render de `renderMarkdown()` fica visivelmente lento | `static/index.html` | 2h | Nenhuma |
-| 5.6 | **feedback_memory cap** — limitar a 100 entries para evitar crescimento ilimitado | `app.py` | 30min | Nenhuma |
-
-**Deploy:** ZIP deploy (novos ficheiros Python). Nao ha dependencias pip novas (usa httpx que ja existe)
-**Validacao:** "Mostra-me os ecras do Figma do RevampFEE" → lista de frames. "O que foi discutido no Miro?" → conteudo. Chat fluido com respostas longas.
-**Resultado:** v7.2.0
-**Pre-requisito Pedro:** Configurar FIGMA_ACCESS_TOKEN e MIRO_ACCESS_TOKEN nas App Settings.
-
----
-
-### FASE 6 — Analise Profunda (Semana 9-10, se houver tempo)
-
-**Objectivo:** O agente analisa documentos completos e gera digests.
-
-| # | Tarefa | Ficheiros | Esforco | Dependencia |
-|---|--------|-----------|---------|-------------|
-| 6.1 | **PDF chunking + indexacao temporaria** — documentos >50K chars sao divididos em chunks e indexados no AI Search (index temporario ou no `millennium-omni-index`). Permite pesquisa semantica em docs de 100+ paginas | `app.py`, `tools.py` | 4h | Nenhuma |
-| 6.2 | **Nova tool `search_uploaded_document`** — pesquisa semantica no documento carregado. O user pergunta "o que diz o capitulo 3?" e o agente encontra | `tools.py` | 2h | 6.1 |
-| 6.3 | **Daily digest endpoint** — `/api/digest` que gera HTML com: USs criadas ontem, bugs abertos >7 dias, items sem assignee, KPIs da semana | `app.py` | 3h | Nenhuma |
-
-**Deploy:** Kudu VFS PUT + restart
-**Validacao:** Upload PDF longo → perguntar sobre seccoes especificas → respostas precisas. GET /api/digest → HTML com resumo.
-**Resultado:** v7.2.1
+### REGRAS
+1. UMA tarefa de cada vez
+2. Ler antes de escrever
+3. Mínimo de ficheiros
+4. Testar mentalmente
+5. Não inventar — perguntar
+6. React hooks antes de early returns
+7. Sem dependências novas sem indicação
+8. Output limpo para ZIP deploy
+9. Nunca regredir segurança
+10. Tool registry para novas tools
 
 ---
 
-### TIMELINE VISUAL
-
-```
-Sem 1        Sem 2        Sem 3         Sem 4-5        Sem 6         Sem 7-8        Sem 9-10
-Fev 24-28    Mar 3-7      Mar 10-14     Mar 17-28      Mar 31-Abr4   Abr 7-18       Abr 21+
-
- FASE 1A      FASE 1B      FASE 2        FASE 3         FASE 4        FASE 5         FASE 6
- Bug Fixes    UX Wins      DevOps Write  Charts &       US Writer     Figma+Miro     Deep
- v7.0.3       v7.0.4       + Memoria     Visualizacao   Pro           + Polish       Analysis
- ✅ DONE      ✅ DONE      ✅ DONE       ⏳ 3/5 DONE   v7.1.1        v7.2.0         v7.2.1
-                           v7.0.5        v7.1.0
-
- [tier fix]   [prompt]     [create_wi]   [Plotly CDN]✅  [draft→final] [tool registry] [PDF chunk]
- [retry]      [largura]    [write-thru]  [gen_chart]✅   [profiles]    [figma tool]    [search_doc]
- [logging]    [exports]    [lazy-load]   [upload→chart]✅ [upload pre]  [miro tool]     [digest]
- [eviction]   [SVG input]                [chart export]  [PPT]         [streaming opt]
- [fs cache]   [Anthropic?]               [gen_file]                    [fb_mem cap]
-```
-
-### NOTAS
-
-- **Fases 1A-3 sao as criticas.** Corrigem bugs, adicionam DevOps write, memoria persistente, e charts.
-- **Fases 4-5 sao diferenciadoras.** US Writer Pro e integracoes Figma/Miro tornam o agente unico.
-- **Fase 6 e bonus.** So se houver tempo. Pode ser adiada sem impacto.
-- **Cada fase e independente apos a 1A.** Se ficares atrasado, podes saltar fases sem quebrar as anteriores.
-- **A regra de ouro:** uma fase, um deploy, uma validacao, proxima fase.
-
----
-
-### 9.5 Descartado / Baixo ROI
-
-- **Plotly+Kaleido no backend** -- +110MB no ZIP de deploy, inaceitavel. Charts ficam no frontend via CDN
-- **WeasyPrint para PDFs** -- +100MB, problemas em App Service. `export_engine.py` ja resolve
-- **Selector manual de modelo OpenAI** -- os tiers Fast/Standard/Pro ja cobrem isto; quando Anthropic activar, Standard e Pro sao Claude automaticamente
-- **VBA macros para Excel** -- demasiado nicho, ninguem vai usar
-- **Web search generico** -- complexidade alta para valor marginal fora do scope do assistente
-
----
-
-## 14. MENSAGEM PARA O CODEX
-
-> Instrucoes estruturadas para o agente de implementacao. Executar por ordem, uma tarefa de cada vez.
-> **REGRA FUNDAMENTAL:** Nunca implementar mais do que uma tarefa por sessao. Validar, testar, e so depois avancar para a proxima.
-
----
-
-### CONTEXTO OBRIGATORIO
-
-Antes de qualquer implementacao, o agente DEVE:
-1. Ler este ficheiro completo (`DBDE_AI_ASSISTANT_V7_HANDOFF.md`) para entender a arquitectura
-2. Ler os ficheiros que vai alterar para entender o codigo actual
-3. Respeitar as regras da seccao 12 (deploy workflow, React hooks, WIQL, etc.)
-4. NAO alterar ficheiros que nao estao listados na tarefa
-5. NAO instalar dependencias pip a menos que explicitamente indicado
-6. Cada output deve incluir APENAS os ficheiros alterados, prontos para deploy via Kudu VFS PUT
-
----
-
-### FASE 1A — BUG FIXES DA AUDITORIA (executar por ordem, ANTES de tudo o resto)
-
-#### TAREFA 1.0 — Fix Tier Selector [P1]
-```
-FICHEIROS: static/index.html
-ACCAO: Localizar o POST para /chat/agent e /chat/agent/stream (zona ~linha 754).
-        O frontend envia { tier: modelTier } mas o Pydantic espera { model_tier: ... }.
-        Mudar para { model_tier: modelTier }.
-VALIDACAO: Selecionar "Fast", enviar mensagem. No response JSON, model_used deve ser "gpt-4.1-mini".
-           Selecionar "Standard", enviar mensagem. model_used deve mudar.
-DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
-```
-
-#### TAREFA 1.1 — AI Search Retry Helper [P2]
-```
-FICHEIROS: tools.py, learning.py
-ACCAO: 1. Em tools.py, criar funcao _search_with_retry(client, url, body, headers, max_retries=3)
-           com retry para 429 (backoff 2-4-6s) e TimeoutException (backoff 2-4-6s).
-           Return {"value": []} se todas as tentativas falharem.
-        2. Usar em tool_search_workitems (substituir o client.post directo)
-        3. Usar em tool_search_website (idem)
-        4. Em learning.py, usar em _search_examples_semantic (importar de tools.py ou duplicar)
-VALIDACAO: Simular 429 — o retry deve funcionar sem erro visivel ao utilizador.
-DEPLOY: Kudu VFS PUT tools.py + learning.py + restart
-```
-
-#### TAREFA 1.2 — Logging de Falhas Silenciosas [P2]
-```
-FICHEIROS: app.py, learning.py
-ACCAO: 1. Em app.py, localizar _index_example ou equivalente. Substituir qualquer
-           "except: pass" ou "except Exception: pass" por:
-           except Exception as e: print(f"[Learning] Index example failed: {e}")
-        2. Em learning.py, localizar _search_examples_semantic. Substituir
-           "except Exception: return []" por:
-           except Exception as e: print(f"[Learning] Search examples failed: {e}"); return []
-        3. Verificar se ha outros except silenciosos nos mesmos ficheiros e corrigir.
-VALIDACAO: Provocar um erro e verificar que aparece nos logs do App Service.
-DEPLOY: Kudu VFS PUT app.py + learning.py + restart
-```
-
-#### TAREFA 1.3 — Eviction de Conversas em Memoria [P1]
-```
-FICHEIROS: agent.py, app.py
-ACCAO: 1. Em agent.py, substituir os 3 dicts globais (conversations, conversation_modes,
-           file_contexts) por uma class ConversationStore:
-           - MAX_CONVERSATIONS = 200, TTL_SECONDS = 4 * 3600 (4h)
-           - OrderedDict com timestamps de last_accessed
-           - get() actualiza timestamp, set() faz eviction se > MAX, cleanup() remove expirados
-           - A interface publica deve manter mesma API para nao quebrar nada
-        2. Em app.py, background task cleanup a cada 30min
-CUIDADO: API publica do ConversationStore compativel com codigo existente.
-VALIDACAO: GET /debug/conversations mostra contagem. Apos cleanup, entries antigas removidas.
-DEPLOY: Kudu VFS PUT agent.py + app.py + restart
-```
-
-#### TAREFA 1.4 — Cache de Few-Shot por Request [P3]
-```
-FICHEIROS: agent.py
-ACCAO: Cachear resultado de get_few_shot_examples(question) e get_learned_rules()
-        na primeira chamada dentro do mesmo request (variavel local, nao global).
-VALIDACAO: Performance — deve poupar ~100ms por iteracao extra.
-DEPLOY: Kudu VFS PUT agent.py + restart
-```
-
-**~~Apos completar TODAS as tarefas 1.0-1.4: Bump APP_VERSION para "7.0.3" em config.py.~~** DONE — v7.0.3 (2026-02-22). PENDENTE: bump APP_VERSION em config.py no proximo deploy.
-
----
-
-### FASE 1B — QUICK WINS E UX (executar por ordem)
-
-#### TAREFA 1.5 — System Prompt Mais Abrangente
-```
-FICHEIROS: tools.py
-ACCAO: Adicionar regras ao system prompt ANTES das regras de tools:
-        "REGRA IMPORTANTE: NEM TODAS as perguntas precisam de ferramentas.
-        - Perguntas gerais, conceptuais, opiniao → responde directamente sem tools
-        - Redaccao de emails, textos, documentacao → responde directamente
-        - Explicacoes de conceitos (WIQL, Agile, etc.) → responde directamente
-        - So usa ferramentas para dados ESPECIFICOS do DevOps, pesquisa, ou analise de padroes"
-VALIDACAO: "O que e uma user story?" → sem tool badges. "Quantas USs ativas?" → usa query_workitems.
-DEPLOY: Kudu VFS PUT tools.py + restart
-```
-
-#### TAREFA 1.6 — Largura Variavel no Chat
-```
-FICHEIROS: static/index.html
-ACCAO: maxWidth 800→900 para texto. Tabelas: max-width: calc(100vw - 320px) + overflow-x: auto.
-        OPCIONAL: toggle "expandir" por mensagem.
-CUIDADO: NAO quebrar React hooks. Testar login → chat → enviar → sem ecra branco.
-DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
-```
-
-#### TAREFA 1.7 — Polish dos Export Buttons
-```
-FICHEIROS: static/index.html
-ACCAO: Quando resposta contem dados tabulares, renderizar barra [CSV] [Excel] [PDF] [HTML].
-        Cada botao chama POST /api/export. Backend ja suporta via export_engine.py.
-CUIDADO: NAO remover export HTML da conversa completa que ja existe.
-DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
-```
-
-#### TAREFA 1.8 — SVG como Input
-```
-FICHEIROS: app.py, static/index.html
-ACCAO: Adicionar ".svg" e "image/svg+xml" aos tipos aceites. Ler como texto, passar ao LLM.
-DEPLOY: Kudu VFS PUT app.py + static/index.html + restart
-```
-
-**Apos completar 1.5-1.8:** Bump APP_VERSION para "7.0.4" em config.py.
-
----
-
-### FASE 2 — DEVOPS WRITE + MEMORIA (executar por ordem)
-
-#### TAREFA 2.1 — Tool create_workitem
-```
-FICHEIROS: tools.py
-ACCAO: Nova tool create_workitem:
-        - POST _apis/wit/workitems/$User%20Story?api-version=7.1
-        - Body: JSON Patch format [{"op":"add","path":"/fields/System.Title","value":title}, ...]
-        - Parametros: work_item_type, title, description, acceptance_criteria, area_path, assigned_to, tags
-        - Usa _devops_request_with_retry
-        - Retorna: {"id": 12345, "url": "https://dev.azure.com/...", "title": "..."}
-        - System prompt: "Quando o user confirmar criacao, usa create_workitem. Pergunta SEMPRE antes de criar."
-VALIDACAO: "Gera uma US sobre notificacoes push e cria no board" → WI criado no DevOps.
-DEPLOY: Kudu VFS PUT tools.py + restart
-RISCO: Medio — escreve no DevOps. Testar com work item type de teste primeiro.
-```
-
-#### TAREFA 2.2 — Write-Through para Table Storage
-```
-FICHEIROS: agent.py
-ACCAO: Apos cada turno do agent (par user+assistant), serializar conversations[conv_id]
-        para ChatHistory table. Mesmo formato JSON que o frontend usa.
-        Chamar await _persist_conversation(conv_id) apos conversations[conv_id].append(assistant msg).
-VALIDACAO: Restart app → conversa anterior carrega do storage.
-DEPLOY: Kudu VFS PUT agent.py + restart
-```
-
-#### TAREFA 2.3 — Lazy-Load de Conversas
-```
-FICHEIROS: agent.py
-ACCAO: Em _ensure_conversation(), antes de criar nova conversa, tentar table_query("ChatHistory", ...)
-        com o conv_id. Se encontrar, deserializar e popular conversations[conv_id].
-VALIDACAO: Restart → enviar mensagem na mesma conversa → contexto preservado.
-DEPLOY: Kudu VFS PUT agent.py + restart
-```
-
-**Apos completar 2.1-2.3:** Bump APP_VERSION para "7.0.5" em config.py.
-
----
-
-### FASE 3 — CHARTS E VISUALIZACAO (3.1-3.3 FECHADAS, 3.4-3.5 PENDENTES)
-
-#### TAREFA 3.1 — Plotly.js no Frontend ✅ FECHADA
-```
-IMPLEMENTADO: Plotly.js 2.35.2 CDN defer. renderPlotlyChart() com Millennium branding (colorway).
-ChartBlock com useRef/useEffect async render + botoes Download SVG/PNG via Plotly.downloadImage.
-getChartSpecs() extrai _chart de tool_results. MessageBubble renderiza charts entre markdown e exports.
-```
-
-#### TAREFA 3.2 — Tool generate_chart ✅ FECHADA
-```
-IMPLEMENTADO: tool_generate_chart() com 6 tipos (bar/pie/line/scatter/histogram/hbar).
-Multi-series via param "series" (array de objetos). Retorna _chart com Plotly spec completo.
-TOOLS array com 9 entries. System prompt regra 9: "compute_kpi DEPOIS generate_chart".
-Dispatch atualizado com generate_chart. Frontend ja suporta _chart da 3.1.
-```
-
-#### TAREFA 3.3 — Charts a Partir de File Upload ✅ FECHADA
-```
-IMPLEMENTADO: app.py /upload: col_analysis com deteccao numeric/text (heuristica >60%).
-col_analysis=[] inicializado defensivamente antes do bloco if. Guardado no uploaded_files_store.
-agent.py _inject_file_context: bloco "ANALISE DE COLUNAS (para graficos)" + instrucao generate_chart.
-```
-
-#### TAREFA 3.4 — Export de Charts (PENDENTE — pode ja estar feita via 3.1)
-```
-FICHEIROS: static/index.html
-ACCAO: Validar que os botoes SVG/PNG do ChartBlock (implementados na 3.1) funcionam correctamente.
-        Se funcionam, marcar como fechada. Se nao, ajustar.
-DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
-```
-
-#### TAREFA 3.5 — File Generation via Prompts (PENDENTE)
-```
-FICHEIROS: tools.py, app.py, export_engine.py, static/index.html
-ACCAO: Nova tool "generate_file" (format, title, data, columns).
-        Usa export_engine.py. Frontend detecta "_file_download" e mostra botao.
-DEPLOY: Kudu VFS PUT (4 ficheiros) + restart
-```
-
-**Apos completar 3.4-3.5:** Bump APP_VERSION para "7.1.0" em config.py.
-
----
-
-### FASE 4 — US WRITER PRO (executar por ordem)
-
-#### TAREFA 4.1 — System Prompt Rewrite Modo Userstory
-```
-FICHEIROS: tools.py
-ACCAO: Reescrever get_userstory_system_prompt() com ciclo Draft→Review→Final.
-        Instrucoes de visual parsing (imagens→CTAs, inputs, labels).
-        Refinamento iterativo: se user da feedback, re-chamar generate_user_stories com context.
-DEPLOY: Kudu VFS PUT tools.py + restart
-```
-
-#### TAREFA 4.2 — WriterProfiles Table
-```
-FICHEIROS: tools.py, storage.py
-ACCAO: Nova tabela WriterProfiles (PartitionKey: username, RowKey: "profile").
-        Cache de estilos por autor. Carregamento em generate_user_stories.
-        "Gera USs como o Jorge escreve" carrega perfil em vez de refazer analyze.
-DEPLOY: Kudu VFS PUT tools.py + storage.py + restart
-```
-
-#### TAREFA 4.3 — Upload Pre-Processing Inteligente
-```
-FICHEIROS: agent.py
-ACCAO: Quando modo e userstory, pre-processar: Excel→lista requisitos, PDF→seccoes hierarquicas.
-DEPLOY: Kudu VFS PUT agent.py + restart
-```
-
-#### TAREFA 4.4 — PPT Support no Upload
-```
-FICHEIROS: app.py
-ACCAO: Adicionar python-pptx. Extrair texto de slides como sequencia de requisitos.
-DEPLOY: ZIP deploy (nova dependencia pip)
-```
-
-**Apos completar 4.1-4.4:** Bump APP_VERSION para "7.1.1" em config.py.
-
----
-
-### FASE 5 — INTEGRACOES EXTERNAS + FRONTEND POLISH (executar por ordem)
-
-#### TAREFA 5.1 — Registry de Tools Dinamico
-```
-FICHEIROS: tools.py (refactor), agent.py
-ACCAO: TOOL_REGISTRY dict. register_tool(name, definition, handler).
-        get_all_tool_definitions(), get_tool_handler(name). Agent usa registry.
-CUIDADO: NAO quebrar tools existentes. Refactor interno.
-DEPLOY: Kudu VFS PUT tools.py + agent.py + restart
-```
-
-#### TAREFA 5.2 — Integracao Figma (Read-Only)
-```
-FICHEIROS: tools_figma.py (novo), config.py, tools.py (import)
-ACCAO: Tool "search_figma" via Figma REST API v1. Metadados, frames, thumbnails, links.
-PRE-REQUISITO: Pedro configura FIGMA_ACCESS_TOKEN nas App Settings.
-DEPLOY: ZIP deploy ou Kudu VFS PUT + restart
-```
-
-#### TAREFA 5.3 — Integracao Miro (Read-Only)
-```
-FICHEIROS: tools_miro.py (novo), config.py, tools.py (import)
-ACCAO: Tool "search_miro" via Miro REST API v2. Boards, sticky notes, links.
-PRE-REQUISITO: Pedro configura MIRO_ACCESS_TOKEN nas App Settings.
-DEPLOY: ZIP deploy ou Kudu VFS PUT + restart
-```
-
-#### TAREFA 5.4 — Streaming Optimization
-```
-FICHEIROS: static/index.html
-ACCAO: React.memo no MessageBubble. So re-render do ultimo bloco durante streaming.
-DEPLOY: Kudu VFS PUT static/index.html (nao precisa restart)
-```
-
-**Apos completar 5.1-5.4:** Bump APP_VERSION para "7.2.0" em config.py.
-
----
-
-### FASE 6 — ANALISE PROFUNDA (bonus, se houver tempo)
-
-#### TAREFA 6.1 — PDF Chunking + Indexacao
-```
-FICHEIROS: app.py, tools.py
-ACCAO: Docs >50K chars divididos em chunks, indexados no AI Search.
-DEPLOY: Kudu VFS PUT + restart
-```
-
-#### TAREFA 6.2 — Tool search_uploaded_document
-```
-FICHEIROS: tools.py
-ACCAO: Pesquisa semantica no documento carregado.
-DEPLOY: Kudu VFS PUT tools.py + restart
-```
-
-#### TAREFA 6.3 — Daily Digest Endpoint
-```
-FICHEIROS: app.py
-ACCAO: GET /api/digest — HTML com USs criadas ontem, bugs >7 dias, items sem assignee.
-DEPLOY: Kudu VFS PUT app.py + restart
-```
-
-**Apos completar 6.1-6.3:** Bump APP_VERSION para "7.2.1" em config.py.
-
----
-
-### REGRAS PARA O CODEX
-
-1. **UMA tarefa de cada vez.** Nao agrupar. Nao antecipar.
-2. **Ler antes de escrever.** Sempre ler o ficheiro completo antes de o alterar.
-3. **Minimo de ficheiros.** So alterar o que a tarefa pede. Nada mais.
-4. **Testar mentalmente.** Antes de entregar, simular o fluxo completo.
-5. **Nao inventar.** Se algo nao esta claro, perguntar. Nao assumir.
-6. **React hooks.** No index.html, NUNCA colocar hooks depois de early returns. Ordem identica em todos os renders.
-7. **Sem dependencias novas** (pip install) a menos que explicitamente indicado na tarefa.
-8. **Output limpo.** Entregar APENAS os ficheiros alterados, completos, prontos para Kudu VFS PUT.
-9. **Versioning.** Apos cada fase: 1A→7.0.3, 1B→7.0.4, 2→7.0.5, 3→7.1.0, 4→7.1.1, 5→7.2.0, 6→7.2.1.
-10. **Nao tocar em:** `auth.py`, `models.py` a menos que explicitamente pedido. `storage.py` so na tarefa 4.2. `learning.py` so nas tarefas 1.1 e 1.2.
+— Atualizado por Claude (Arquiteto), 2026-02-23

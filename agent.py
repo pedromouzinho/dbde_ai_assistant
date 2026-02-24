@@ -18,7 +18,8 @@ from collections.abc import MutableMapping
 
 from config import (
     AGENT_MAX_ITERATIONS, AGENT_MAX_TOKENS, AGENT_TEMPERATURE,
-    AGENT_HISTORY_LIMIT, LLM_DEFAULT_TIER,
+    AGENT_HISTORY_LIMIT, LLM_DEFAULT_TIER, UPLOAD_MAX_IMAGES_PER_MESSAGE,
+    UPLOAD_INDEX_TOP, DEVOPS_AREAS, CHAT_TOOLRESULT_BLOB_CONTAINER,
 )
 from models import (
     AgentChatRequest, AgentChatResponse, LLMToolCall,
@@ -28,11 +29,19 @@ from llm_provider import (
     make_assistant_message_from_response,
 )
 from learning import get_learned_rules, get_few_shot_examples
+from tool_registry import execute_tool, get_all_tool_definitions
 from tools import (
-    TOOLS, execute_tool, truncate_tool_result,
+    truncate_tool_result,
     get_agent_system_prompt, get_userstory_system_prompt,
 )
-from storage import table_insert, table_merge, table_query
+from storage import (
+    table_insert,
+    table_merge,
+    table_query,
+    blob_download_bytes,
+    blob_upload_json,
+    parse_blob_ref,
+)
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -176,12 +185,28 @@ def _user_partition_key(user: Optional[dict]) -> str:
     return (safe or "anon")[:100]
 
 
+def _safe_blob_component(raw: str, max_len: int = 120) -> str:
+    txt = str(raw or "").strip()
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in txt)
+    if not safe:
+        safe = "x"
+    return safe[:max_len]
+
+
 def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
-    lock = _conversation_locks.get(conv_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _conversation_locks[conv_id] = lock
-    return lock
+    return _conversation_locks.setdefault(conv_id, asyncio.Lock())
+
+
+def _create_logged_task(coro, label: str) -> None:
+    task = asyncio.create_task(coro)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except Exception as e:
+            logger.warning("[Agent] background task '%s' failed: %s", label, e, exc_info=True)
+
+    task.add_done_callback(_on_done)
 
 # =============================================================================
 # HISTORY MANAGEMENT
@@ -209,47 +234,254 @@ def _trim_history(messages: List[dict]) -> List[dict]:
     return sys_msgs + kept
 
 
-def _build_user_message(request: AgentChatRequest) -> dict:
-    """Constrói a mensagem do user (texto ou texto+imagem)."""
-    if request.image_base64:
-        return {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": request.question},
-                {"type": "image_url", "image_url": {
-                    "url": f"data:{request.image_content_type};base64,{request.image_base64}"
-                }},
-            ],
+MAX_IMAGES_PER_INPUT = max(1, int(UPLOAD_MAX_IMAGES_PER_MESSAGE))
+MAX_FILES_CONTEXT = 10
+
+
+def _normalize_uploaded_files_entry(conv_id: str) -> dict:
+    current = uploaded_files_store.get(conv_id)
+    if isinstance(current, dict) and isinstance(current.get("files"), list):
+        return current
+    if isinstance(current, dict) and current:
+        legacy = dict(current)
+        legacy.pop("files", None)
+        normalized = {"files": [legacy]}
+        uploaded_files_store[conv_id] = normalized
+        return normalized
+    return {"files": []}
+
+
+def _get_uploaded_files(conv_id: str) -> List[dict]:
+    return _normalize_uploaded_files_entry(conv_id).get("files", [])
+
+
+async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> None:
+    current_files = _get_uploaded_files(conv_id)
+    if current_files:
+        return
+    try:
+        safe_conv = _odata_escape(conv_id)
+        rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
+    except Exception as e:
+        logger.warning("[Agent] upload index query failed for %s: %s", conv_id, e)
+        return
+    if not rows:
+        return
+
+    safe_user = str(user_sub or "")
+    filtered = []
+    for row in rows:
+        owner_sub = str(row.get("UserSub", "") or "")
+        if owner_sub and safe_user and owner_sub != safe_user:
+            continue
+        filtered.append(row)
+    if not filtered:
+        return
+
+    files = []
+    for row in sorted(filtered, key=lambda r: str(r.get("UploadedAt", ""))):
+        preview_text = str(row.get("PreviewText", "") or "")
+        extracted_ref = str(row.get("ExtractedBlobRef", "") or "")
+        if not preview_text and extracted_ref:
+            container, blob_name = parse_blob_ref(extracted_ref)
+            if container and blob_name:
+                try:
+                    raw = await blob_download_bytes(container, blob_name)
+                    if raw:
+                        preview_text = raw.decode("utf-8", errors="replace")[:16000]
+                except Exception as e:
+                    logger.warning("[Agent] extracted blob read failed for %s: %s", extracted_ref, e)
+        try:
+            col_names = json.loads(row.get("ColNamesJson", "[]") or "[]")
+        except Exception:
+            col_names = []
+        try:
+            col_analysis = json.loads(row.get("ColAnalysisJson", "[]") or "[]")
+        except Exception:
+            col_analysis = []
+        files.append(
+            {
+                "filename": row.get("Filename", ""),
+                "data_text": preview_text,
+                "row_count": int(row.get("RowCount", 0) or 0),
+                "col_names": col_names if isinstance(col_names, list) else [],
+                "col_analysis": col_analysis if isinstance(col_analysis, list) else [],
+                "truncated": bool(row.get("Truncated", False)),
+                "uploaded_at": row.get("UploadedAt", ""),
+                "has_chunks": str(row.get("HasChunks", "")).lower() in ("true", "1"),
+                "chunks_blob_ref": row.get("ChunksBlobRef", ""),
+                "extracted_blob_ref": extracted_ref,
+            }
+        )
+    if files:
+        uploaded_files_store[conv_id] = {
+            "files": files[-MAX_FILES_CONTEXT:],
+            "uploaded_at": datetime.now().isoformat(),
+            "from_index": True,
         }
-    return {"role": "user", "content": request.question}
+
+
+def _extract_request_images(request: AgentChatRequest) -> List[dict]:
+    """Extrai até MAX_IMAGES_PER_INPUT imagens do request (novo campo images + fallback legacy)."""
+    extracted: List[dict] = []
+    raw_images = getattr(request, "images", None) or []
+    for raw in raw_images[:MAX_IMAGES_PER_INPUT]:
+        if isinstance(raw, dict):
+            base64_data = raw.get("base64")
+            content_type = raw.get("content_type") or raw.get("contentType")
+            filename = raw.get("filename")
+        else:
+            base64_data = getattr(raw, "base64", None)
+            content_type = getattr(raw, "content_type", None) or getattr(raw, "contentType", None)
+            filename = getattr(raw, "filename", None)
+        b64 = str(base64_data or "").strip()
+        if not b64:
+            continue
+        extracted.append(
+            {
+                "base64": b64,
+                "content_type": str(content_type or "image/png"),
+                "filename": str(filename or "")[:120],
+            }
+        )
+
+    if extracted:
+        return extracted
+
+    legacy_b64 = str(getattr(request, "image_base64", "") or "").strip()
+    if legacy_b64:
+        extracted.append(
+            {
+                "base64": legacy_b64,
+                "content_type": str(getattr(request, "image_content_type", "image/png") or "image/png"),
+                "filename": "",
+            }
+        )
+    return extracted
+
+
+def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] = None) -> dict:
+    """Constrói a mensagem do user (texto puro ou multimodal com 1..MAX_IMAGES_PER_INPUT imagens)."""
+    images = _extract_request_images(request)
+
+    # Fallback: usar imagem previamente carregada via /upload nesta conversa.
+    if not images and conv_id:
+        uploaded_images = []
+        for file_data in _get_uploaded_files(conv_id):
+            upload_b64 = str(file_data.get("image_base64", "") or "").strip()
+            if not upload_b64:
+                continue
+            uploaded_images.append(
+                {
+                    "base64": upload_b64,
+                    "content_type": str(file_data.get("image_content_type") or "image/png"),
+                    "filename": str(file_data.get("filename") or "")[:120],
+                }
+            )
+        images = uploaded_images[:MAX_IMAGES_PER_INPUT]
+
+    if not images:
+        return {"role": "user", "content": request.question}
+
+    content_blocks: List[dict] = [{"type": "text", "text": request.question}]
+    if len(images) == 2:
+        content_blocks.append(
+            {"type": "text", "text": "Contexto visual: Imagem 1 = ANTES; Imagem 2 = DEPOIS."}
+        )
+    for idx, img in enumerate(images, 1):
+        if img.get("filename"):
+            content_blocks.append({"type": "text", "text": f"Imagem {idx}: {img['filename']}"})
+        content_blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{img['content_type']};base64,{img['base64']}",
+                },
+            }
+        )
+
+    return {"role": "user", "content": content_blocks}
 
 
 def _inject_file_context(conv_id: str, messages: List[dict]):
-    """Injeta contexto de ficheiro uploaded na conversa."""
-    file_data = uploaded_files_store.get(conv_id)
-    if file_data and not conversation_meta.get(conv_id, {}).get("file_injected"):
-        # Mantém só o contexto do último ficheiro para evitar bloat de system prompts.
+    """Injeta contexto de ficheiros uploaded na conversa."""
+    files = _get_uploaded_files(conv_id)
+    if files and not conversation_meta.get(conv_id, {}).get("file_injected"):
         messages[:] = [
             m for m in messages
             if not (
                 m.get("role") == "system"
                 and isinstance(m.get("content"), str)
-                and m.get("content", "").startswith("FICHEIRO CARREGADO:")
+                and (
+                    m.get("content", "").startswith("FICHEIROS CARREGADOS:")
+                    or m.get("content", "").startswith("FICHEIRO CARREGADO:")
+                )
             )
         ]
-        ctx = (
-            f"FICHEIRO CARREGADO:\nFicheiro: {file_data['filename']}\n"
-            f"Linhas: {file_data['row_count']}\nColunas: {', '.join(file_data['col_names'])}\n"
-            f"{'NOTA: Dados truncados.' if file_data.get('truncated') else ''}\n"
-        )
-        # Adicionar análise de colunas se disponível
-        col_analysis = file_data.get("col_analysis")
-        if col_analysis:
-            ctx += "\nANÁLISE DE COLUNAS (para gráficos):\n"
-            for ca in col_analysis:
-                ctx += f"  - {ca['name']} ({ca['type']}): ex. {', '.join(ca['sample'][:3])}\n"
-            ctx += "\nNOTA: O utilizador pode pedir gráficos destes dados. Usa generate_chart com os valores extraídos do ficheiro.\n"
-        ctx += f"\nCONTEÚDO:\n{file_data['data_text'][:50000]}"
+        mode = conversation_meta.get(conv_id, {}).get("mode", "general")
+        use_files = files[-MAX_FILES_CONTEXT:]
+        ctx_parts = [
+            f"FICHEIROS CARREGADOS: {len(use_files)} (máximo analisado por pedido: {MAX_FILES_CONTEXT})",
+            "Analisa TODOS os ficheiros listados antes de responder. Não ignores nenhum.",
+        ]
+
+        total_budget = 90000
+        per_file_budget = max(3000, min(18000, total_budget // max(1, len(use_files))))
+
+        if mode == "userstory":
+            ctx_parts.append(
+                "MODO USERSTORY — integra requisitos de todos os anexos numa proposta coerente e sem duplicações."
+            )
+
+        for idx, file_data in enumerate(use_files, 1):
+            filename = str(file_data.get("filename", ""))
+            filename_lower = filename.lower()
+            is_tabular = filename_lower.endswith((".xlsx", ".xls", ".csv"))
+            is_pdf = filename_lower.endswith(".pdf")
+            is_pptx = filename_lower.endswith(".pptx")
+            is_image = bool(file_data.get("image_base64"))
+            cols = file_data.get("col_names", [])
+            cols_txt = ", ".join(cols) if isinstance(cols, list) else str(cols or "")
+
+            block = [
+                f"[FICHEIRO {idx}] {filename}",
+                f"Linhas: {file_data.get('row_count', 0)} | Colunas: {cols_txt}",
+            ]
+            if file_data.get("truncated"):
+                block.append("NOTA: Conteúdo truncado para contexto.")
+
+            col_analysis = file_data.get("col_analysis")
+            if col_analysis:
+                block.append("ANÁLISE DE COLUNAS:")
+                for ca in col_analysis[:20]:
+                    sample = ", ".join((ca.get("sample") or [])[:3])
+                    block.append(f"- {ca.get('name','')} ({ca.get('type','text')}): {sample}")
+
+            if mode == "userstory":
+                if is_tabular:
+                    block.append("Interpretar como lista estruturada de requisitos funcionais.")
+                elif is_pdf:
+                    block.append("Interpretar secções como hierarquia Épico > Feature > US > AC.")
+                elif is_pptx:
+                    block.append("Interpretar cada slide como bloco de requisitos.")
+                elif is_image:
+                    block.append("Imagem de apoio visual: extrair CTAs, inputs, labels, estados e validações.")
+                else:
+                    block.append("Extrair requisitos acionáveis e testáveis.")
+
+            data_text = str(file_data.get("data_text", "") or "")
+            if data_text:
+                block.append("CONTEÚDO:")
+                block.append(data_text[:per_file_budget])
+
+            if (isinstance(file_data.get("chunks"), list) and file_data.get("chunks")) or file_data.get("has_chunks"):
+                block.append(
+                    "NOTA: Documento grande com chunks semânticos disponíveis; usa search_uploaded_document para pesquisa profunda."
+                )
+
+            ctx_parts.append("\n".join(block))
+
+        ctx = "\n\n".join(ctx_parts)[:120000]
         messages.append({"role": "system", "content": ctx})
         conversation_meta.setdefault(conv_id, {})["file_injected"] = True
 
@@ -314,7 +546,9 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
     return conv_id
 
 
-async def _build_llm_messages(conv_id: str, question: str) -> List[dict]:
+async def _build_llm_messages(
+    conv_id: str, question: str, request: Optional[AgentChatRequest] = None
+) -> List[dict]:
     """Cópia efémera do histórico + regras + few-shot. Não muta conversations[]."""
     base = conversations[conv_id].copy()
     insert_pos = 1 if base else 0
@@ -327,6 +561,22 @@ async def _build_llm_messages(conv_id: str, question: str) -> List[dict]:
     fewshot = await get_few_shot_examples(question)
     if fewshot:
         base.insert(insert_pos, {"role": "system", "content": fewshot})
+
+    # Injeta conteúdo multimodal apenas na cópia efémera para evitar bloat no histórico real.
+    if request:
+        user_msg = _build_user_message(request, conv_id=conv_id)
+        if isinstance(user_msg.get("content"), list):
+            replaced = False
+            for idx in range(len(base) - 1, -1, -1):
+                msg = base[idx]
+                if msg.get("role") != "user":
+                    continue
+                if isinstance(msg.get("content"), str) and msg.get("content") == request.question:
+                    base[idx] = user_msg
+                    replaced = True
+                    break
+            if not replaced:
+                base.append(user_msg)
 
     return base
 
@@ -436,6 +686,124 @@ def _has_explicit_create_confirmation(conv_id: str) -> bool:
     return False
 
 
+def _normalize_request_text(value: str) -> str:
+    lowered = str(value or "").lower()
+    deaccented = unicodedata.normalize("NFKD", lowered)
+    clean = "".join(ch for ch in deaccented if not unicodedata.combining(ch))
+    clean = clean.replace("|", " ").replace("—", " ").replace("-", " ").replace("_", " ")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def _canonicalize_area_path(area_hint: str) -> str:
+    raw = str(area_hint or "").strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        return raw
+    norm_hint = _normalize_request_text(raw)
+    for known in DEVOPS_AREAS:
+        known_norm = _normalize_request_text(known)
+        if norm_hint and (known_norm.endswith(norm_hint) or norm_hint in known_norm):
+            return known
+    return raw
+
+
+def _extract_forced_dual_hierarchy_calls(question: str) -> List[LLMToolCall]:
+    norm = _normalize_request_text(question)
+    has_bug = bool(re.search(r"\bbugs?\b", norm))
+    has_us = bool(re.search(r"\buser stor(?:y|ies)\b", norm))
+    has_epic = bool(re.search(r"\bepic\b", norm))
+    has_feature = bool(re.search(r"\bfeature\b", norm))
+    if not (has_bug and has_us and has_epic and has_feature):
+        return []
+
+    epic_match = re.search(r"\bepic\b[^\d]{0,90}(\d{4,9})", norm)
+    feature_match = re.search(r"\bfeature\b[^\d]{0,90}(\d{4,9})", norm)
+    if not epic_match or not feature_match:
+        return []
+
+    try:
+        epic_id = int(epic_match.group(1))
+        feature_id = int(feature_match.group(1))
+    except (TypeError, ValueError):
+        return []
+    if epic_id <= 0 or feature_id <= 0:
+        return []
+
+    area_hint = ""
+    area_match = re.search(r"\barea\b\s+(.+?)(?:\bnao\b|[.,;]|$)", norm)
+    if area_match:
+        area_hint = area_match.group(1).strip()
+    area_path = _canonicalize_area_path(area_hint)
+
+    title_contains = ""
+    title_match = re.search(
+        r"\btitulo\s+tem\s+(.+?)(?:\bdentro\s+da\s+area\b|\bna\s+area\b|\bnao\b|[.,;]|$)",
+        norm,
+    )
+    if title_match:
+        title_contains = title_match.group(1).strip()
+
+    calls = [
+        LLMToolCall(
+            id=f"forced_qh_bug_{uuid.uuid4().hex[:8]}",
+            name="query_hierarchy",
+            arguments={
+                "parent_id": epic_id,
+                "parent_type": "Epic",
+                "child_type": "Bug",
+                "area_path": area_path,
+            },
+        ),
+        LLMToolCall(
+            id=f"forced_qh_us_{uuid.uuid4().hex[:8]}",
+            name="query_hierarchy",
+            arguments={
+                "parent_id": feature_id,
+                "parent_type": "Feature",
+                "child_type": "User Story",
+                "area_path": area_path,
+                "title_contains": title_contains,
+            },
+        ),
+    ]
+    return calls
+
+
+def _make_tool_calls_assistant_message(tool_calls: List[LLMToolCall]) -> dict:
+    msg_calls = []
+    for tc in tool_calls:
+        msg_calls.append(
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments, ensure_ascii=False, default=str),
+                },
+            }
+        )
+    return {"role": "assistant", "content": "", "tool_calls": msg_calls}
+
+
+async def _run_forced_dual_hierarchy(
+    question: str,
+    conv_id: str,
+    user_sub: str = "",
+) -> tuple[List[str], List[Dict]]:
+    forced_calls = _extract_forced_dual_hierarchy_calls(question)
+    if not forced_calls:
+        return [], []
+
+    logger.info(
+        "[Agent] forcing dual query_hierarchy calls for mixed hierarchy request (conv=%s)",
+        conv_id,
+    )
+    conversations[conv_id].append(_make_tool_calls_assistant_message(forced_calls))
+    return await _execute_tool_calls(forced_calls, conv_id, user_sub=user_sub)
+
+
 async def _persist_conversation(conv_id: str, partition_key: str) -> None:
     """Persiste conversa na tabela ChatHistory (fire-and-forget)."""
     try:
@@ -463,7 +831,13 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                         c = c[:1200] + "...(truncado)"
                     elif isinstance(c, list):
                         c = [{"type": "summary", "text": "conteúdo multimodal omitido"}]
-                    slimmed.append({"role": m.get("role", ""), "content": c})
+                    slim_item = {"role": m.get("role", ""), "content": c}
+                    if m.get("role") == "tool":
+                        if m.get("tool_call_id"):
+                            slim_item["tool_call_id"] = m.get("tool_call_id")
+                        if m.get("result_blob_ref"):
+                            slim_item["result_blob_ref"] = m.get("result_blob_ref")
+                    slimmed.append(slim_item)
                 compact = slimmed
                 messages_json = json.dumps(compact, ensure_ascii=False, default=str)
 
@@ -504,18 +878,77 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
 # =============================================================================
 
 async def _execute_tool_calls(
-    tool_calls: List[LLMToolCall], conv_id: str,
+    tool_calls: List[LLMToolCall], conv_id: str, user_sub: str = "",
 ) -> tuple[List[str], List[Dict]]:
     """Executa tools em paralelo, retorna (tools_used, tool_details)."""
     tools_used = []
     tool_details = []
+
+    def _latest_user_text() -> str:
+        for msg in reversed(conversations.get(conv_id, [])):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        parts.append(str(p.get("text", "")))
+                return " ".join(parts).strip()
+        return ""
     
     async def _run(tc: LLMToolCall):
         args = tc.arguments
+        user_text = _latest_user_text()
         # Auto-inject file context for US generation
-        file_data = uploaded_files_store.get(conv_id)
-        if tc.name == "generate_user_stories" and file_data and not args.get("context"):
-            args["context"] = file_data.get("data_text", "")[:20000]
+        files = _get_uploaded_files(conv_id)
+        if tc.name == "generate_user_stories" and files and not args.get("context"):
+            context_blocks = []
+            per_file_budget = max(2000, min(12000, 80000 // max(1, len(files))))
+            for idx, f in enumerate(files[-MAX_FILES_CONTEXT:], 1):
+                fname = f.get("filename", f"ficheiro_{idx}")
+                content = str(f.get("data_text", "") or "")
+                if not content:
+                    continue
+                context_blocks.append(f"[{idx}] {fname}\n{content[:per_file_budget]}")
+            if context_blocks:
+                args["context"] = "\n\n".join(context_blocks)[:90000]
+        if tc.name == "search_uploaded_document" and not args.get("conv_id"):
+            args["conv_id"] = conv_id
+        if tc.name == "search_uploaded_document" and user_sub and not args.get("user_sub"):
+            args["user_sub"] = user_sub
+        if tc.name == "query_hierarchy":
+            has_parent_id = bool(args.get("parent_id"))
+            parent_type = str(args.get("parent_type", "") or "").strip().lower()
+            title_contains = str(args.get("title_contains", "") or "").strip()
+            explicit_title_filter = bool(re.search(r"\bt[ií]tulo\b|\btitle\b", user_text.lower()))
+            if not has_parent_id and parent_type in ("epic", "feature"):
+                m = None
+                if parent_type == "epic":
+                    m = re.search(
+                        r"\bepic\b\s+(.+?)(?:\bcujo\b|\bcom\s+t[ií]tulo\b|\bt[ií]tulo\b|\bna\b|\bno\b|\bdentro\b|[?.!,]|$)",
+                        user_text,
+                        re.IGNORECASE,
+                    )
+                elif parent_type == "feature":
+                    m = re.search(
+                        r"\bfeature\b\s+(.+?)(?:\bcujo\b|\bcom\s+t[ií]tulo\b|\bt[ií]tulo\b|\bna\b|\bno\b|\bdentro\b|[?.!,]|$)",
+                        user_text,
+                        re.IGNORECASE,
+                    )
+
+                hint = ""
+                if m:
+                    hint = str(m.group(1) or "").strip()
+                if hint and not re.search(r"\d{4,9}", hint):
+                    args["parent_title_hint"] = hint[:160]
+                    if title_contains and not explicit_title_filter:
+                        args["title_contains"] = ""
+                elif title_contains and not explicit_title_filter:
+                    args["parent_title_hint"] = title_contains
+                    args["title_contains"] = ""
         if tc.name == "create_workitem":
             if _has_explicit_create_confirmation(conv_id):
                 args["confirmed"] = True
@@ -540,7 +973,23 @@ async def _execute_tool_calls(
             continue
         tc, tool_result = res
         tools_used.append(tc.name)
+
+        result_blob_ref = ""
+        try:
+            safe_user = _safe_blob_component(user_sub or "anon", 80)
+            safe_conv = _safe_blob_component(conv_id, 80)
+            safe_tool = _safe_blob_component(tc.name, 40)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            blob_name = f"{safe_user}/{safe_conv}/{ts}_{safe_tool}_{_safe_blob_component(tc.id, 60)}.json"
+            uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, tool_result)
+            result_blob_ref = str(uploaded.get("blob_ref", "") or "")
+        except Exception as e:
+            logger.warning("[Agent] tool result blob persist failed (%s): %s", tc.name, e)
         
+        serialized_tool_result = truncate_tool_result(
+            json.dumps(tool_result, ensure_ascii=False, default=str)
+        )
+
         td = {
             "tool": tc.name, "arguments": tc.arguments,
             "result_summary": {
@@ -548,18 +997,18 @@ async def _execute_tool_calls(
                 "items_returned": len(tool_result.get("items", tool_result.get("analysis_data", []))),
                 "has_error": "error" in tool_result,
             },
-            "result_json": json.dumps(tool_result, ensure_ascii=False, default=str)[:30000],
+            "result_json": serialized_tool_result,
+            "result_blob_ref": result_blob_ref,
         }
         tool_details.append(td)
-        
-        result_str = json.dumps(tool_result, ensure_ascii=False, default=str)
-        result_str = truncate_tool_result(result_str)
+        result_str = serialized_tool_result
         
         # Add tool result to conversation
         conversations[conv_id].append({
             "role": "tool",
             "tool_call_id": tc.id,
             "content": result_str,
+            "result_blob_ref": result_blob_ref,
         })
     
     return tools_used, tool_details
@@ -582,19 +1031,35 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     model_used = ""
     has_exportable = False
     export_idx = None
+    should_persist = False
 
     async with _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
+        await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         _inject_file_context(conv_id, conversations[conv_id])
 
-        conversations[conv_id].append(_build_user_message(request))
+        conversations[conv_id].append({"role": "user", "content": request.question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
         try:
+            forced_tu, forced_td = await _run_forced_dual_hierarchy(
+                request.question,
+                conv_id,
+                user_sub=str((user or {}).get("sub", "") or ""),
+            )
+            if forced_td:
+                tools_used.extend(forced_tu)
+                tool_details.extend(forced_td)
+                batch_start = len(tool_details) - len(forced_td)
+                for local_idx, d in enumerate(forced_td):
+                    if d["result_summary"].get("items_returned", 0) > 0:
+                        has_exportable = True
+                        export_idx = batch_start + local_idx
+
             # Agent loop
-            ephemeral = await _build_llm_messages(conv_id, request.question)
+            ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
             response = await llm_with_fallback(
-                ephemeral, tools=TOOLS, tier=tier,
+                ephemeral, tools=get_all_tool_definitions(), tier=tier,
                 temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
             )
             model_used = response.model
@@ -610,20 +1075,25 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                 )
 
                 # Execute tools
-                tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
+                tu, td = await _execute_tool_calls(
+                    response.tool_calls,
+                    conv_id,
+                    user_sub=str((user or {}).get("sub", "") or ""),
+                )
                 tools_used.extend(tu)
                 tool_details.extend(td)
 
                 # Check for exportable data
-                for d in td:
+                batch_start = len(tool_details) - len(td)
+                for local_idx, d in enumerate(td):
                     if d["result_summary"].get("items_returned", 0) > 0:
                         has_exportable = True
-                        export_idx = len(tool_details) - 1
+                        export_idx = batch_start + local_idx
 
                 # Next LLM call
-                ephemeral = await _build_llm_messages(conv_id, request.question)
+                ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
                 response = await llm_with_fallback(
-                    ephemeral, tools=TOOLS, tier=tier,
+                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
                     temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
                 )
                 for k, v in response.usage.items():
@@ -632,13 +1102,17 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
             answer = response.content or "Não consegui processar a tua pergunta."
             conversations[conv_id].append({"role": "assistant", "content": answer})
-
-            # Persist to Table Storage (fire-and-forget)
-            asyncio.create_task(_persist_conversation(conv_id, partition_key))
+            should_persist = True
 
         except Exception as e:
             logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
             answer = f"Erro: {str(e)}"
+
+    if should_persist:
+        try:
+            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
+        except Exception:
+            _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
     
@@ -672,20 +1146,35 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     tool_details = []
     total_usage = {}
     model_used = ""
+    should_persist = False
     
     def _sse(event: dict) -> str:
         return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     
     async with _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
+        await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         _inject_file_context(conv_id, conversations[conv_id])
-        conversations[conv_id].append(_build_user_message(request))
+        conversations[conv_id].append({"role": "user", "content": request.question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
         # Emit conversation_id immediately
         yield _sse({"type": "init", "conversation_id": conv_id, "mode": mode})
 
         try:
+            forced_tu, forced_td = await _run_forced_dual_hierarchy(
+                request.question,
+                conv_id,
+                user_sub=str((user or {}).get("sub", "") or ""),
+            )
+            if forced_td:
+                tools_used.extend(forced_tu)
+                tool_details.extend(forced_td)
+                for d in forced_td:
+                    yield _sse({"type": "tool_start", "tool": d["tool"], "text": f"🔍 {d['tool']} (forced)..."})
+                    count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
+                    yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
+
             provider = get_provider(tier)
             model_used = getattr(provider, 'model', getattr(provider, 'deployment', ''))
 
@@ -698,9 +1187,9 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
 
                 # Non-streaming call for tool detection
-                ephemeral = await _build_llm_messages(conv_id, request.question)
+                ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
                 response = await llm_with_fallback(
-                    ephemeral, tools=TOOLS, tier=tier,
+                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
                     temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
                 )
                 for k, v in response.usage.items():
@@ -718,7 +1207,11 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                         yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
 
                     # Execute tools
-                    tu, td = await _execute_tool_calls(response.tool_calls, conv_id)
+                    tu, td = await _execute_tool_calls(
+                        response.tool_calls,
+                        conv_id,
+                        user_sub=str((user or {}).get("sub", "") or ""),
+                    )
                     tools_used.extend(tu)
                     tool_details.extend(td)
 
@@ -736,7 +1229,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                         # Try to re-do as streaming for token-by-token delivery
                         # Remove tools so we get pure text streaming
                         try:
-                            ephemeral_stream = await _build_llm_messages(conv_id, request.question)
+                            ephemeral_stream = await _build_llm_messages(conv_id, request.question, request=request)
                             async for event in provider.chat_stream(
                                 ephemeral_stream, tools=None,
                                 temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
@@ -751,21 +1244,33 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                             yield _sse({"type": "token", "text": response.content})
 
                         conversations[conv_id].append({"role": "assistant", "content": response.content})
-
-                        # Persist to Table Storage (fire-and-forget)
-                        asyncio.create_task(_persist_conversation(conv_id, partition_key))
+                        should_persist = True
                     else:
                         yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
 
         except Exception as e:
             yield _sse({"type": "error", "text": str(e)})
+
+    if should_persist:
+        try:
+            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
+        except Exception:
+            _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
+    has_exportable = False
+    export_idx = None
+    for idx, d in enumerate(tool_details):
+        if d.get("result_summary", {}).get("items_returned", 0) > 0:
+            has_exportable = True
+            export_idx = idx
     
     yield _sse({
         "type": "done",
         "tools_used": list(set(tools_used)),
         "tool_details": tool_details,
+        "has_exportable_data": has_exportable,
+        "export_index": export_idx,
         "tokens_used": total_usage,
         "total_time_ms": total_time,
         "model_used": model_used,

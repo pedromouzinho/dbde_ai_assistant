@@ -2,8 +2,10 @@
 
 > **Ficheiro de referência rápida para recuperação de contexto.**
 > Usar quando: chat perdido, context window cheia, novo agente precisa de onboarding.
-> Última atualização: 2026-02-23 (Fase 3 em progresso — 3.1/3.2/3.3 em produção + hotfixes pós-auditoria; faltam 3.4/3.5)
-> Versão atual em produção: **v7.0.5** (com hotfixes de segurança/robustez deployados em 2026-02-23)
+> Última atualização: 2026-02-24 (Fases 1A-5 completas em produção; `.pptx` em backlog técnico/shelved)
+> Versão atual em produção: **v7.2.0** (confirmado via `/api/info` e `/health`)
+> Estado de release: **estável** para fluxos core (chat, tools, export, userstory, Figma, Miro)
+> Nota: texto corrido a preto; títulos e destaques em cerise (`#DE3163`)
 
 ---
 
@@ -139,6 +141,13 @@ curl -X PUT -u "$AUTH" \
 - `invalidate_few_shot_cache()` para limpeza explícita
 - Cache hit evita 3 chamadas HTTP (1 embedding + 2 search)
 
+### 5.5 Hardening Pós-Review (v7.1.1 deployado)
+- Escaping OData consistente em filtros com input de utilizador (`app.py`)
+- Bootstrap de password admin sem hardcode (`ADMIN_INITIAL_PASSWORD` ou gerada no startup)
+- `storage.py` com níveis de log corrigidos (`info`/`warning` em vez de `error` indevido)
+- `_generated_files_store` com limite por quantidade e por bytes totais
+- Alinhamento de versão entre backend/export/frontend para `7.1.1`
+
 ---
 
 ## 6. ESTADO DO ROADMAP
@@ -179,22 +188,43 @@ curl -X PUT -u "$AUTH" \
 **Deploy:** v7.0.5 em produção, 7 testes PASS
 **Nota:** table_merge não é upsert — _persist_conversation usa query→insert/merge. _ensure_conversation agora async.
 
-### Fase 3 — Charts e Visualização → v7.1.0 ⏳ EM PROGRESSO
+### Fase 3 — Charts e Visualização → v7.1.0 ✅ FECHADA
 | Tarefa | Descrição | Estado |
 |--------|-----------|--------|
 | 3.1 | Plotly.js CDN (2.35.2 defer) + renderPlotlyChart + ChartBlock + getChartSpecs | ✅ FECHADA |
 | 3.2 | Tool generate_chart (6 tipos + multi-series, _chart Plotly spec, regra 9 system prompt, TOOLS 9 entries) | ✅ FECHADA |
 | 3.3 | Upload enrichment: col_analysis (numeric/text) + _inject_file_context com instrução generate_chart | ✅ FECHADA |
-| 3.4 | Export de charts (SVG/PNG) — parcialmente feito no ChartBlock da 3.1, validar | PENDENTE |
-| 3.5 | File generation via prompts — tool generate_file para CSV/XLSX/PDF | PENDENTE |
+| 3.4 | Export de charts (SVG/PNG) via `Plotly.downloadImage` no `ChartBlock` | ✅ FECHADA |
+| 3.5 | File generation via prompts — `generate_file` + endpoint `/api/download/{id}` + botões por mensagem | ✅ FECHADA |
 
-**Nota:** 3.1-3.3 implementadas, auditadas e **deployadas em produção** (Kudu VFS PUT + restart em 2026-02-23). Hotfixes pós-auditoria também deployados: confirmação robusta no `create_workitem`, parsing de delimitador dinâmico no `col_analysis`, locks por conversa e hardening de persistência multimodal.
+**Nota:** Fase 3 completa e deployada em produção (Kudu VFS PUT + restart em 2026-02-23). Inclui export de charts (SVG/PNG) e geração de ficheiros por prompt (CSV/XLSX/PDF) com download autenticado.
 **Detalhe técnico 3.2:** `tool_generate_chart()` aceita chart_type, title, x_values, y_values, labels, values, series, x_label, y_label. Multi-series via `series` param (array de objetos). Retorna `{ _chart: { data, layout, config } }`.
 **Detalhe técnico 3.3:** `col_analysis` inicializado como `[]` antes do bloco if (defensivo). Heurística >60% numérico para tipo. Guardado em `uploaded_files_store[conv_id]["col_analysis"]`. `_inject_file_context` enriquecida com bloco "ANÁLISE DE COLUNAS".
 
-### Fase 4 — US Writer Pro → v7.1.1
-### Fase 5 — Integrações + Polish → v7.2.0
-### Fase 6 — Análise Profunda → v7.2.1
+### Fase 4 — US Writer Pro → v7.1.1 ✅ FECHADA (com exceção 4.4 em backlog técnico)
+| Tarefa | Descrição | Estado |
+|--------|-----------|--------|
+| 4.1 | Rewrite de `get_userstory_system_prompt()` com ciclo Draft→Review→Final + refinamento por feedback + visual parsing | ✅ FECHADA (DEPLOYADA) |
+| 4.2 | `WriterProfiles` table + persistência de estilo (`author_style`) + reuse em `generate_user_stories` por `reference_author` | ✅ FECHADA (DEPLOYADA) |
+| 4.3 | Pré-processamento no `agent.py` para modo userstory (tabular→REQ-xxx, PDF→hierarquia, PPTX→orientação por slide) | ✅ FECHADA (DEPLOYADA) |
+| 4.4 | Suporte `.pptx` no upload com `python-pptx`, import guard e extração de texto por slides/shapes (ignora imagens) | ⏸️ SHELVED/TBD (runtime/dependências) |
+| 4.5 | Hardening pós-review arquitetural (OData escape, password bootstrap sem hardcode, memory cap generated files, logging/versão) | ✅ FECHADA (DEPLOYADA) |
+
+**Nota:** A Fase 4 está fechada para produção core. O item `.pptx` (4.4) foi colocado em backlog técnico para melhoria futura, sem bloquear operação.
+### Fase 5 — Integrações + Polish → v7.2.0 ✅ FECHADA (2026-02-23)
+| Tarefa | Descrição | Estado |
+|--------|-----------|--------|
+| 5.1 | Tool Registry dinâmico (tool_registry.py, auto-registo) | ✅ FECHADA (DEPLOYADA) |
+| 5.2 | Integração Figma read-only (tools_figma.py, REST API v1, cache 5min, retry 3×) | ✅ FECHADA (DEPLOYADA) |
+| 5.3 | Integração Miro read-only (tools_miro.py, REST API v2, cache 5min, retry 3×) | ✅ FECHADA (DEPLOYADA) |
+| 5.4 | System prompt awareness (routing dinâmico c/ has_tool, data_sources) | ✅ FECHADA (DEPLOYADA) |
+| 5.5 | Streaming optimization (incremental rendering) | ✅ FECHADA (DEPLOYADA) |
+| 5.6 | Feedback memory cap (deque maxlen=100) | ✅ FECHADA (DEPLOYADA) |
+| 5.7 | httpOnly cookies (JWT migrado de localStorage) | ✅ FECHADA (DEPLOYADA) |
+
+**Nota:** Fase 5 deployada via ZIP deploy em 2026-02-23. Fixes Figma/Miro (endpoint inválido + limit) aplicados por hotfix. Tokens Figma/Miro requerem validação no App Settings runtime.
+
+### Fase 6 — Análise Profunda → v7.2.1 (PRÓXIMA)
 
 ---
 
@@ -242,3 +272,10 @@ MENSAGEM PARA O CLAUDE
 | 2026-02-23 | Hotfix de segurança: `create_workitem` só avança com confirmação explícita robusta (negações bloqueiam; aprovações comuns aceites) |
 | 2026-02-23 | Hotfix de dados: `col_analysis` no upload passou a usar delimitador dinâmico (`sep`) em vez de split hardcoded por vírgula |
 | 2026-02-23 | Deploy técnico confirmado por Codex: PUT de `agent.py`, `app.py`, `tools.py`, `learning.py`, `static/index.html` + `restartTrigger.txt` + validação `/api/info` e `/health` |
+| 2026-02-23 | Hardening pós-review preparado para v7.1.1: OData escape no `app.py`, bootstrap admin password por env/aleatória, cap total de memória em generated files, alinhamento de versão/logging |
+| 2026-02-23 | Decisão de produto: suporte `.pptx` fica **shelved/TBD** até correção definitiva de runtime/build no App Service (sem impacto nos restantes fluxos) |
+| 2026-02-24 | **VFS PUT NÃO PERSISTE** — lição aprendida: Oryx usa ZIP artifact como source of truth. VFS PUT só para debug rápido |
+| 2026-02-24 | Figma /v1/files/recent não existe (404). Fix: validar com /v1/me + notice para usar file_key |
+| 2026-02-24 | Miro /boards/{id}/items max limit=50 (não 100). Fix aplicado em tools_miro.py |
+| 2026-02-24 | Tokens Figma/Miro em App Settings podem não chegar ao container — validar no Kudu Environment após restart |
+| 2026-02-24 | Handoff .md sincronizado com v7.2.0 (era v7.0.5). Rmd descartado como formato de referência |

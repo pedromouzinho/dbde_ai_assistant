@@ -9,10 +9,14 @@ import csv
 import io
 import json
 import logging
+import html as html_lib
+import os
+import re
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+from urllib.parse import urlparse
 
-from config import EXPORT_BRAND_COLOR, EXPORT_BRAND_NAME, EXPORT_AGENT_NAME
+from config import EXPORT_BRAND_COLOR, EXPORT_BRAND_NAME, EXPORT_AGENT_NAME, APP_VERSION
 
 # =============================================================================
 # DATA EXTRACTION
@@ -73,6 +77,149 @@ def _latin1_safe(text: str, max_len: int = 0) -> str:
     return safe
 
 
+def _safe_http_url(value: str) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return candidate
+    return ""
+
+
+def _hex_to_rgb(hex_color: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    raw = str(hex_color or "").strip().lstrip("#")
+    if len(raw) != 6:
+        return fallback
+    try:
+        return (int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16))
+    except Exception:
+        return fallback
+
+
+def _is_numeric_like(value: str) -> bool:
+    txt = str(value or "").strip()
+    if not txt:
+        return False
+    return bool(re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", txt))
+
+
+def _configure_pdf_font(pdf) -> str:
+    """Configura Montserrat quando existir no runtime; fallback para Helvetica."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    font_dir = os.path.join(base_dir, "assets", "fonts")
+    regular = os.path.join(font_dir, "Montserrat-Regular.ttf")
+    bold = os.path.join(font_dir, "Montserrat-Bold.ttf")
+    italic = os.path.join(font_dir, "Montserrat-Italic.ttf")
+    if os.path.exists(regular) and os.path.exists(bold) and os.path.exists(italic):
+        try:
+            pdf.add_font("Montserrat", "", regular)
+            pdf.add_font("Montserrat", "B", bold)
+            pdf.add_font("Montserrat", "I", italic)
+            return "Montserrat"
+        except Exception as e:
+            logging.warning("[ExportEngine] Montserrat unavailable, fallback Helvetica: %s", e)
+    return "Helvetica"
+
+
+def _pdf_column_widths(headers: List[str], page_width: float) -> List[float]:
+    if not headers:
+        return []
+    weights = {
+        "id": 1.0,
+        "type": 1.2,
+        "state": 1.1,
+        "parent_id": 1.1,
+        "title": 4.8,
+        "area": 2.6,
+        "assigned_to": 1.9,
+        "created_by": 1.9,
+        "created_date": 1.6,
+        "url": 3.0,
+    }
+    min_w = 14.0
+    raw = [float(weights.get(h, 1.6)) for h in headers]
+    total = sum(raw) if raw else 1.0
+    widths = [max(min_w, page_width * (w / total)) for w in raw]
+    overflow = sum(widths) - page_width
+    if overflow > 0:
+        candidates = sorted(range(len(widths)), key=lambda idx: widths[idx], reverse=True)
+        for idx in candidates:
+            if overflow <= 0:
+                break
+            shrink = max(0.0, widths[idx] - min_w)
+            if shrink <= 0:
+                continue
+            delta = min(shrink, overflow)
+            widths[idx] -= delta
+            overflow -= delta
+    if sum(widths) > page_width and headers:
+        eq = max(10.0, page_width / len(headers))
+        widths = [eq] * len(headers)
+    return widths
+
+
+def _pdf_wrap_lines(pdf, text: str, cell_width: float, max_lines: int = 4) -> List[str]:
+    raw = _latin1_safe(str(text or "")).strip()
+    if not raw:
+        return [""]
+
+    max_text_w = max(2.0, cell_width - 1.8)
+    lines: List[str] = []
+
+    for segment in raw.replace("\r", "\n").split("\n"):
+        words = segment.split()
+        if not words:
+            continue
+        current = words[0]
+        if pdf.get_string_width(current) > max_text_w:
+            # Hard-break de tokens longos (URL, IDs) para manter largura estável.
+            chunk = ""
+            for ch in current:
+                cand = chunk + ch
+                if pdf.get_string_width(cand) <= max_text_w:
+                    chunk = cand
+                else:
+                    if chunk:
+                        lines.append(chunk)
+                    chunk = ch
+            current = chunk or current
+        for word in words[1:]:
+            if pdf.get_string_width(word) > max_text_w:
+                lines.append(current)
+                chunk = ""
+                for ch in word:
+                    cand = chunk + ch
+                    if pdf.get_string_width(cand) <= max_text_w:
+                        chunk = cand
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = ch
+                current = chunk or word
+                continue
+            candidate = f"{current} {word}".strip()
+            if pdf.get_string_width(candidate) <= max_text_w:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if lines:
+            tail = lines[-1]
+            if len(tail) > 2:
+                lines[-1] = tail[:-1] + "..."
+            else:
+                lines[-1] = tail + "..."
+    return [ln for ln in lines if ln] or [""]
+
+
 # =============================================================================
 # CSV EXPORT
 # =============================================================================
@@ -118,7 +265,10 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     ws.title = _safe_sheet_title(title)
     
     # Branding colors
-    brand_fill = PatternFill(start_color="CC0033", end_color="CC0033", fill_type="solid")
+    brand_hex = str(EXPORT_BRAND_COLOR or "#DE3163").strip().lstrip("#").upper()
+    if len(brand_hex) != 6:
+        brand_hex = "DE3163"
+    brand_fill = PatternFill(start_color=brand_hex, end_color=brand_hex, fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     data_font = Font(size=10)
     zebra_fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
@@ -132,7 +282,7 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     # Title row
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
     title_cell = ws.cell(row=1, column=1, value=f"{EXPORT_AGENT_NAME} — {title}")
-    title_cell.font = Font(bold=True, size=14, color="CC0033")
+    title_cell.font = Font(bold=True, size=14, color=brand_hex)
     
     # Subtitle
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
@@ -191,62 +341,107 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         pdf = FPDF()
         pdf.add_page('L')  # Landscape for tables
         pdf.set_auto_page_break(auto=True, margin=15)
+        font_family = _configure_pdf_font(pdf)
+        cerise_rgb = _hex_to_rgb("#DE3163", (222, 49, 99))
 
         # Title
-        pdf.set_font('Helvetica', 'B', 16)
-        pdf.set_text_color(204, 0, 51)  # Brand red
-        pdf.cell(0, 10, _latin1_safe(title, 80), ln=True)
+        pdf.set_font(font_family, 'B', 16)
+        pdf.set_text_color(*cerise_rgb)
+        pdf.cell(0, 10, _latin1_safe(title, 160), ln=True)
 
         # Subtitle
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font(font_family, '', 9)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 6, _latin1_safe(f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | {EXPORT_AGENT_NAME}"), ln=True)
+        pdf.multi_cell(0, 5, _latin1_safe(f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | {EXPORT_AGENT_NAME}"))
         if summary:
-            pdf.cell(0, 6, _latin1_safe(summary, 120), ln=True)
+            pdf.set_font(font_family, 'I', 8.5)
+            for line in str(summary).splitlines():
+                if line.strip():
+                    try:
+                        pdf.multi_cell(0, 4.5, _latin1_safe(line))
+                    except Exception:
+                        pdf.cell(0, 4.5, _latin1_safe(line, 250), ln=True)
         pdf.ln(5)
 
         if not headers:
-            pdf.set_font('Helvetica', '', 10)
+            pdf.set_font(font_family, '', 10)
             pdf.cell(0, 10, "Sem dados para exportar.", ln=True)
         else:
-            # Calculate column widths
-            page_w = pdf.w - 20  # margins
-            col_w = min(page_w / len(headers), 50)
-            col_widths = [col_w] * len(headers)
-            # Make title column wider
-            if "title" in headers:
-                ti = headers.index("title")
-                extra = page_w - col_w * len(headers)
-                if extra > 0:
-                    col_widths[ti] += extra
+            page_w = pdf.w - pdf.l_margin - pdf.r_margin
+            col_widths = _pdf_column_widths(headers, page_w)
 
-            # Header row
-            pdf.set_font('Helvetica', 'B', 8)
-            pdf.set_fill_color(204, 0, 51)
-            pdf.set_text_color(255, 255, 255)
-            for i, h in enumerate(headers):
-                pdf.cell(col_widths[i], 7, _latin1_safe(_clean_header(h), 20), border=1, fill=True)
-            pdf.ln()
-
-            # Data rows
-            pdf.set_font('Helvetica', '', 7)
-            pdf.set_text_color(0, 0, 0)
-            for r_idx, row in enumerate(rows[:200]):  # Max 200 rows in PDF
-                if r_idx % 2 == 1:
-                    pdf.set_fill_color(245, 245, 245)
-                    fill = True
-                else:
-                    fill = False
-                for i, val in enumerate(row):
-                    w = col_widths[i] if i < len(col_widths) else col_w
-                    pdf.cell(w, 6, _latin1_safe(str(val), 60), border=1, fill=fill)
+            def _draw_header() -> None:
+                pdf.set_font(font_family, 'B', 8)
+                pdf.set_fill_color(*cerise_rgb)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_x(pdf.l_margin)
+                for i, h in enumerate(headers):
+                    pdf.cell(col_widths[i], 7, _latin1_safe(_clean_header(h), 28), border=1, fill=True)
                 pdf.ln()
+
+            _draw_header()
+
+            pdf.set_font(font_family, '', 7)
+            pdf.set_text_color(0, 0, 0)
+            line_h = 3.8
+
+            prepared_rows: List[tuple[List[str], List[List[str]]]] = []
+            global_max_lines = 1
+            for row in rows[:500]:
+                cell_lines: List[List[str]] = []
+                for i, val in enumerate(row):
+                    key = headers[i] if i < len(headers) else ""
+                    max_lines = 6 if key in ("title", "url", "area") else 4
+                    wrapped = _pdf_wrap_lines(pdf, str(val), col_widths[i], max_lines=max_lines)
+                    cell_lines.append(wrapped)
+                    global_max_lines = max(global_max_lines, len(wrapped))
+                prepared_rows.append((row, cell_lines))
+
+            uniform_row_lines = max(2, min(6, global_max_lines))
+
+            for r_idx, (row_values, cell_lines) in enumerate(prepared_rows):
+                row_h = line_h * uniform_row_lines
+                if pdf.get_y() + row_h > (pdf.h - pdf.b_margin - 10):
+                    pdf.add_page('L')
+                    _draw_header()
+
+                fill = (r_idx % 2 == 1)
+                if fill:
+                    pdf.set_fill_color(245, 245, 245)
+
+                y0 = pdf.get_y()
+                x = pdf.l_margin
+                for i, lines in enumerate(cell_lines):
+                    padded_lines = (lines + ([""] * max(0, uniform_row_lines - len(lines))))[:uniform_row_lines]
+                    cell_style = "I" if _is_numeric_like(row_values[i] if i < len(row_values) else "") else ""
+                    pdf.set_font(font_family, cell_style, 7)
+                    pdf.set_xy(x, y0)
+                    cell_text = "\n".join(padded_lines)
+                    try:
+                        pdf.multi_cell(
+                            col_widths[i],
+                            line_h,
+                            cell_text,
+                            border=1,
+                            fill=fill,
+                        )
+                    except Exception:
+                        pdf.set_xy(x, y0)
+                        pdf.cell(
+                            col_widths[i],
+                            row_h,
+                            _latin1_safe(cell_text.replace("\n", " | "), 220),
+                            border=1,
+                            fill=fill,
+                        )
+                    x += col_widths[i]
+                pdf.set_xy(pdf.l_margin, y0 + row_h)
 
         # Footer
         pdf.ln(10)
-        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_font(font_family, 'I', 8)
         pdf.set_text_color(150, 150, 150)
-        pdf.cell(0, 5, _latin1_safe(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v7.0"), ln=True)
+        pdf.cell(0, 5, _latin1_safe(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}"), ln=True)
 
         buf = io.BytesIO()
         pdf.output(buf)
@@ -292,15 +487,16 @@ def to_svg_bar_chart(tool_result: dict, title: str = "Chart") -> str:
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{chart_w}" height="{total_h}" style="font-family:Arial,sans-serif">']
     
     # Title
-    svg.append(f'<text x="{chart_w//2}" y="25" text-anchor="middle" font-size="16" font-weight="bold" fill="#CC0033">{title}</text>')
+    safe_title = html_lib.escape(str(title or "Chart"))
+    svg.append(f'<text x="{chart_w//2}" y="25" text-anchor="middle" font-size="16" font-weight="bold" fill="{html_lib.escape(EXPORT_BRAND_COLOR)}">{safe_title}</text>')
     
     y = 50
     for g in groups:
         w = int((g["count"] / max_val) * bar_w)
-        label = str(g["value"])[:25]
+        label = html_lib.escape(str(g["value"])[:25])
         
         svg.append(f'<text x="{label_w - 10}" y="{y + 16}" text-anchor="end" font-size="11" fill="#333">{label}</text>')
-        svg.append(f'<rect x="{label_w}" y="{y + 2}" width="{max(w, 2)}" height="{bar_h - 6}" fill="#CC0033" rx="3"/>')
+        svg.append(f'<rect x="{label_w}" y="{y + 2}" width="{max(w, 2)}" height="{bar_h - 6}" fill="{html_lib.escape(EXPORT_BRAND_COLOR)}" rx="3"/>')
         svg.append(f'<text x="{label_w + w + 8}" y="{y + 16}" font-size="11" fill="#666">{g["count"]}</text>')
         
         y += bar_h
@@ -319,47 +515,63 @@ def to_svg_bar_chart(tool_result: dict, title: str = "Chart") -> str:
 def to_html_report(tool_result: dict, title: str = "Relatório", summary: str = "") -> str:
     """Gera relatório HTML completo com tabela e estilos."""
     headers, rows = extract_table_data(tool_result)
+    safe_title = html_lib.escape(str(title or "Relatório"))
+    safe_summary = html_lib.escape(str(summary or ""))
+    total_count = html_lib.escape(str(tool_result.get('total_count', len(rows))))
+    generated_at = html_lib.escape(datetime.now().strftime('%d/%m/%Y %H:%M'))
     
     html = f"""<!DOCTYPE html>
 <html lang="pt">
-<head><meta charset="UTF-8"><title>{title}</title>
+<head><meta charset="UTF-8"><title>{safe_title}</title>
 <style>
 body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; color: #333; }}
-h1 {{ color: #CC0033; border-bottom: 3px solid #CC0033; padding-bottom: 10px; }}
+h1 {{ color: {html_lib.escape(EXPORT_BRAND_COLOR)}; border-bottom: 3px solid {html_lib.escape(EXPORT_BRAND_COLOR)}; padding-bottom: 10px; }}
 .meta {{ color: #666; font-size: 0.9em; margin-bottom: 20px; }}
 table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
-th {{ background: #CC0033; color: white; padding: 10px 12px; text-align: left; font-size: 0.9em; }}
+th {{ background: {html_lib.escape(EXPORT_BRAND_COLOR)}; color: white; padding: 10px 12px; text-align: left; font-size: 0.9em; }}
 td {{ padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 0.85em; }}
 tr:nth-child(even) {{ background: #f9f9f9; }}
 tr:hover {{ background: #fff0f0; }}
 .footer {{ margin-top: 30px; font-size: 0.8em; color: #999; border-top: 1px solid #eee; padding-top: 10px; }}
-a {{ color: #CC0033; text-decoration: none; }}
+a {{ color: {html_lib.escape(EXPORT_BRAND_COLOR)}; text-decoration: none; }}
 </style></head>
 <body>
-<h1>{title}</h1>
-<div class="meta">Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: {tool_result.get('total_count', len(rows))} registos{f' | {summary}' if summary else ''}</div>
+<h1>{safe_title}</h1>
+<div class="meta">Gerado em {generated_at} | Total: {total_count} registos{f' | {safe_summary}' if safe_summary else ''}</div>
 """
     if headers:
         html += '<table><thead><tr>'
         for h in headers:
-            html += f'<th>{_clean_header(h)}</th>'
+            html += f'<th>{html_lib.escape(_clean_header(h))}</th>'
         html += '</tr></thead><tbody>'
         for row in rows:
             html += '<tr>'
             for i, val in enumerate(row):
-                if headers[i] == 'url' and val.startswith('http'):
-                    html += f'<td><a href="{val}" target="_blank">🔗 Link</a></td>'
+                text_val = html_lib.escape(str(val))
+                if headers[i] == 'url':
+                    safe_url = _safe_http_url(str(val))
+                    if safe_url:
+                        escaped_url = html_lib.escape(safe_url, quote=True)
+                        html += f'<td><a href="{escaped_url}" target="_blank" rel="noopener noreferrer">🔗 Link</a></td>'
+                    else:
+                        html += f'<td>{text_val}</td>'
                 elif headers[i] == 'id' and len(row) > headers.index('url') if 'url' in headers else False:
                     url_val = row[headers.index('url')] if 'url' in headers else ''
-                    html += f'<td><a href="{url_val}" target="_blank">{val}</a></td>'
+                    safe_url = _safe_http_url(str(url_val))
+                    if safe_url:
+                        escaped_url = html_lib.escape(safe_url, quote=True)
+                        html += f'<td><a href="{escaped_url}" target="_blank" rel="noopener noreferrer">{text_val}</a></td>'
+                    else:
+                        html += f'<td>{text_val}</td>'
                 else:
-                    html += f'<td>{val}</td>'
+                    html += f'<td>{text_val}</td>'
             html += '</tr>'
         html += '</tbody></table>'
     else:
         html += '<p>Sem dados tabulares para apresentar.</p>'
         # Show raw data
-        html += f'<pre>{json.dumps(tool_result, indent=2, ensure_ascii=False)[:5000]}</pre>'
+        raw = json.dumps(tool_result, indent=2, ensure_ascii=False)[:5000]
+        html += f'<pre>{html_lib.escape(raw)}</pre>'
     
-    html += f'\n<div class="footer">{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v7.0</div>\n</body></html>'
+    html += f'\n<div class="footer">{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}</div>\n</body></html>'
     return html

@@ -3,12 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Assistente AI DBDE v7.0</title>
+    <title>Assistente AI DBDE v7.2.0</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23DE3163'/><text x='50' y='70' font-size='60' font-weight='bold' fill='white' text-anchor='middle' font-family='sans-serif'>M</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.6/purify.min.js"></script>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -124,8 +125,74 @@
     <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 const API_URL = window.location.origin;
+const DEFAULT_MAX_IMAGES_PER_MESSAGE = 10;
+const DEFAULT_MAX_FILES_PER_CONVERSATION = 10;
+const DEFAULT_MAX_BATCH_TOTAL_BYTES = 60 * 1024 * 1024;
+const UPLOAD_POLL_INTERVAL_MS = 1200;
+const UPLOAD_JOB_TIMEOUT_MS = 20 * 60 * 1000;
+const DEVOPS_WORKITEM_BASE_URL = "https://dev.azure.com/ptbcp/IT.DIT/_workitems/edit/";
 
 // ─── Markdown Renderer ──────────────────────────────────────────────────────
+function escapeHtml(text) {
+    return String(text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function sanitizeLinkUrl(rawUrl) {
+    const candidate = String(rawUrl || "").trim();
+    if (!candidate) return "";
+    try {
+        const parsed = new URL(candidate, window.location.origin);
+        const protocol = (parsed.protocol || "").toLowerCase();
+        if (protocol === "http:" || protocol === "https:") {
+            return parsed.href;
+        }
+    } catch (e) {
+        return "";
+    }
+    return "";
+}
+
+function sanitizeHtmlOutput(rawHtml) {
+    if (window.DOMPurify) {
+        return window.DOMPurify.sanitize(rawHtml, {
+            ALLOWED_TAGS: ["p", "strong", "em", "code", "pre", "h2", "h3", "h4", "li", "ul", "ol", "a", "table", "thead", "tbody", "tr", "th", "td", "br", "div", "span"],
+            ALLOWED_ATTR: ["href", "target", "rel", "class", "style"],
+            FORBID_TAGS: ["script", "iframe", "object", "embed", "svg", "math", "img"],
+        });
+    }
+    return escapeHtml(rawHtml);
+}
+
+function _extractWorkItemIdFromRowCells(rowCells, headerCells = []) {
+    if (!Array.isArray(rowCells) || rowCells.length === 0) return "";
+    let idCandidate = "";
+    if (Array.isArray(headerCells) && headerCells.length === rowCells.length) {
+        const idx = headerCells.findIndex(h => String(h || "").trim().toLowerCase() === "id");
+        if (idx >= 0) idCandidate = String(rowCells[idx] || "").trim();
+    }
+    if (!idCandidate) idCandidate = String(rowCells[0] || "").trim();
+    return /^\d{4,9}$/.test(idCandidate) ? idCandidate : "";
+}
+
+function _renderTableCell(cellText, colIndex, rowCells, headerCells) {
+    const rendered = renderInline(cellText);
+    if (/<a\s/i.test(rendered)) return rendered;
+    const normalized = String(cellText || "").trim().toLowerCase();
+    const headerNorm = String((headerCells || [])[colIndex] || "").trim().toLowerCase();
+    const isLinkCell = normalized === "link" || normalized === "🔗 link" || headerNorm === "link" || headerNorm === "url";
+    if (!isLinkCell) return rendered;
+    const workItemId = _extractWorkItemIdFromRowCells(rowCells, headerCells);
+    if (!workItemId) return rendered;
+    const safeUrl = sanitizeLinkUrl(`${DEVOPS_WORKITEM_BASE_URL}${workItemId}`);
+    if (!safeUrl) return rendered;
+    return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">Link</a>`;
+}
+
 function renderMarkdown(text) {
     if (!text) return "";
     let html = text;
@@ -138,24 +205,40 @@ function renderMarkdown(text) {
     // Tables
     const lines = html.split("\n");
     let result = [], inTable = false, tableHtml = "";
+    let tableHeaderCells = null;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
         if (line.startsWith("|") && line.endsWith("|")) {
-            if (!inTable) { inTable = true; tableHtml = '<div class="table-wrapper"><table>'; }
+            if (!inTable) {
+                inTable = true;
+                tableHtml = '<div class="table-wrapper"><table>';
+                tableHeaderCells = null;
+            }
             if (line.replace(/[|\s-:]/g, "") === "") continue; // separator
             const cells = line.split("|").slice(1, -1).map(c => c.trim());
-            const isHeader = !inTable || (i + 1 < lines.length && lines[i + 1].trim().replace(/[|\s-:]/g, "") === "");
-            if (tableHtml.indexOf("<tbody>") === -1 && tableHtml.indexOf("<thead>") === -1) {
+            const nextIsSeparator = i + 1 < lines.length && lines[i + 1].trim().replace(/[|\s-:]/g, "") === "";
+            if (tableHtml.indexOf("<thead>") === -1 && nextIsSeparator) {
+                tableHeaderCells = cells.slice();
                 tableHtml += "<thead><tr>" + cells.map(c => `<th>${renderInline(c)}</th>`).join("") + "</tr></thead><tbody>";
             } else {
-                tableHtml += "<tr>" + cells.map(c => `<td>${renderInline(c)}</td>`).join("") + "</tr>";
+                if (tableHtml.indexOf("<tbody>") === -1) tableHtml += "<tbody>";
+                tableHtml += "<tr>" + cells.map((c, idx) => `<td>${_renderTableCell(c, idx, cells, tableHeaderCells || [])}</td>`).join("") + "</tr>";
             }
         } else {
-            if (inTable) { tableHtml += "</tbody></table></div>"; result.push(tableHtml); inTable = false; tableHtml = ""; }
+            if (inTable) {
+                tableHtml += "</tbody></table></div>";
+                result.push(tableHtml);
+                inTable = false;
+                tableHtml = "";
+                tableHeaderCells = null;
+            }
             result.push(line);
         }
     }
-    if (inTable) { tableHtml += "</tbody></table></div>"; result.push(tableHtml); }
+    if (inTable) {
+        tableHtml += "</tbody></table></div>";
+        result.push(tableHtml);
+    }
     html = result.join("\n");
 
     // Block elements
@@ -172,7 +255,7 @@ function renderMarkdown(text) {
     // Inline
     html = renderInline(html);
 
-    return `<p>${html}</p>`;
+    return sanitizeHtmlOutput(`<p>${html}</p>`);
 }
 
 function renderInline(text) {
@@ -181,9 +264,19 @@ function renderInline(text) {
     text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
     // Links: [text](url) — avoid duplicating
-    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, rawUrl) => {
+        const safeUrl = sanitizeLinkUrl(rawUrl);
+        const safeLabel = escapeHtml(label);
+        if (!safeUrl) return safeLabel;
+        return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
+    });
     // Auto-link bare URLs not already in href
-    text = text.replace(/(?<!href="|">)(https?:\/\/[^\s<"]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    text = text.replace(/(?<!href="|">)(https?:\/\/[^\s<"]+)/g, (rawUrl) => {
+        const safeUrl = sanitizeLinkUrl(rawUrl);
+        const safeLabel = escapeHtml(rawUrl);
+        if (!safeUrl) return safeLabel;
+        return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
+    });
     return text;
 }
 
@@ -258,7 +351,7 @@ hr{border:none;border-top:1px solid #e0e0e0;margin:24px 0}</style></head><body>
 // ─── Tool badges component ──────────────────────────────────────────────────
 function ToolBadges({ tools, details }) {
     if (!tools || tools.length === 0) return null;
-    const icons = { query_workitems: "🔍", search_workitems: "🧠", search_website: "🌐", analyze_patterns: "📊", generate_user_stories: "📋", query_hierarchy: "🔗", compute_kpi: "📈" };
+    const icons = { query_workitems: "🔍", search_workitems: "🧠", search_website: "🌐", analyze_patterns: "📊", generate_user_stories: "📋", query_hierarchy: "🔗", compute_kpi: "📈", generate_chart: "📉", generate_file: "💾" };
     return React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 } },
         tools.map((t, i) => React.createElement("span", { key: i, className: "tool-badge", title: details && details[i] ? JSON.stringify(details[i]).slice(0, 200) : t },
             React.createElement("span", null, icons[t] || "⚙️"),
@@ -284,17 +377,41 @@ function _isExportablePayload(parsed) {
     return hasItems || hasAnalysis || hasGroups;
 }
 
-function getFirstExportableData(toolResults) {
+function _parseExportIndex(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value);
+    if (!Number.isInteger(n)) return null;
+    return n;
+}
+
+function _toolResultHasPayload(toolResult) {
+    const parsed = _parseToolResult(toolResult);
+    if (_isExportablePayload(parsed)) return true;
+    return !!String(toolResult?.result_blob_ref || "").trim();
+}
+
+function getPreferredToolResult(toolResults, preferredIndex = null) {
     if (!Array.isArray(toolResults)) return null;
-    for (const tr of toolResults) {
-        const parsed = _parseToolResult(tr);
-        if (_isExportablePayload(parsed)) return parsed;
+    const idx = _parseExportIndex(preferredIndex);
+    if (idx !== null && idx >= 0 && idx < toolResults.length) {
+        const preferred = toolResults[idx];
+        if (_toolResultHasPayload(preferred)) return preferred;
+    }
+    for (let i = toolResults.length - 1; i >= 0; i--) {
+        const tr = toolResults[i];
+        if (_toolResultHasPayload(tr)) return tr;
     }
     return null;
 }
 
+function getPreferredExportableData(toolResults, preferredIndex = null) {
+    const selected = getPreferredToolResult(toolResults, preferredIndex);
+    if (!selected) return null;
+    return _parseToolResult(selected);
+}
+
 function messageHasExportableData(message) {
-    return !!getFirstExportableData(message?.tool_results);
+    return !!getPreferredToolResult(message?.tool_results, message?.export_index);
 }
 
 function getChartSpecs(toolResults) {
@@ -307,6 +424,30 @@ function getChartSpecs(toolResults) {
         }
     }
     return charts;
+}
+
+function getFileDownloads(toolResults) {
+    if (!Array.isArray(toolResults)) return [];
+    const downloads = [];
+    for (const tr of toolResults) {
+        const parsed = _parseToolResult(tr);
+        if (parsed && parsed._file_download) {
+            downloads.push(parsed._file_download);
+        }
+        if (parsed && Array.isArray(parsed._auto_file_downloads)) {
+            downloads.push(...parsed._auto_file_downloads.filter(Boolean));
+        }
+    }
+    return downloads;
+}
+
+function getPreferredAutoCsvDownload(toolResults, preferredIndex = null) {
+    const selected = getPreferredToolResult(toolResults, preferredIndex);
+    if (!selected) return null;
+    const parsed = _parseToolResult(selected);
+    if (!parsed) return null;
+    const auto = Array.isArray(parsed._auto_file_downloads) ? parsed._auto_file_downloads : [];
+    return auto.find(fd => String(fd?.format || "").toLowerCase() === "csv") || null;
 }
 
 // ─── Feedback widget ────────────────────────────────────────────────────────
@@ -441,7 +582,7 @@ function ChartBlock({ chartSpec, chartId }) {
             style: { width: "100%", minHeight: 300 }
         }),
         React.createElement("div", {
-            style: { display: "flex", gap: 6, marginTop: 8 }
+            style: { display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }
         },
             React.createElement("button", {
                 className: "export-btn",
@@ -449,24 +590,25 @@ function ChartBlock({ chartSpec, chartId }) {
                     const el = document.getElementById(chartId);
                     if (el && window.Plotly) window.Plotly.downloadImage(el, { format: "svg", filename: (chartSpec.layout?.title?.text || "chart").replace(/[^a-zA-Z0-9]/g, "_") });
                 },
-                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif" }
-            }, "⬇ SVG"),
+                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 600, fontFamily: "'Montserrat', sans-serif" }
+            }, "Download SVG"),
             React.createElement("button", {
                 className: "export-btn",
                 onClick: () => {
                     const el = document.getElementById(chartId);
                     if (el && window.Plotly) window.Plotly.downloadImage(el, { format: "png", width: 1200, height: 600, filename: (chartSpec.layout?.title?.text || "chart").replace(/[^a-zA-Z0-9]/g, "_") });
                 },
-                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif" }
-            }, "⬇ PNG")
+                style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 600, fontFamily: "'Montserrat', sans-serif" }
+            }, "Download PNG")
         )
     );
 }
 
 // ─── Message bubble ─────────────────────────────────────────────────────────
-function MessageBubble({ message, isLastAssistant, conversationId, messageIndex, onFeedback, onExport }) {
+function MessageBubble({ message, isLastAssistant, conversationId, messageIndex, onFeedback, onExport, onExportBundle, onFileDownload }) {
     const isUser = message.role === "user";
     const content = typeof message.content === "string" ? message.content : (message.text || "");
+    const fileDownloads = getFileDownloads(message.tool_results);
 
     if (isUser) {
         return React.createElement("div", {
@@ -508,6 +650,20 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
                     chartId: "chart-" + messageIndex + "-" + ci,
                 })
             ),
+            // Generated files (tool generate_file)
+            fileDownloads.length > 0 && React.createElement("div", {
+                style: { display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }
+            },
+                fileDownloads.map((fd, fi) =>
+                    React.createElement("button", {
+                        key: (fd.download_id || "file") + "-" + fi,
+                        className: "export-btn",
+                        onClick: () => onFileDownload(fd),
+                        style: { background: "#FFF0F3", border: "1px solid rgba(222,49,99,0.35)", borderRadius: 7, padding: "5px 12px", cursor: "pointer", fontSize: 11, color: "#B0103A", fontWeight: 700, fontFamily: "'Montserrat', sans-serif" },
+                        title: fd.filename || "download",
+                    }, "⬇ Download " + String(fd.format || "file").toUpperCase())
+                )
+            ),
             messageHasExportableData(message) && React.createElement("div", {
                 style: { display: "flex", gap: 4, marginTop: 8, flexWrap: "wrap" }
             },
@@ -515,10 +671,16 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
                     React.createElement("button", {
                         key: fmt,
                         className: "export-btn",
-                        onClick: () => onExport(fmt, message.tool_results),
+                        onClick: () => onExport(fmt, message.tool_results, message.export_index, messageIndex),
                         style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif", transition: "all 0.15s" }
                     }, "⬇ " + fmt.toUpperCase())
-                )
+                ),
+                React.createElement("button", {
+                    key: "bundle",
+                    className: "export-btn",
+                    onClick: () => onExportBundle(message.tool_results, message.export_index, messageIndex),
+                    style: { background: "#FFF0F3", border: "1px solid rgba(222,49,99,0.35)", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#B0103A", fontWeight: 700, fontFamily: "'Montserrat', sans-serif", transition: "all 0.15s" }
+                }, "⬇ Bundle ZIP")
             ),
             // Metadata line
             (message.total_time_ms || message.model_used) && React.createElement("div", {
@@ -537,8 +699,12 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
 }
 
 // ─── Auth helpers ───────────────────────────────────────────────────────────
-function getAuthHeaders(token) {
-    return { "Content-Type": "application/json", "Authorization": "Bearer " + token };
+function getAuthHeaders() {
+    return { "Content-Type": "application/json" };
+}
+
+function authFetch(url, options = {}) {
+    return fetch(url, { credentials: "include", ...options });
 }
 
 // ─── Login screen ───────────────────────────────────────────────────────────
@@ -553,12 +719,14 @@ function LoginScreen({ onLogin }) {
         setLoading(true); setError("");
         try {
             const res = await fetch(API_URL + "/api/auth/login", {
-                method: "POST", headers: { "Content-Type": "application/json" },
+                method: "POST",
+                credentials: "include",
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ username: username.trim(), password }),
             });
             if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || "Erro"); }
             const data = await res.json();
-            onLogin(data.access_token, { username: data.username, role: data.role, display_name: data.display_name });
+            onLogin({ username: data.username, role: data.role, display_name: data.display_name });
         } catch (e) { setError(e.message); } finally { setLoading(false); }
     }
 
@@ -573,7 +741,7 @@ function LoginScreen({ onLogin }) {
                     style: { width: 56, height: 56, borderRadius: 16, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "inline-flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 24, fontWeight: 700, marginBottom: 16, boxShadow: "0 4px 16px rgba(222,49,99,0.25)" }
                 }, "M"),
                 React.createElement("div", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a1a" } }, "Assistente AI DBDE"),
-                React.createElement("div", { style: { fontSize: 13, color: "#888", marginTop: 4 } }, "Millennium BCP · v7.0")
+                React.createElement("div", { style: { fontSize: 13, color: "#888", marginTop: 4 } }, "Millennium BCP · v7.2.0")
             ),
             error && React.createElement("div", { style: { background: "#FFF0F0", color: "#DE3163", padding: "10px 14px", borderRadius: 8, fontSize: 12, marginBottom: 16, textAlign: "center" } }, error),
             React.createElement("input", { className: "login-input", placeholder: "Username", value: username, onChange: e => setUsername(e.target.value), onKeyDown: e => { if (e.key === "Enter") handleSubmit(); }, style: { marginBottom: 12 } }),
@@ -584,7 +752,7 @@ function LoginScreen({ onLogin }) {
 }
 
 // ─── User Menu (with password change + user creation) ───────────────────────
-function UserMenu({ user, onLogout, token }) {
+function UserMenu({ user, onLogout }) {
     const [open, setOpen] = useState(false);
     const [showPw, setShowPw] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
@@ -600,7 +768,7 @@ function UserMenu({ user, onLogout, token }) {
 
     async function changePw() {
         try {
-            const res = await fetch(API_URL + "/api/auth/change-password", { method: "POST", headers: getAuthHeaders(token), body: JSON.stringify({ current_password: cpCur, new_password: cpNew }) });
+            const res = await authFetch(API_URL + "/api/auth/change-password", { method: "POST", headers: getAuthHeaders(), body: JSON.stringify({ current_password: cpCur, new_password: cpNew }) });
             const d = await res.json().catch(() => ({}));
             setCpMsg(res.ok ? "✅ Password alterada!" : "❌ " + (d.detail || "Erro"));
             if (res.ok) { setCpCur(""); setCpNew(""); }
@@ -609,7 +777,7 @@ function UserMenu({ user, onLogout, token }) {
 
     async function createUser() {
         try {
-            const res = await fetch(API_URL + "/api/auth/create-user", { method: "POST", headers: getAuthHeaders(token), body: JSON.stringify({ username: nuU, password: nuP, display_name: nuN }) });
+            const res = await authFetch(API_URL + "/api/auth/create-user", { method: "POST", headers: getAuthHeaders(), body: JSON.stringify({ username: nuU, password: nuP, display_name: nuN }) });
             const d = await res.json().catch(() => ({}));
             setNuMsg(res.ok ? "✅ Utilizador criado!" : "❌ " + (d.detail || "Erro"));
             if (res.ok) { setNuU(""); setNuP(""); setNuN(""); }
@@ -657,28 +825,33 @@ function UserMenu({ user, onLogout, token }) {
 // APP COMPONENT
 // =============================================================================
 function App() {
-    const [conversations, setConversations] = useState([{ id: null, title: "Nova conversa", messages: [], mode: "general" }]);
+    const [conversations, setConversations] = useState([{ id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] }]);
     const [activeIdx, setActiveIdx] = useState(0);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
     const [streamingText, setStreamingText] = useState("");
+    const [streamingRenderedBlocks, setStreamingRenderedBlocks] = useState([]);
+    const [streamingActiveBlock, setStreamingActiveBlock] = useState("");
     const [streamingStatus, setStreamingStatus] = useState("");
     const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth > 768);
     const [agentMode, setAgentMode] = useState("general");
-    const [modelTier, setModelTier] = useState("standard");
-    const [uploadedFile, setUploadedFile] = useState(null);
+    const [modelTier, setModelTier] = useState("fast");
+    const [uploadedFiles, setUploadedFiles] = useState([]);
     const [imagePreviews, setImagePreviews] = useState([]);
+    const [uploadingFiles, setUploadingFiles] = useState(false);
+    const [uploadProgressText, setUploadProgressText] = useState("");
+    const [maxImagesPerMessage, setMaxImagesPerMessage] = useState(DEFAULT_MAX_IMAGES_PER_MESSAGE);
+    const [maxFilesPerConversation, setMaxFilesPerConversation] = useState(DEFAULT_MAX_FILES_PER_CONVERSATION);
+    const [maxBatchTotalBytes, setMaxBatchTotalBytes] = useState(DEFAULT_MAX_BATCH_TOTAL_BYTES);
+    const [uploadWorkerConcurrency, setUploadWorkerConcurrency] = useState(2);
     const [dragOver, setDragOver] = useState(false);
-    const [auth, setAuth] = useState(() => {
-        try { const s = localStorage.getItem("dbde_auth"); return s ? JSON.parse(s) : null; } catch { return null; }
-    });
+    const [auth, setAuth] = useState(null);
+    const [authInitializing, setAuthInitializing] = useState(true);
 
     const active = conversations[activeIdx];
-    const authToken = auth ? auth.token : "";
+    const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
     const authUser = auth ? auth.user : {};
     const userId = authUser.username || "";
-    const authRef = useRef(auth);
-    authRef.current = auth;
 
     const chatEndRef = useRef(null);
     const inputRef = useRef(null);
@@ -687,25 +860,26 @@ function App() {
 
     useEffect(() => { chatEndRef.current && chatEndRef.current.scrollIntoView({ behavior: "smooth" }); }, [conversations, activeIdx, loading, streamingText]);
 
-    function handleLogin(token, user) {
-        const a = { token, user };
-        authRef.current = a; // Update ref immediately so loadChats can use it
+    function handleLogin(user) {
+        const a = { user };
         setAuth(a);
-        localStorage.setItem("dbde_auth", JSON.stringify(a));
-        loadChats(user.username, token);
     }
 
-    function handleLogout() {
+    async function handleLogout() {
+        try {
+            await authFetch(API_URL + "/api/auth/logout", { method: "POST" });
+        } catch (e) {
+            console.warn("Logout request failed:", e);
+        }
         setAuth(null);
-        authRef.current = null;
-        localStorage.removeItem("dbde_auth");
-        setConversations([{ id: null, title: "Nova conversa", messages: [], mode: "general" }]);
+        setConversations([{ id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] }]);
         setActiveIdx(0);
+        setUploadedFiles([]);
+        setImagePreviews([]);
     }
 
-    function authHeaders(overrideToken) {
-        const t = overrideToken || (authRef.current ? authRef.current.token : "");
-        return getAuthHeaders(t);
+    function authHeaders() {
+        return getAuthHeaders();
     }
 
     // ─── Hooks that must be called before any early return ───────────────
@@ -713,25 +887,87 @@ function App() {
 
     useEffect(() => {
         if (userId && auth) loadChats(userId);
-    }, [userId]);
+    }, [userId, auth]);
+
+    useEffect(() => {
+        let cancelled = false;
+        async function bootstrapSession() {
+            try {
+                const res = await authFetch(API_URL + "/api/auth/me");
+                if (!res.ok) {
+                    if (!cancelled) setAuth(null);
+                    return;
+                }
+                const me = await res.json();
+                if (!cancelled) {
+                    setAuth({
+                        user: {
+                            username: me.username,
+                            role: me.role,
+                            display_name: me.name || me.username,
+                        },
+                    });
+                }
+            } catch (e) {
+                if (!cancelled) setAuth(null);
+            } finally {
+                if (!cancelled) setAuthInitializing(false);
+            }
+        }
+        bootstrapSession();
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        async function loadRuntimeLimits() {
+            try {
+                const res = await fetch(API_URL + "/api/info");
+                if (!res.ok) return;
+                const info = await res.json();
+                const limits = info && info.upload_limits ? info.upload_limits : {};
+                const maxImages = Number(limits.max_images_per_message);
+                const maxFiles = Number(limits.max_files_per_conversation);
+                const maxBatchBytes = Number(limits.max_batch_total_bytes);
+                const maxConcurrency = Number(limits.max_concurrent_jobs);
+                if (!cancelled && Number.isFinite(maxImages) && maxImages > 0) {
+                    setMaxImagesPerMessage(Math.floor(maxImages));
+                }
+                if (!cancelled && Number.isFinite(maxFiles) && maxFiles > 0) {
+                    setMaxFilesPerConversation(Math.floor(maxFiles));
+                }
+                if (!cancelled && Number.isFinite(maxBatchBytes) && maxBatchBytes > 0) {
+                    setMaxBatchTotalBytes(Math.floor(maxBatchBytes));
+                }
+                if (!cancelled && Number.isFinite(maxConcurrency) && maxConcurrency > 0) {
+                    setUploadWorkerConcurrency(Math.max(1, Math.min(4, Math.floor(maxConcurrency))));
+                }
+            } catch (e) {
+                // Fallback silencioso para defaults locais
+            }
+        }
+        loadRuntimeLimits();
+        return () => { cancelled = true; };
+    }, []);
 
     // ─── Auth gate ──────────────────────────────────────────────────────
+    if (authInitializing) return React.createElement("div", { style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "#777", fontSize: 14 } }, "A iniciar sessão...");
     if (!auth) return React.createElement(LoginScreen, { onLogin: handleLogin });
 
     // ─── Chat persistence ────────────────────────────────────────────────
-    async function loadChats(uid, overrideToken) {
+    async function loadChats(uid) {
         try {
-            const res = await fetch(API_URL + "/api/chats/" + uid, { headers: authHeaders(overrideToken) });
+            const res = await authFetch(API_URL + "/api/chats/" + uid, { headers: authHeaders() });
             if (res.status === 401) { handleLogout(); return; }
             if (res.ok) {
                 const data = await res.json();
                 if (data.chats && data.chats.length > 0) {
                     const loaded = data.chats.map(c => ({
                         id: c.conversation_id, title: c.title || "Conversa",
-                        messages: [], savedOnServer: true,
+                        messages: [], savedOnServer: true, uploadedFiles: [],
                         message_count: c.message_count,
                     }));
-                    setConversations([{ id: null, title: "Nova conversa", messages: [], mode: "general" }, ...loaded]);
+                    setConversations([{ id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] }, ...loaded]);
                 }
             }
         } catch (e) { console.error("Load chats error:", e); }
@@ -739,7 +975,7 @@ function App() {
 
     async function loadChatMessages(uid, convId, idx) {
         try {
-            const res = await fetch(API_URL + "/api/chats/" + uid + "/" + convId, { headers: authHeaders() });
+            const res = await authFetch(API_URL + "/api/chats/" + uid + "/" + convId, { headers: authHeaders() });
             if (res.ok) {
                 const data = await res.json();
                 setConversations(prev => {
@@ -759,7 +995,7 @@ function App() {
     async function saveChat(conv) {
         if (!conv.id || conv.messages.length === 0) return;
         try {
-            await fetch(API_URL + "/api/chats/save", {
+            await authFetch(API_URL + "/api/chats/save", {
                 method: "POST", headers: authHeaders(),
                 body: JSON.stringify({ user_id: userId, conversation_id: conv.id, title: conv.title, messages: conv.messages }),
             });
@@ -769,10 +1005,10 @@ function App() {
     function startNew() {
         setConversations(prev => {
             if (prev[0] && prev[0].messages.length === 0) return prev;
-            return [{ id: null, title: "Nova conversa", messages: [], mode: agentMode }, ...prev];
+            return [{ id: null, title: "Nova conversa", messages: [], mode: agentMode, uploadedFiles: [] }, ...prev];
         });
         setActiveIdx(0);
-        setUploadedFile(null);
+        setUploadedFiles([]);
         setImagePreviews([]);
         setTimeout(() => inputRef.current && inputRef.current.focus(), 100);
     }
@@ -781,47 +1017,402 @@ function App() {
         const conv = conversations[idx];
         setConversations(prev => {
             const u = prev.filter((_, i) => i !== idx);
-            if (u.length === 0) return [{ id: null, title: "Nova conversa", messages: [], mode: "general" }];
+            if (u.length === 0) return [{ id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] }];
             return u;
         });
         if (idx <= activeIdx) setActiveIdx(Math.max(0, activeIdx - 1));
         // Delete from server
         if (conv.id && userId) {
-            fetch(API_URL + "/api/chats/" + userId + "/" + conv.id, { method: "DELETE", headers: authHeaders() }).catch(() => {});
+            authFetch(API_URL + "/api/chats/" + userId + "/" + conv.id, { method: "DELETE", headers: authHeaders() }).catch(() => {});
         }
     }
 
     // ─── File upload ─────────────────────────────────────────────────────
-    async function handleFileUpload(e) {
-        const file = e.target.files && e.target.files[0];
-        if (!file) return;
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function uploadSingleFileSync(file, conversationId) {
         const formData = new FormData();
         formData.append("file", file);
-        if (active && active.id) formData.append("conversation_id", active.id);
+        if (conversationId) formData.append("conversation_id", conversationId);
+        const res = await authFetch(API_URL + "/upload", { method: "POST", body: formData });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Erro upload");
+        }
+        const data = await res.json();
+        if (data && data.status === "queued" && data.job_id) {
+            return await waitUploadJob(data.job_id);
+        }
+        return data;
+    }
+
+    async function queueUploadJob(file, conversationId) {
+        const formData = new FormData();
+        formData.append("file", file);
+        if (conversationId) formData.append("conversation_id", conversationId);
+        const res = await authFetch(API_URL + "/upload/async", { method: "POST", body: formData });
+        if (!res.ok) {
+            if (res.status === 404 || res.status === 405) {
+                return null;
+            }
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Erro ao criar job de upload");
+        }
+        return await res.json();
+    }
+
+    async function queueUploadJobsBatch(files, conversationId) {
+        const formData = new FormData();
+        files.forEach(f => formData.append("files", f));
+        if (conversationId) formData.append("conversation_id", conversationId);
+        const res = await authFetch(API_URL + "/upload/batch/async", { method: "POST", body: formData });
+        if (!res.ok) {
+            if (res.status === 404 || res.status === 405) {
+                return null;
+            }
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Erro ao criar jobs de upload");
+        }
+        return await res.json();
+    }
+
+    async function waitUploadJob(jobId) {
+        const deadline = Date.now() + UPLOAD_JOB_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            const res = await authFetch(API_URL + "/api/upload/status/" + encodeURIComponent(jobId), { method: "GET" });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || "Erro ao consultar estado do upload");
+            }
+            const job = await res.json();
+            if (job.status === "completed") {
+                if (!job.result) throw new Error("Upload concluído sem resultado");
+                return job.result;
+            }
+            if (job.status === "failed") {
+                throw new Error(job.error || "Falha no processamento do ficheiro");
+            }
+            await sleep(UPLOAD_POLL_INTERVAL_MS);
+        }
+        throw new Error("Timeout no processamento do ficheiro. Tenta novamente.");
+    }
+
+    async function fetchUploadStatusBatch(jobIds) {
+        const res = await authFetch(API_URL + "/api/upload/status/batch", {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({ job_ids: jobIds }),
+        });
+        if (!res.ok) {
+            if (res.status === 404 || res.status === 405) {
+                return null;
+            }
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Erro ao consultar estado batch dos uploads");
+        }
+        return await res.json();
+    }
+
+    async function resolveQueuedUploadsLegacy(queuedJobs, concurrency, onProgress) {
+        if (!Array.isArray(queuedJobs) || queuedJobs.length === 0) {
+            return { results: [], errors: [] };
+        }
+        const results = new Array(queuedJobs.length);
+        const errors = [];
+        let cursor = 0;
+        let processed = 0;
+
+        async function worker() {
+            while (true) {
+                const idx = cursor++;
+                if (idx >= queuedJobs.length) return;
+                const job = queuedJobs[idx];
+                try {
+                    const data = await waitUploadJob(job.job_id);
+                    results[idx] = { ok: true, data, filename: job.filename };
+                    processed += 1;
+                    if (onProgress) onProgress(processed, queuedJobs.length, job.filename, true);
+                } catch (err) {
+                    const message = (err && err.message) ? err.message : "Falha no processamento do ficheiro";
+                    results[idx] = { ok: false, error: message, filename: job.filename };
+                    errors.push({ filename: job.filename, error: message });
+                    processed += 1;
+                    if (onProgress) onProgress(processed, queuedJobs.length, job.filename, false);
+                }
+            }
+        }
+
+        const workerCount = Math.max(1, Math.min(concurrency, queuedJobs.length));
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        return { results, errors };
+    }
+
+    async function resolveQueuedUploads(queuedJobs, concurrency, onProgress) {
+        if (!Array.isArray(queuedJobs) || queuedJobs.length === 0) {
+            return { results: [], errors: [] };
+        }
+        const byId = new Map();
+        queuedJobs.forEach((job, idx) => {
+            byId.set(job.job_id, { idx, filename: job.filename || "ficheiro" });
+        });
+        const results = new Array(queuedJobs.length);
+        const errors = [];
+        const pending = new Set(queuedJobs.map(j => j.job_id));
+        const deadline = Date.now() + UPLOAD_JOB_TIMEOUT_MS;
+        let processed = 0;
+
+        while (pending.size > 0 && Date.now() < deadline) {
+            const ids = Array.from(pending);
+            let batch;
+            try {
+                batch = await fetchUploadStatusBatch(ids);
+            } catch (err) {
+                throw err;
+            }
+            if (!batch || !Array.isArray(batch.items)) {
+                return await resolveQueuedUploadsLegacy(queuedJobs, concurrency, onProgress);
+            }
+
+            for (const item of batch.items) {
+                const jobId = String(item.job_id || "");
+                if (!pending.has(jobId)) continue;
+                const meta = byId.get(jobId);
+                if (!meta) {
+                    pending.delete(jobId);
+                    continue;
+                }
+
+                const status = String(item.status || "").toLowerCase();
+                if (status === "completed") {
+                    if (item.result) {
+                        results[meta.idx] = { ok: true, data: item.result, filename: meta.filename };
+                        processed += 1;
+                        if (onProgress) onProgress(processed, queuedJobs.length, meta.filename, true);
+                    } else {
+                        const msg = "Upload concluído sem resultado";
+                        results[meta.idx] = { ok: false, error: msg, filename: meta.filename };
+                        errors.push({ filename: meta.filename, error: msg });
+                        processed += 1;
+                        if (onProgress) onProgress(processed, queuedJobs.length, meta.filename, false);
+                    }
+                    pending.delete(jobId);
+                } else if (status === "failed" || status === "not_found" || status === "forbidden") {
+                    const msg = item.error || "Falha no processamento do ficheiro";
+                    results[meta.idx] = { ok: false, error: msg, filename: meta.filename };
+                    errors.push({ filename: meta.filename, error: msg });
+                    processed += 1;
+                    if (onProgress) onProgress(processed, queuedJobs.length, meta.filename, false);
+                    pending.delete(jobId);
+                }
+            }
+
+            if (pending.size > 0) {
+                await sleep(UPLOAD_POLL_INTERVAL_MS);
+            }
+        }
+
+        for (const jobId of pending) {
+            const meta = byId.get(jobId);
+            if (!meta) continue;
+            const msg = "Timeout no processamento do ficheiro";
+            results[meta.idx] = { ok: false, error: msg, filename: meta.filename };
+            errors.push({ filename: meta.filename, error: msg });
+            if (onProgress) onProgress(Math.min(queuedJobs.length, ++processed), queuedJobs.length, meta.filename, false);
+        }
+
+        return { results, errors };
+    }
+
+    async function handleFileUpload(e) {
+        const selectedFiles = Array.from((e.target && e.target.files) || []);
+        if (selectedFiles.length === 0) return;
+
+        const currentCount = Array.isArray(activeUploadedFiles) ? activeUploadedFiles.length : 0;
+        const availableSlots = Math.max(0, maxFilesPerConversation - currentCount);
+        const filesWithinSlot = selectedFiles.slice(0, availableSlots);
+        const filesToUpload = [];
+        const skippedByBatchLimit = [];
+        let batchBytes = 0;
+        for (const file of filesWithinSlot) {
+            const fsize = Number(file.size || 0);
+            if (batchBytes + fsize > maxBatchTotalBytes) {
+                skippedByBatchLimit.push(file.name || "ficheiro");
+                continue;
+            }
+            filesToUpload.push(file);
+            batchBytes += fsize;
+        }
+        if (filesToUpload.length === 0) {
+            if (skippedByBatchLimit.length > 0) {
+                const mb = (maxBatchTotalBytes / (1024 * 1024)).toFixed(0);
+                alert(`Lote excede ${mb}MB. Seleciona menos ficheiros ou ficheiros mais pequenos.`);
+            } else {
+                alert(`Limite de ${maxFilesPerConversation} ficheiros por conversa atingido.`);
+            }
+            e.target.value = "";
+            return;
+        }
+        if (selectedFiles.length > filesToUpload.length || skippedByBatchLimit.length > 0) {
+            alert(`Só foram processados ${filesToUpload.length} ficheiros (máximo por conversa: ${maxFilesPerConversation}).`);
+        }
 
         try {
-            const res = await fetch(API_URL + "/upload", { method: "POST", body: formData, headers: { "Authorization": "Bearer " + authToken } });
-            if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || "Erro upload"); }
-            const data = await res.json();
-            setUploadedFile(data);
+            setUploadingFiles(true);
+            setUploadProgressText(`A preparar upload de ${filesToUpload.length} ficheiro(s)...`);
+            let convId = active && active.id ? active.id : null;
+            let lastData = null;
+            const uploadedNow = [];
+            const failedNow = [];
+            let useAsyncJobs = true;
+            const queuedJobs = [];
+            const preSkipped = [];
+
+            if (useAsyncJobs) {
+                setUploadProgressText(`A enfileirar ${filesToUpload.length} ficheiro(s)...`);
+                const batch = await queueUploadJobsBatch(filesToUpload, convId);
+                if (batch && Array.isArray(batch.queued_jobs)) {
+                    convId = batch.conversation_id || convId;
+                    batch.queued_jobs.forEach(j => {
+                        queuedJobs.push({
+                            job_id: j.job_id,
+                            filename: j.filename,
+                        });
+                    });
+                    if (Array.isArray(batch.skipped)) {
+                        batch.skipped.forEach(s => {
+                            preSkipped.push({
+                                filename: s.filename || "ficheiro",
+                                error: s.reason || "Não enfileirado",
+                            });
+                        });
+                    }
+                } else {
+                    for (const file of filesToUpload) {
+                        if (!useAsyncJobs) break;
+                        setUploadProgressText(`A enfileirar ${file.name}...`);
+                        let queued = null;
+                        try {
+                            queued = await queueUploadJob(file, convId);
+                        } catch (err) {
+                            preSkipped.push({
+                                filename: file.name || "ficheiro",
+                                error: (err && err.message) ? err.message : "Não foi possível enfileirar",
+                            });
+                            continue;
+                        }
+                        if (!queued) {
+                            useAsyncJobs = false;
+                            queuedJobs.length = 0;
+                            break;
+                        }
+                        convId = queued.conversation_id || convId;
+                        queuedJobs.push({
+                            job_id: queued.job_id,
+                            filename: file.name,
+                        });
+                    }
+                }
+            }
+
+            if (useAsyncJobs && queuedJobs.length > 0) {
+                const outcomes = await resolveQueuedUploads(
+                    queuedJobs,
+                    uploadWorkerConcurrency,
+                    (done, total, filename, ok) => {
+                        const mark = ok ? "OK" : "FALHA";
+                        setUploadProgressText(`A processar anexos: ${done}/${total} · ${mark} · ${filename || ""}`);
+                    }
+                );
+                for (const outcome of outcomes.results) {
+                    if (!outcome) continue;
+                    if (outcome.ok && outcome.data) {
+                        const data = outcome.data;
+                        convId = data.conversation_id || convId;
+                        lastData = data;
+                        uploadedNow.push(data);
+                    } else {
+                        failedNow.push({
+                            filename: outcome.filename || "ficheiro",
+                            error: outcome.error || "Falha no processamento",
+                        });
+                    }
+                }
+            } else {
+                for (const file of filesToUpload) {
+                    setUploadProgressText(`A processar ${file.name}...`);
+                    try {
+                        const data = await uploadSingleFileSync(file, convId);
+                        convId = data.conversation_id || convId;
+                        lastData = data;
+                        uploadedNow.push(data);
+                    } catch (err) {
+                        failedNow.push({
+                            filename: file.name || "ficheiro",
+                            error: (err && err.message) ? err.message : "Falha no processamento",
+                        });
+                    }
+                }
+            }
+            failedNow.push(...preSkipped);
+
+            if (uploadedNow.length === 0) {
+                const failedSummary = failedNow.slice(0, 3).map(f => `${f.filename}: ${f.error}`).join(" | ");
+                throw new Error(failedSummary ? `Nenhum ficheiro processado com sucesso. ${failedSummary}` : "Nenhum ficheiro processado com sucesso.");
+            }
+
+            const allFiles = (lastData && Array.isArray(lastData.all_files)) ? lastData.all_files : [];
+            setUploadedFiles(allFiles);
             setConversations(prev => {
                 const u = [...prev];
+                const successDetails = uploadedNow.map(d => `• ${d.filename} (${d.rows} linhas)`).join("\n");
+                const failureDetails = failedNow.length > 0
+                    ? `\n\n⚠️ ${failedNow.length} ficheiro(s) com falha:\n` + failedNow.slice(0, 5).map(f => `• ${f.filename}: ${f.error}`).join("\n")
+                    : "";
                 u[activeIdx] = {
-                    ...u[activeIdx], id: data.conversation_id, fileMode: true,
+                    ...u[activeIdx],
+                    id: (lastData && lastData.conversation_id) || u[activeIdx].id,
+                    fileMode: true,
+                    uploadedFiles: allFiles,
                     messages: [...u[activeIdx].messages, {
-                        role: "assistant", content: `📊 Ficheiro **${data.filename}** carregado com sucesso!\n\n${data.rows} linhas · ${data.columns.length} colunas: ${data.columns.join(", ")}\n\nPodes fazer perguntas sobre estes dados.`,
+                        role: "assistant",
+                        content: `📊 ${uploadedNow.length} ficheiro(s) carregado(s) com sucesso.\n\n${successDetails}${failureDetails}\n\nTotal anexado nesta conversa: ${allFiles.length}/${maxFilesPerConversation}.`,
                         tools_used: ["upload_file"],
                     }],
                 };
                 return u;
             });
-        } catch (e) { alert("Erro: " + e.message); }
-        e.target.value = "";
+        } catch (e) {
+            alert("Erro: " + e.message);
+        } finally {
+            setUploadingFiles(false);
+            setUploadProgressText("");
+            e.target.value = "";
+        }
+    }
+
+    async function getPendingUploads(conversationId) {
+        if (!conversationId) return 0;
+        try {
+            const res = await authFetch(API_URL + "/api/upload/pending/" + encodeURIComponent(conversationId), { method: "GET" });
+            if (!res.ok) return 0;
+            const data = await res.json();
+            return Number(data.pending_jobs || 0);
+        } catch (e) {
+            return 0;
+        }
     }
 
     // ─── Image upload ────────────────────────────────────────────────────
     function addImageFiles(files) {
-        Array.from(files).filter(f => f.type.startsWith("image/")).forEach(f => {
+        const candidates = Array.from(files).filter(f => f.type.startsWith("image/"));
+        const allowedSlots = Math.max(0, maxImagesPerMessage - imagePreviews.length);
+        const accepted = candidates.slice(0, allowedSlots);
+        if (candidates.length > accepted.length) {
+            alert(`Máximo de ${maxImagesPerMessage} imagens por pedido.`);
+        }
+        accepted.forEach(f => {
             const reader = new FileReader();
             reader.onload = (ev) => {
                 const dataUrl = ev.target.result;
@@ -855,7 +1446,8 @@ function App() {
         const dataFiles = Array.from(files).filter(f => !f.type.startsWith("image/"));
         if (imageFiles.length > 0) addImageFiles(imageFiles);
         if (dataFiles.length > 0) {
-            const dt = new DataTransfer(); dt.items.add(dataFiles[0]);
+            const dt = new DataTransfer();
+            dataFiles.forEach(f => dt.items.add(f));
             if (fileInputRef.current) { fileInputRef.current.files = dt.files; handleFileUpload({ target: fileInputRef.current }); }
         }
     }
@@ -864,7 +1456,7 @@ function App() {
     async function switchMode(newMode) {
         setAgentMode(newMode);
         if (active && active.id) {
-            try { await fetch(API_URL + "/api/mode/switch", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: active.id, mode: newMode }) }); } catch (e) { console.warn("Mode switch sync failed:", e); }
+            try { await authFetch(API_URL + "/api/mode/switch", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: active.id, mode: newMode }) }); } catch (e) { console.warn("Mode switch sync failed:", e); }
         }
         if (active) {
             const label = newMode === "userstory" ? "User Story Writer" : "Assistente Geral";
@@ -878,7 +1470,14 @@ function App() {
 
     // ─── SEND MESSAGE (SSE Streaming) ────────────────────────────────────
     async function send() {
-        if (!input.trim() || loading || !active) return;
+        if (!input.trim() || loading || uploadingFiles || !active) return;
+        if (active.id) {
+            const pendingUploads = await getPendingUploads(active.id);
+            if (pendingUploads > 0) {
+                alert(`Ainda existem ${pendingUploads} upload(s) a processar. Aguarda conclusão antes de enviar a pergunta.`);
+                return;
+            }
+        }
         const q = input.trim();
         const currentImages = [...imagePreviews];
         setInput(""); setImagePreviews([]);
@@ -900,15 +1499,23 @@ function App() {
 
         setLoading(true);
         setStreamingText("");
+        setStreamingRenderedBlocks([]);
+        setStreamingActiveBlock("");
         setStreamingStatus("");
 
         try {
-            const firstImage = currentImages.length > 0 ? currentImages[0] : null;
+            const imagesPayload = currentImages.slice(0, maxImagesPerMessage).map(img => ({
+                base64: img.base64,
+                content_type: img.contentType,
+                filename: img.filename,
+            }));
+            const firstImage = imagesPayload.length > 0 ? imagesPayload[0] : null;
             const reqBody = {
                 question: q,
                 conversation_id: active.id || null,
                 image_base64: firstImage ? firstImage.base64 : null,
-                image_content_type: firstImage ? firstImage.contentType : null,
+                image_content_type: firstImage ? firstImage.content_type : null,
+                images: imagesPayload.length > 0 ? imagesPayload : null,
                 mode: agentMode,
                 model_tier: modelTier,
             };
@@ -919,7 +1526,7 @@ function App() {
 
             if (useStreaming) {
                 try {
-                    const res = await fetch(API_URL + "/chat/agent/stream", {
+                    const res = await authFetch(API_URL + "/chat/agent/stream", {
                         method: "POST", headers: authHeaders(), body: JSON.stringify(reqBody),
                     });
 
@@ -937,6 +1544,9 @@ function App() {
                         let modelUsed = "";
                         let totalTime = 0;
                         let tokensUsed = null;
+                        let streamHasExportable = false;
+                        let streamExportIndex = null;
+                        let committedUntil = 0;
 
                         while (true) {
                             const { done, value } = await reader.read();
@@ -967,12 +1577,28 @@ function App() {
                                         case "token":
                                             fullText += (evt.text || "");
                                             setStreamingText(fullText);
+                                            const lastBlockBoundary = fullText.lastIndexOf("\n\n");
+                                            if (lastBlockBoundary >= committedUntil) {
+                                                const nextCommittedUntil = lastBlockBoundary + 2;
+                                                const newlyCommitted = fullText.slice(committedUntil, nextCommittedUntil);
+                                                const newBlocks = newlyCommitted
+                                                    .split(/\n\n+/)
+                                                    .filter(s => s && s.replace(/\s/g, "").length > 0);
+                                                if (newBlocks.length > 0) {
+                                                    const renderedNewBlocks = newBlocks.map(block => renderMarkdown(block));
+                                                    setStreamingRenderedBlocks(prev => prev.concat(renderedNewBlocks));
+                                                }
+                                                committedUntil = nextCommittedUntil;
+                                            }
+                                            setStreamingActiveBlock(fullText.slice(committedUntil));
                                             setStreamingStatus("");
                                             break;
                                         case "done":
                                             modelUsed = evt.model_used || "";
                                             totalTime = evt.total_time_ms || 0;
                                             tokensUsed = evt.tokens_used || null;
+                                            streamHasExportable = !!evt.has_exportable_data;
+                                            streamExportIndex = (evt.export_index !== undefined) ? evt.export_index : null;
                                             if (Array.isArray(evt.tools_used) && evt.tools_used.length > 0) toolsUsed = evt.tools_used;
                                             if (Array.isArray(evt.tool_details) && evt.tool_details.length > 0) toolDetails = evt.tool_details;
                                             streamCompleted = true;
@@ -992,7 +1618,13 @@ function App() {
                             if (toolDetails && toolDetails.length > 0) {
                                 for (const td of toolDetails) {
                                     if (td.result_json) {
-                                        try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch (e) { console.warn("Tool result parse failed (stream):", e); }
+                                        try {
+                                            toolResults.push({
+                                                tool: td.tool,
+                                                result: td.result_json,
+                                                result_blob_ref: td.result_blob_ref || "",
+                                            });
+                                        } catch (e) { console.warn("Tool result parse failed (stream):", e); }
                                     }
                                 }
                             }
@@ -1006,6 +1638,8 @@ function App() {
                                         tools_used: toolsUsed.length > 0 ? [...new Set(toolsUsed)] : undefined,
                                         tool_details: toolDetails.length > 0 ? toolDetails : undefined,
                                         tool_results: toolResults.length > 0 ? toolResults : undefined,
+                                        has_exportable: streamHasExportable,
+                                        export_index: streamExportIndex,
                                         model_used: modelUsed, total_time_ms: totalTime, tokens_used: tokensUsed,
                                     }],
                                 };
@@ -1027,7 +1661,7 @@ function App() {
                 let res, lastErr;
                 for (let attempt = 0; attempt < 3; attempt++) {
                     try {
-                        res = await fetch(API_URL + "/chat/agent", { method: "POST", headers: authHeaders(), body: JSON.stringify(reqBody) });
+                        res = await authFetch(API_URL + "/chat/agent", { method: "POST", headers: authHeaders(), body: JSON.stringify(reqBody) });
                         if (res.status === 429 || res.status === 502) {
                             setStreamingStatus(`⏳ Serviço ocupado, tentativa ${attempt + 2}/3...`);
                             await new Promise(r => setTimeout(r, 5000 * (attempt + 1)));
@@ -1046,7 +1680,13 @@ function App() {
                     if (data.tool_details) {
                         for (const td of data.tool_details) {
                             if (td.result_json) {
-                                try { toolResults.push({ tool: td.tool, result: td.result_json }); } catch (e) { console.warn("Tool result parse failed (sync):", e); }
+                                try {
+                                    toolResults.push({
+                                        tool: td.tool,
+                                        result: td.result_json,
+                                        result_blob_ref: td.result_blob_ref || "",
+                                    });
+                                } catch (e) { console.warn("Tool result parse failed (sync):", e); }
                             }
                         }
                     }
@@ -1059,6 +1699,7 @@ function App() {
                             tool_results: toolResults.length > 0 ? toolResults : undefined,
                             model_used: data.model_used, tokens_used: data.tokens_used, total_time_ms: data.total_time_ms,
                             has_exportable: data.has_exportable_data || false,
+                            export_index: data.export_index,
                         }],
                     };
                     scheduleSave(u[activeIdx]);
@@ -1077,31 +1718,76 @@ function App() {
         } finally {
             setLoading(false);
             setStreamingText("");
+            setStreamingRenderedBlocks([]);
+            setStreamingActiveBlock("");
             setStreamingStatus("");
             setTimeout(() => inputRef.current && inputRef.current.focus(), 100);
         }
     }
 
     // ─── Data export ─────────────────────────────────────────────────────
+    function _messageTextContent(msg) {
+        if (!msg) return "";
+        if (typeof msg.content === "string") return msg.content;
+        if (Array.isArray(msg.content)) {
+            return msg.content
+                .filter(p => p && typeof p === "object" && p.type === "text")
+                .map(p => String(p.text || ""))
+                .join("\n")
+                .trim();
+        }
+        return "";
+    }
+
+    function _promptForAssistantMessage(messages, assistantIndex) {
+        if (!Array.isArray(messages) || assistantIndex < 0) return "";
+        for (let i = assistantIndex - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg && msg.role === "user") return _messageTextContent(msg);
+        }
+        return "";
+    }
+
     async function exportData(format) {
         if (!active) return;
         try {
             // Find the last tool result data in the conversation messages
+            let selectedToolResult = null;
             let toolData = null;
+            let promptSummary = "";
             for (let i = active.messages.length - 1; i >= 0; i--) {
                 const msg = active.messages[i];
-                toolData = getFirstExportableData(msg.tool_results);
-                if (toolData) break;
+                selectedToolResult = getPreferredToolResult(msg.tool_results, msg.export_index);
+                toolData = getPreferredExportableData(msg.tool_results, msg.export_index);
+                if (selectedToolResult || toolData) {
+                    promptSummary = _promptForAssistantMessage(active.messages, i);
+                    break;
+                }
             }
-            if (!toolData) { alert("Sem dados exportáveis nesta conversa. Executa uma query primeiro."); return; }
+            if (!selectedToolResult && !toolData) { alert("Sem dados exportáveis nesta conversa. Executa uma query primeiro."); return; }
 
-            const res = await fetch(API_URL + "/api/export", {
+            const res = await authFetch(API_URL + "/api/export", {
                 method: "POST", headers: authHeaders(),
-                body: JSON.stringify({ conversation_id: active.id || "", format, title: active.title || "Export DBDE", data: toolData }),
+                body: JSON.stringify({
+                    conversation_id: active.id || "",
+                    format,
+                    title: active.title || "Export DBDE",
+                    data: toolData || undefined,
+                    result_blob_ref: selectedToolResult?.result_blob_ref || undefined,
+                    summary: promptSummary || undefined,
+                }),
             });
+            if (res.status === 202) {
+                const queued = await res.json();
+                const statusEndpoint = queued.status_endpoint || (`/api/export/status/${queued.job_id}`);
+                const result = await waitForExportJob(statusEndpoint);
+                if (!result || !result.endpoint) throw new Error("Export concluído sem ficheiro disponível");
+                await downloadGeneratedFile(result);
+                return;
+            }
             if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || "Erro export"); }
             const blob = await res.blob();
-            const ext = format === "xlsx" ? "xlsx" : format === "pdf" ? "pdf" : format === "svg" ? "svg" : format === "html" ? "html" : "csv";
+            const ext = format === "xlsx" ? "xlsx" : format === "pdf" ? "pdf" : format === "svg" ? "svg" : format === "html" ? "html" : format === "zip" ? "zip" : "csv";
             const a = document.createElement("a");
             a.href = URL.createObjectURL(blob);
             a.download = `${(active.title || "export").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30)}.${ext}`;
@@ -1110,31 +1796,97 @@ function App() {
         } catch (e) { alert("Erro ao exportar: " + e.message); }
     }
 
-    async function exportMessageData(format, toolResults) {
+    async function exportMessageData(format, toolResults, exportIndex = null, messageIndex = null, withCompanion = true) {
         if (!active || !toolResults || toolResults.length === 0) return;
         try {
-            const toolData = getFirstExportableData(toolResults);
+            const selectedToolResult = getPreferredToolResult(toolResults, exportIndex);
+            const toolData = getPreferredExportableData(toolResults, exportIndex);
+            if (!selectedToolResult && !toolData) { alert("Sem dados exportáveis nesta mensagem."); return; }
+            const promptSummary = Number.isInteger(messageIndex) ? _promptForAssistantMessage(active.messages, messageIndex) : "";
 
-            if (!toolData) { alert("Sem dados exportáveis nesta mensagem."); return; }
-
-            const res = await fetch(API_URL + "/api/export", {
+            const res = await authFetch(API_URL + "/api/export", {
                 method: "POST", headers: authHeaders(),
-                body: JSON.stringify({ conversation_id: active.id || "", format, title: active.title || "Export DBDE", data: toolData }),
+                body: JSON.stringify({
+                    conversation_id: active.id || "",
+                    format,
+                    title: active.title || "Export DBDE",
+                    data: toolData || undefined,
+                    result_blob_ref: selectedToolResult?.result_blob_ref || undefined,
+                    summary: promptSummary || undefined,
+                }),
             });
-            if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || "Erro export"); }
+            if (res.status === 202) {
+                const queued = await res.json();
+                const statusEndpoint = queued.status_endpoint || (`/api/export/status/${queued.job_id}`);
+                const result = await waitForExportJob(statusEndpoint);
+                if (!result || !result.endpoint) throw new Error("Export concluído sem ficheiro disponível");
+                await downloadGeneratedFile(result);
+            } else {
+                if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || "Erro export"); }
+                const blob = await res.blob();
+                const ext = format === "xlsx" ? "xlsx" : format === "pdf" ? "pdf" : format === "svg" ? "svg" : format === "html" ? "html" : format === "zip" ? "zip" : "csv";
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = `${(active.title || "export").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30)}.${ext}`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            }
+            const fullCsv = getPreferredAutoCsvDownload(toolResults, exportIndex);
+            if (withCompanion && fullCsv && format !== "csv") {
+                await downloadGeneratedFile(fullCsv);
+            }
+        } catch (e) { alert("Erro ao exportar: " + e.message); }
+    }
+
+    async function exportMessageBundle(toolResults, exportIndex = null, messageIndex = null) {
+        await exportMessageData("zip", toolResults, exportIndex, messageIndex, false);
+    }
+
+    async function waitForExportJob(statusEndpoint, timeoutMs = 180000) {
+        const started = Date.now();
+        const endpoint = String(statusEndpoint || "").startsWith("http")
+            ? String(statusEndpoint)
+            : (API_URL + String(statusEndpoint || ""));
+        while (Date.now() - started < timeoutMs) {
+            const res = await authFetch(endpoint, { method: "GET", headers: authHeaders() });
+            if (!res.ok) {
+                const e = await res.json().catch(() => ({}));
+                throw new Error(e.detail || "Falha ao obter estado do export");
+            }
+            const job = await res.json();
+            const status = String(job.status || "").toLowerCase();
+            if (status === "completed") return job.result || {};
+            if (status === "failed") throw new Error(job.error || "Export falhou");
+            await new Promise(resolve => setTimeout(resolve, 1800));
+        }
+        throw new Error("Timeout no processamento do export");
+    }
+
+    async function downloadGeneratedFile(fileMeta) {
+        if (!fileMeta) return;
+        try {
+            if (!fileMeta.endpoint) throw new Error("Endpoint de download em falta");
+            const url = String(fileMeta.endpoint).startsWith("http") ? fileMeta.endpoint : (API_URL + fileMeta.endpoint);
+            const res = await authFetch(url, { method: "GET", headers: authHeaders() });
+            if (!res.ok) {
+                const e = await res.json().catch(() => ({}));
+                throw new Error(e.detail || "Erro download");
+            }
             const blob = await res.blob();
-            const ext = format === "xlsx" ? "xlsx" : format === "pdf" ? "pdf" : format === "svg" ? "svg" : format === "html" ? "html" : "csv";
+            const fallbackName = `download_${Date.now()}.${String(fileMeta.format || "bin").toLowerCase()}`;
             const a = document.createElement("a");
             a.href = URL.createObjectURL(blob);
-            a.download = `${(active.title || "export").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30)}.${ext}`;
+            a.download = fileMeta.filename || fallbackName;
             a.click();
             URL.revokeObjectURL(a.href);
-        } catch (e) { alert("Erro ao exportar: " + e.message); }
+        } catch (e) {
+            alert("Erro ao descarregar: " + e.message);
+        }
     }
 
     async function submitFeedback(convId, msgIdx, rating, note) {
         try {
-            await fetch(API_URL + "/feedback", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: convId, message_index: msgIdx, rating, note: note || "" }) });
+            await authFetch(API_URL + "/feedback", { method: "POST", headers: authHeaders(), body: JSON.stringify({ conversation_id: convId, message_index: msgIdx, rating, note: note || "" }) });
         } catch (e) { console.warn("Submit feedback failed:", e); }
     }
 
@@ -1179,7 +1931,7 @@ function App() {
                     }, "M"),
                     React.createElement("div", null,
                         React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: "#1a1a1a", lineHeight: 1.2 } }, "Assistente AI"),
-                        React.createElement("div", { style: { fontSize: 11, color: "#999", fontWeight: 500 } }, "DBDE v7.0")
+                        React.createElement("div", { style: { fontSize: 11, color: "#999", fontWeight: 500 } }, "DBDE v7.2.0")
                     )
                 ),
                 React.createElement("button", {
@@ -1197,6 +1949,7 @@ function App() {
                         className: "sidebar-item" + (i === activeIdx ? " active" : ""),
                         onClick: () => {
                             setActiveIdx(i);
+                            setUploadedFiles(Array.isArray(conv.uploadedFiles) ? conv.uploadedFiles : []);
                             if (conv.savedOnServer && conv.messages.length === 0 && conv.id && userId) loadChatMessages(userId, conv.id, i);
                             inputRef.current && inputRef.current.focus();
                         },
@@ -1263,9 +2016,9 @@ function App() {
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
                     // Model tier selector
                     React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "fast" ? " active" : ""), onClick: () => setModelTier("fast"), title: "GPT-4.1 mini — mais rápido" }, "⚡ Fast"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "standard" ? " active" : ""), onClick: () => setModelTier("standard"), title: "Claude Sonnet — equilibrado" }, "🧠 Standard"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "pro" ? " active" : ""), onClick: () => setModelTier("pro"), title: "Claude Opus — máxima qualidade" }, "🔬 Pro")
+                        React.createElement("button", { className: "tier-btn" + (modelTier === "fast" ? " active" : ""), onClick: () => setModelTier("fast"), title: "GPT-5 mini — rápido e económico" }, "⚡ Fast"),
+                        React.createElement("button", { className: "tier-btn" + (modelTier === "standard" ? " active" : ""), onClick: () => setModelTier("standard"), title: "GPT-5 chat — thinking (equilibrado)" }, "🧠 Thinking"),
+                        React.createElement("button", { className: "tier-btn" + (modelTier === "pro" ? " active" : ""), onClick: () => setModelTier("pro"), title: "GPT-5.2 chat — máxima qualidade" }, "🔬 Pro")
                     ),
                     // Mode toggle
                     React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
@@ -1273,7 +2026,7 @@ function App() {
                         React.createElement("button", { className: "tier-btn" + (agentMode === "userstory" ? " active" : ""), onClick: () => switchMode("userstory") }, "User Stories")
                     ),
                     // User menu
-                    React.createElement(UserMenu, { user: authUser, onLogout: handleLogout, token: authToken })
+                    React.createElement(UserMenu, { user: authUser, onLogout: handleLogout })
                 )
             ),
 
@@ -1314,11 +2067,13 @@ function App() {
                             conversationId: active.id, messageIndex: i,
                             onFeedback: submitFeedback,
                             onExport: exportMessageData,
+                            onExportBundle: exportMessageBundle,
+                            onFileDownload: downloadGeneratedFile,
                         })
                     ),
 
                     // Streaming in progress
-                    loading && streamingText && React.createElement("div", {
+                    loading && (streamingText || streamingRenderedBlocks.length > 0 || streamingActiveBlock) && React.createElement("div", {
                         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
                     },
                         React.createElement("div", {
@@ -1326,9 +2081,18 @@ function App() {
                         }, "M"),
                         React.createElement("div", {
                             className: "msg-content",
-                            style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", maxWidth: "min(900px, 100%)" },
-                            dangerouslySetInnerHTML: { __html: renderMarkdown(streamingText) },
-                        })
+                            style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", maxWidth: "min(900px, 100%)" }
+                        },
+                            streamingRenderedBlocks.map((blockHtml, bi) =>
+                                React.createElement("div", {
+                                    key: "stream-block-" + bi,
+                                    dangerouslySetInnerHTML: { __html: blockHtml },
+                                })
+                            ),
+                            streamingActiveBlock && React.createElement("div", {
+                                dangerouslySetInnerHTML: { __html: renderMarkdown(streamingActiveBlock) },
+                            })
+                        )
                     ),
 
                     // Loading indicator (before tokens arrive)
@@ -1341,18 +2105,28 @@ function App() {
             // ─── Input area ───────────────────────────────────────────────
             React.createElement("div", { style: { background: "white", borderTop: "1px solid #EBEBEB", padding: "16px 24px 20px" } },
                 // File indicator
-                uploadedFile && active && active.fileMode && React.createElement("div", {
-                    style: { maxWidth: 900, margin: "0 auto 8px", display: "flex", alignItems: "center", gap: 8, background: "#FFF5F5", border: "1px solid #FFE0E0", borderRadius: 10, padding: "8px 14px" }
+                uploadingFiles && React.createElement("div", {
+                    style: { maxWidth: 900, margin: "0 auto 8px", display: "flex", alignItems: "center", gap: 8, background: "#FFF7ED", border: "1px solid #FDD8A5", borderRadius: 10, padding: "8px 14px" }
                 },
-                    React.createElement("span", { style: { fontSize: 16 } }, "📊"),
+                    React.createElement("span", { style: { fontSize: 16 } }, "⏳"),
+                    React.createElement("div", { style: { fontSize: 12, color: "#9A5A00", fontWeight: 600 } }, uploadProgressText || "A processar anexos...")
+                ),
+                // File indicator
+                activeUploadedFiles.length > 0 && active && active.fileMode && React.createElement("div", {
+                    style: { maxWidth: 900, margin: "0 auto 8px", display: "flex", alignItems: "flex-start", gap: 8, background: "#FFF5F5", border: "1px solid #FFE0E0", borderRadius: 10, padding: "8px 14px" }
+                },
+                    React.createElement("span", { style: { fontSize: 16, marginTop: 2 } }, "📊"),
                     React.createElement("div", { style: { flex: 1 } },
-                        React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "#DE3163" } }, uploadedFile.filename),
-                        React.createElement("div", { style: { fontSize: 11, color: "#888" } }, uploadedFile.rows + " linhas · " + uploadedFile.columns.length + " colunas")
-                    ),
-                    React.createElement("button", {
-                        onClick: () => { setUploadedFile(null); setConversations(prev => { const u = [...prev]; u[activeIdx] = {...u[activeIdx], fileMode: false}; return u; }); },
-                        style: { background: "none", border: "none", color: "#999", cursor: "pointer", fontSize: 16 }
-                    }, "✕")
+                        React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "#DE3163", marginBottom: 4 } }, `${activeUploadedFiles.length}/${maxFilesPerConversation} ficheiro(s) anexado(s)`),
+                        React.createElement("div", { style: { fontSize: 11, color: "#888", display: "flex", flexDirection: "column", gap: 2 } },
+                            activeUploadedFiles.slice(-5).map((f, idx) =>
+                                React.createElement("div", { key: `uf-${idx}` },
+                                    `• ${f.filename} (${f.rows || 0} linhas${Array.isArray(f.columns) ? ` · ${f.columns.length} colunas` : ""})`
+                                )
+                            ),
+                            activeUploadedFiles.length > 5 && React.createElement("div", null, `... +${activeUploadedFiles.length - 5} ficheiro(s)`)
+                        )
+                    )
                 ),
                 // Image previews
                 imagePreviews.length > 0 && React.createElement("div", {
@@ -1371,14 +2145,15 @@ function App() {
                             }, "✕")
                         )
                     ),
-                    React.createElement("button", { onClick: () => setImagePreviews([]), style: { marginLeft: "auto", background: "none", border: "none", color: "#999", cursor: "pointer", fontSize: 12, alignSelf: "center" } }, "Limpar")
+                    React.createElement("button", { onClick: () => setImagePreviews([]), style: { marginLeft: "auto", background: "none", border: "none", color: "#999", cursor: "pointer", fontSize: 12, alignSelf: "center" } }, "Limpar"),
+                    React.createElement("div", { style: { alignSelf: "center", fontSize: 11, color: "#888" } }, `${imagePreviews.length}/${maxImagesPerMessage}`)
                 ),
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto", display: "flex", gap: 8, alignItems: "flex-end" } },
-                    React.createElement("input", { ref: fileInputRef, type: "file", accept: ".xlsx,.xls,.csv,.txt,.pdf,.svg", style: { display: "none" }, onChange: handleFileUpload }),
+                    React.createElement("input", { ref: fileInputRef, type: "file", accept: ".xlsx,.xls,.csv,.txt,.pdf,.svg,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pptx", multiple: true, style: { display: "none" }, onChange: handleFileUpload }),
                     React.createElement("input", { ref: imageInputRef, type: "file", accept: "image/jpeg,image/png,image/gif,image/webp", multiple: true, style: { display: "none" }, onChange: handleImageUpload }),
                     // File button
                     React.createElement("button", {
-                        onClick: () => fileInputRef.current && fileInputRef.current.click(), disabled: loading, title: "Carregar ficheiro",
+                        onClick: () => fileInputRef.current && fileInputRef.current.click(), disabled: loading || uploadingFiles, title: "Carregar ficheiro",
                         style: { width: 46, height: 46, borderRadius: 14, background: "white", color: "#888", border: "1.5px solid #E0E0E0", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.15s ease", fontSize: 18 },
                         onMouseEnter: e => { e.currentTarget.style.borderColor = "#DE3163"; e.currentTarget.style.color = "#DE3163"; },
                         onMouseLeave: e => { e.currentTarget.style.borderColor = "#E0E0E0"; e.currentTarget.style.color = "#888"; },
@@ -1394,8 +2169,8 @@ function App() {
                     React.createElement("textarea", {
                         ref: inputRef, value: input, onChange: e => setInput(e.target.value),
                         onKeyDown: handleKeyDown, onPaste: handlePaste,
-                        placeholder: uploadedFile && active && active.fileMode
-                            ? "Pergunta sobre " + uploadedFile.filename + "..."
+                        placeholder: activeUploadedFiles.length > 0 && active && active.fileMode
+                            ? `Pergunta sobre os ${activeUploadedFiles.length} ficheiros anexados...`
                             : agentMode === "userstory" ? "Descreve a funcionalidade para gerar User Stories..." : "Faz uma pergunta sobre DevOps, KPIs, User Stories...",
                         rows: 1,
                         style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#FAFAFA", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
@@ -1405,13 +2180,15 @@ function App() {
                     }),
                     // Send button
                     React.createElement("button", {
-                        className: "send-btn", onClick: send, disabled: !input.trim() || loading,
+                        className: "send-btn", onClick: send, disabled: !input.trim() || loading || uploadingFiles,
                         style: { width: 46, height: 46, borderRadius: 14, background: "#DE3163", color: "white", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.15s ease", fontSize: 18 }
                     }, "➤")
                 ),
                 React.createElement("div", {
                     style: { maxWidth: 900, margin: "6px auto 0", textAlign: "center", fontSize: 11, color: "#ccc" }
-                }, "Enter para enviar · Shift+Enter nova linha · 📎 ficheiros · Ctrl+V colar imagens")
+                }, uploadingFiles
+                    ? "A processar anexos. O envio da mensagem fica disponível no fim."
+                    : `Enter para enviar · Shift+Enter nova linha · 📎 ficheiros · Ctrl+V colar imagens · lote até ${Math.max(1, Math.round(maxBatchTotalBytes / (1024 * 1024)))}MB`)
             )
         )
     );

@@ -21,6 +21,7 @@ _prompt_rules_cache: Dict = {"rules": [], "last_refresh": None}
 _few_shot_cache: Dict = {}  # key: question_hash -> {"result": str, "ts": datetime}
 _FEW_SHOT_CACHE_TTL = 1800  # 30 minutos
 _FEW_SHOT_CACHE_MAX = 50    # máximo 50 entradas
+_prompt_rules_lock = asyncio.Lock()
 
 
 def invalidate_prompt_rules_cache():
@@ -70,19 +71,27 @@ async def _search_examples_semantic(embedding, filter_expr="", top=3):
 
 async def get_learned_rules():
     now = datetime.utcnow()
-    if (
+    needs_refresh = (
         _prompt_rules_cache["last_refresh"] is None
         or (now - _prompt_rules_cache["last_refresh"]).total_seconds() > 3600
-    ):
-        try:
-            _prompt_rules_cache["rules"] = await table_query(
-                "PromptRules",
-                "PartitionKey eq 'active'",
-                top=30,
+    )
+    if needs_refresh:
+        async with _prompt_rules_lock:
+            now = datetime.utcnow()
+            needs_refresh = (
+                _prompt_rules_cache["last_refresh"] is None
+                or (now - _prompt_rules_cache["last_refresh"]).total_seconds() > 3600
             )
-            _prompt_rules_cache["last_refresh"] = now
-        except Exception as e:
-            logging.warning("[Learning] get_learned_rules refresh failed: %s", e)
+            if needs_refresh:
+                try:
+                    _prompt_rules_cache["rules"] = await table_query(
+                        "PromptRules",
+                        "PartitionKey eq 'active'",
+                        top=30,
+                    )
+                    _prompt_rules_cache["last_refresh"] = now
+                except Exception as e:
+                    logging.warning("[Learning] get_learned_rules refresh failed: %s", e)
 
     if not _prompt_rules_cache["rules"]:
         return ""

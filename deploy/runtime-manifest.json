@@ -1,0 +1,11 @@
+{
+  "generated_at_utc": "2026-02-24T18:27:04Z",
+  "app_version": "7.2.2",
+  "files": {
+    "app.py": "6ab2ff7315c245b3627a0f9e9d61a2a3654585843c2ef42e2366c687e8896214",
+    "agent.py": "8aa5d0610087f44df6aac3fa063ce63caf2caaa293a92c4cb39d326d9455b51d",
+    "tools.py": "30c99e71ac507f12bcd78ab6590654d7ce2146ecfc0826b675ef4884371aa477",
+    "config.py": "e937406f17b243baa715acfe581c15159e6388af05065b4018a428ceacd5f999",
+    "static/index.html": "d8fe42ffb83c208c9231cb9f79dd74c9f31365f1f4fd83cd2b6cf67d004d2ef1"
+  }
+}

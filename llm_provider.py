@@ -1,5 +1,5 @@
 # =============================================================================
-# llm_provider.py — Abstração Multi-Modelo do Assistente AI DBDE v7.0
+# llm_provider.py — Abstração Multi-Modelo do Assistente AI DBDE v7.2
 # =============================================================================
 # Suporta Azure OpenAI (GPT-4.1, GPT-4.1-mini) e Anthropic (Claude Opus,
 # Sonnet, Haiku). Normaliza tool calling, streaming e respostas.
@@ -8,6 +8,7 @@
 import json
 import asyncio
 import uuid
+import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
 from collections import deque
 from datetime import datetime
@@ -22,12 +23,15 @@ from config import (
     ANTHROPIC_MODEL_HAIKU,
     LLM_DEFAULT_TIER, LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO,
     LLM_FALLBACK, AGENT_MAX_TOKENS, AGENT_TEMPERATURE,
+    MODEL_ROUTER_ENABLED, MODEL_ROUTER_SPEC, MODEL_ROUTER_TARGET_TIERS,
+    MODEL_ROUTER_NON_PROD_ONLY, IS_PRODUCTION,
     DEBUG_LOG_SIZE,
 )
 from models import LLMResponse, LLMToolCall, StreamEvent
 
 # Debug log ring buffer (shared across providers)
 _llm_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
+logger = logging.getLogger(__name__)
 
 def get_debug_log() -> list:
     return list(_llm_debug_log)
@@ -35,7 +39,7 @@ def get_debug_log() -> list:
 def _log(msg: str):
     entry = {"ts": datetime.now().isoformat(), "msg": msg}
     _llm_debug_log.append(entry)
-    print(f"[LLM] {msg}")
+    logger.info("[LLM] %s", msg)
 
 
 # =============================================================================
@@ -610,13 +614,22 @@ def _parse_provider_spec(spec: str) -> tuple[str, str]:
     return spec, ""
 
 
+def _should_route_tier_with_model_router(tier: str) -> bool:
+    if not MODEL_ROUTER_ENABLED:
+        return False
+    if MODEL_ROUTER_NON_PROD_ONLY and IS_PRODUCTION:
+        return False
+    wanted = str(tier or "").strip().lower()
+    return wanted in MODEL_ROUTER_TARGET_TIERS
+
+
 def get_provider(tier: str = None) -> LLMProvider:
     """Retorna o provider para o tier pedido.
     
     Tiers: "fast", "standard", "pro"
     Se tier=None, usa LLM_DEFAULT_TIER.
     """
-    tier = tier or LLM_DEFAULT_TIER
+    tier = (tier or LLM_DEFAULT_TIER or "standard").strip().lower()
     
     tier_map = {
         "fast": LLM_TIER_FAST,
@@ -625,6 +638,8 @@ def get_provider(tier: str = None) -> LLMProvider:
     }
     
     spec = tier_map.get(tier, LLM_TIER_STANDARD)
+    if _should_route_tier_with_model_router(tier):
+        spec = MODEL_ROUTER_SPEC
     provider_name, model = _parse_provider_spec(spec)
     
     return _create_provider(provider_name, model)
