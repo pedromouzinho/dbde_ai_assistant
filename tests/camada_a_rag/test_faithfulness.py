@@ -39,12 +39,8 @@ Responde APENAS com: "supported" ou "unsupported"."""
         from llm_provider import llm_simple
 
         response = await llm_simple(
-            [
-                {"role": "system", "content": "Responde estritamente ao pedido."},
-                {"role": "user", "content": prompt},
-            ],
+            prompt,
             tier=eval_config.JUDGE_MODEL_TIER,
-            temperature=eval_config.JUDGE_TEMPERATURE,
             max_tokens=eval_config.JUDGE_MAX_TOKENS,
         )
         return str(response or "")
