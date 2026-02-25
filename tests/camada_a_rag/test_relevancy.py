@@ -22,9 +22,8 @@ class RelevancyJudge:
         )
         raw = str(
             await llm_simple(
-                [{"role": "user", "content": prompt}],
+                prompt,
                 tier=eval_config.JUDGE_MODEL_TIER,
-                temperature=eval_config.JUDGE_TEMPERATURE,
                 max_tokens=eval_config.JUDGE_MAX_TOKENS,
             )
         )
