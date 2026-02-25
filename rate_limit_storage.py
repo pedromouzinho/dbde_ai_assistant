@@ -15,6 +15,21 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_TABLE = "RateLimits"
 
 
+def _create_logged_task(coro, name: str = "") -> asyncio.Task:
+    """Create fire-and-forget task with explicit exception retrieval."""
+    task = asyncio.create_task(coro)
+
+    def _done(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            return
+        exc = done_task.exception()
+        if exc:
+            logger.error("[RateLimit] Background task %s failed: %s", name or "unnamed", exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
 class TableStorageRateLimit:
     """
     Sliding-window rate limiter backed by Azure Table Storage.
@@ -43,7 +58,10 @@ class TableStorageRateLimit:
                 next_count = cached_count + 1
                 self._local_cache[cache_key] = next_count
                 limited = next_count > limit
-                asyncio.create_task(self._persist_count(key, int(window_start), next_count))
+                _create_logged_task(
+                    self._persist_count(key, int(window_start), next_count),
+                    name="rate_limit_persist_fast",
+                )
                 return limited
 
         # Slow path: consultar storage.
@@ -62,7 +80,10 @@ class TableStorageRateLimit:
             self._local_cache[cache_key] = next_count
 
         limited = next_count > limit
-        asyncio.create_task(self._persist_count(key, int(window_start), next_count))
+        _create_logged_task(
+            self._persist_count(key, int(window_start), next_count),
+            name="rate_limit_persist_slow",
+        )
         return limited
 
     async def _persist_count(self, key: str, window_start: int, count: int):
@@ -87,4 +108,3 @@ class TableStorageRateLimit:
         expired = [k for k in self._local_cache if float(k.rsplit(":", 1)[-1]) < now - 300]
         for k in expired:
             self._local_cache.pop(k, None)
-
