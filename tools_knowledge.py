@@ -2,10 +2,8 @@
 # tools_knowledge.py — Search, embeddings and rerank utilities
 # =============================================================================
 
-import json
 import math
 import logging
-import re
 from typing import Optional
 
 import httpx
@@ -46,79 +44,6 @@ def _rerank_document_from_item(item: dict) -> str:
             parts.append(val)
     return "\n".join(parts)[:8000]
 
-def _build_chat_rerank_payload(query: str, documents: list, top_n: int) -> dict:
-    safe_query = str(query or "").strip()[:2000]
-    docs_lines = []
-    for idx, doc in enumerate(documents):
-        compact = " ".join(str(doc or "").split())
-        docs_lines.append(f"{idx}: {compact[:1400]}")
-    docs_block = "\n".join(docs_lines)
-    system_prompt = (
-        "You are a strict retrieval reranker. "
-        "Return ONLY JSON with this exact shape: "
-        "{\"results\":[{\"index\":0,\"relevance_score\":1.0}]}. "
-        "Use indexes from provided documents and sort descending by relevance."
-    )
-    user_prompt = (
-        f"Query:\n{safe_query}\n\n"
-        f"TopN: {top_n}\n"
-        "Documents (index: content):\n"
-        f"{docs_block}\n\n"
-        "Return only JSON."
-    )
-    return {
-        "model": RERANK_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0,
-        "max_completion_tokens": max(256, min(1400, top_n * 48)),
-    }
-
-def _extract_rerank_rows_from_chat_response(data: dict) -> list:
-    if not isinstance(data, dict):
-        return []
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return []
-    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-    content = message.get("content", "")
-    text = ""
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        parts = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text":
-                parts.append(str(part.get("text", "") or ""))
-        text = "\n".join(parts).strip()
-    if not text:
-        return []
-
-    payload = None
-    try:
-        payload = json.loads(text)
-    except Exception:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return []
-        try:
-            payload = json.loads(match.group(0))
-        except Exception:
-            return []
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("results")
-    if isinstance(rows, list):
-        return rows
-    rows = payload.get("data")
-    if isinstance(rows, list):
-        return rows
-    return []
-
 async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, dict]:
     if not isinstance(items, list):
         return items, {"applied": False, "reason": "invalid_items"}
@@ -133,18 +58,12 @@ async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, d
 
     top_n = max(1, min(int(RERANK_TOP_N or len(items)), len(items)))
     documents = [_rerank_document_from_item(item) for item in items]
-    endpoint_lower = str(RERANK_ENDPOINT or "").strip().lower()
-    use_chat_completions = "/chat/completions" in endpoint_lower
-    payload = (
-        _build_chat_rerank_payload(query, documents, top_n)
-        if use_chat_completions
-        else {
-            "model": RERANK_MODEL,
-            "query": str(query or "")[:2000],
-            "documents": documents,
-            "top_n": top_n,
-        }
-    )
+    payload = {
+        "model": RERANK_MODEL,
+        "query": str(query or "")[:2000],
+        "documents": documents,
+        "top_n": top_n,
+    }
     headers = _build_rerank_headers()
 
     try:
@@ -162,8 +81,6 @@ async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, d
     ranked_rows = data.get("results")
     if not isinstance(ranked_rows, list):
         ranked_rows = data.get("data")
-    if not isinstance(ranked_rows, list) and use_chat_completions:
-        ranked_rows = _extract_rerank_rows_from_chat_response(data)
     if not isinstance(ranked_rows, list):
         return items, {"applied": False, "reason": "invalid_response"}
 
@@ -280,4 +197,3 @@ async def tool_search_website(query, top=10):
     if rerank_meta.get("applied"):
         result["_rerank"] = rerank_meta
     return result
-
