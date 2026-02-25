@@ -325,7 +325,8 @@ async def table_insert(table_name: str, entity: dict) -> bool:
     auth = _table_auth_header("POST", table_name, date_str)
     
     try:
-        resp = await http_client.post(
+        client = _require_http_client()
+        resp = await client.post(
             url, headers=_base_headers(auth, date_str, content_type=True), json=entity
         )
         if resp.status_code in (201, 204):
@@ -348,7 +349,8 @@ async def table_query(table_name: str, filter_str: str = "", top: int = 50) -> l
         params["$filter"] = filter_str
     
     try:
-        resp = await http_client.get(
+        client = _require_http_client()
+        resp = await client.get(
             url, headers=_base_headers(auth, date_str), params=params
         )
         if resp.status_code == 200:
@@ -412,7 +414,8 @@ async def ensure_tables_exist():
         auth = _table_auth_header("POST", "Tables", date_str)
         
         try:
-            resp = await http_client.post(
+            client = _require_http_client()
+            resp = await client.post(
                 url, headers=_base_headers(auth, date_str, content_type=True),
                 json={"TableName": table_name},
             )
