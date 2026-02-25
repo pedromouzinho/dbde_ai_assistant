@@ -126,6 +126,7 @@ from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_rep
 from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
 from rate_limit_storage import TableStorageRateLimit
 from job_store import PersistentJobStore
+from utils import odata_escape, safe_blob_component, create_logged_task
 
 # =============================================================================
 # APP SETUP
@@ -322,11 +323,6 @@ async def enforce_allowed_origins(request: Request, call_next):
         reset_request_cookie_token(token_ref)
 
 
-def _odata_escape(value: Optional[str]) -> str:
-    """Escapa valor para uso seguro em filtros OData."""
-    return str(value or "").replace("'", "''")
-
-
 def _file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -338,14 +334,6 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _safe_blob_component(raw: str, max_len: int = 120) -> str:
-    txt = (raw or "").strip()
-    safe = "".join(c if c.isalnum() or c in "._- " else "_" for c in txt).strip().replace(" ", "_")
-    if not safe:
-        safe = "file"
-    return safe[:max_len]
-
-
 def _chat_partition_key_for_user(user: Optional[dict]) -> str:
     raw = (user or {}).get("sub") or (user or {}).get("username") or "anon"
     safe = "".join(c if c.isalnum() or c in "._-@" else "_" for c in str(raw))
@@ -353,8 +341,8 @@ def _chat_partition_key_for_user(user: Optional[dict]) -> str:
 
 
 async def _load_conversation_messages_for_export(conv_id: str, user: Optional[dict]) -> List[dict]:
-    safe_conv = _odata_escape(conv_id)
-    safe_pk = _odata_escape(_chat_partition_key_for_user(user))
+    safe_conv = odata_escape(conv_id)
+    safe_pk = odata_escape(_chat_partition_key_for_user(user))
     rows = await table_query(
         "ChatHistory",
         f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -598,7 +586,7 @@ async def _persist_export_job(job: dict) -> None:
         }
         rows = await table_query(
             "ExportJobs",
-            f"PartitionKey eq 'export' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'export' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if rows:
@@ -613,7 +601,7 @@ async def _load_export_job_from_storage(job_id: str) -> Optional[dict]:
     try:
         rows = await table_query(
             "ExportJobs",
-            f"PartitionKey eq 'export' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'export' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if not rows:
@@ -659,8 +647,8 @@ async def _queue_export_job(
     job_id = uuid.uuid4().hex
     now_iso = datetime.now(timezone.utc).isoformat()
     blob_name = (
-        f"export-jobs/{_safe_blob_component(user_sub or 'anon', max_len=90)}/"
-        f"{_safe_blob_component(job_id, max_len=90)}/payload.json"
+        f"export-jobs/{safe_blob_component(user_sub or 'anon', max_len=90)}/"
+        f"{safe_blob_component(job_id, max_len=90)}/payload.json"
     )
     payload = {
         "format": str(format_name or "xlsx").lower(),
@@ -1093,7 +1081,7 @@ async def _count_pending_jobs_for_user(user_sub: str) -> int:
     # Source of truth é Table Storage para evitar drift entre instâncias.
     pending_job_ids = set()
     try:
-        safe_user = _odata_escape(user_sub)
+        safe_user = odata_escape(user_sub)
         rows = await table_query(
             "UploadJobs",
             f"PartitionKey eq 'upload' and UserSub eq '{safe_user}'",
@@ -1119,7 +1107,7 @@ async def _count_pending_jobs_for_conversation(conv_id: str, user_sub: str = "",
     # Source of truth é Table Storage para evitar overcount por cache stale local.
     seen = set()
     try:
-        safe_conv = _odata_escape(conv_id)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query("UploadJobs", f"PartitionKey eq 'upload' and ConversationId eq '{safe_conv}'", top=500)
         for row in rows:
             if not include_all_users and user_sub and str(row.get("UserSub", "")) != user_sub:
@@ -1170,18 +1158,6 @@ def _is_job_stale(job: dict, now: Optional[datetime] = None) -> bool:
     if not ref_dt:
         return False
     return (now_dt - ref_dt).total_seconds() > UPLOAD_JOB_STALE_SECONDS
-
-
-def _create_logged_task(coro, label: str) -> None:
-    task = asyncio.create_task(coro)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except Exception as e:
-            logger.warning("[App] background task '%s' failed: %s", label, e, exc_info=True)
-
-    task.add_done_callback(_on_done)
 
 
 def _job_public_view(job: dict) -> dict:
@@ -1265,7 +1241,7 @@ async def _upsert_upload_index(entity: dict) -> None:
     try:
         rows = await table_query(
             "UploadIndex",
-            f"PartitionKey eq '{_odata_escape(conv_id)}' and RowKey eq '{_odata_escape(row_key)}'",
+            f"PartitionKey eq '{odata_escape(conv_id)}' and RowKey eq '{odata_escape(row_key)}'",
             top=1,
         )
         if rows:
@@ -1277,7 +1253,7 @@ async def _upsert_upload_index(entity: dict) -> None:
 
 
 async def _list_upload_index(conv_id: str, user_sub: str = "", top: int = UPLOAD_INDEX_TOP) -> list:
-    safe_conv = _odata_escape(conv_id)
+    safe_conv = odata_escape(conv_id)
     rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(top, 500)))
     if not user_sub:
         return rows
@@ -1449,7 +1425,7 @@ async def _persist_upload_job(job: dict) -> None:
         }
         rows = await table_query(
             "UploadJobs",
-            f"PartitionKey eq 'upload' and RowKey eq '{_odata_escape(rk)}'",
+            f"PartitionKey eq 'upload' and RowKey eq '{odata_escape(rk)}'",
             top=1,
         )
         if rows:
@@ -1464,7 +1440,7 @@ async def _load_upload_job_from_storage(job_id: str) -> Optional[dict]:
     try:
         rows = await table_query(
             "UploadJobs",
-            f"PartitionKey eq 'upload' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'upload' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if not rows:
@@ -1653,8 +1629,8 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
 
 
 def _build_upload_blob_paths(conv_id: str, job_id: str, filename: str) -> dict:
-    safe_name = _safe_blob_component(filename or "upload.bin", max_len=180)
-    prefix = f"{_safe_blob_component(conv_id, max_len=90)}/{_safe_blob_component(job_id, max_len=90)}"
+    safe_name = safe_blob_component(filename or "upload.bin", max_len=180)
+    prefix = f"{safe_blob_component(conv_id, max_len=90)}/{safe_blob_component(job_id, max_len=90)}"
     return {
         "raw_blob_name": f"{prefix}/raw/{safe_name}",
         "text_blob_name": f"{prefix}/extracted/text.txt",
@@ -2257,7 +2233,7 @@ async def upload_pending_for_conversation(
     stale_msg = "Upload interrompido por timeout/stale (possível restart do servidor). Reenvia o ficheiro."
     # Marca stale com base em estado persistido para consistência cross-instância.
     try:
-        safe_conv = _odata_escape(conversation_id)
+        safe_conv = odata_escape(conversation_id)
         rows = await table_query("UploadJobs", f"PartitionKey eq 'upload' and ConversationId eq '{safe_conv}'", top=500)
         for row in rows:
             job = _job_from_storage_row(row)
@@ -2586,7 +2562,7 @@ async def download_generated_file(request: Request, download_id: str, credential
 @app.post("/api/auth/login")
 @limiter.limit("5/minute", key_func=_login_rate_key)
 async def login(request: Request, login_request: LoginRequest):
-    safe_username = _odata_escape(login_request.username)
+    safe_username = odata_escape(login_request.username)
     users = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if not users: raise HTTPException(401, "Credenciais inválidas")
     user = users[0]
@@ -2635,7 +2611,7 @@ async def logout(request: Request):
 async def create_user(request: Request, payload: CreateUserRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
-    safe_username = _odata_escape(payload.username)
+    safe_username = odata_escape(payload.username)
     existing = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if existing: raise HTTPException(409, "Username já existe")
     entity = {"PartitionKey":"user","RowKey":payload.username,"PasswordHash":hash_password(payload.password),"DisplayName":payload.display_name or payload.username,"Role":payload.role or "user","IsActive":True,"CreatedAt":datetime.now(timezone.utc).isoformat(),"CreatedBy":user.get("sub")}
@@ -2664,7 +2640,7 @@ async def deactivate_user(request: Request, username: str, credentials: HTTPAuth
 async def change_password(request: Request, payload: ChangePasswordRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     username = user.get("sub")
-    safe_username = _odata_escape(username)
+    safe_username = odata_escape(username)
     users = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if not users: raise HTTPException(404, "User não encontrado")
     if not verify_password(payload.current_password, users[0].get("PasswordHash","")): raise HTTPException(401, "Password actual incorrecta")
@@ -2749,7 +2725,7 @@ async def save_chat(request: Request, payload: SaveChatRequest, credentials: HTT
 async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     uid = user.get("sub") if user.get("role")!="admin" else user_id
-    safe_uid = _odata_escape(uid)
+    safe_uid = odata_escape(uid)
     entities = await table_query("ChatHistory", f"PartitionKey eq '{safe_uid}'", top=100)
     chats = sorted([{"conversation_id":e.get("RowKey",""),"title":e.get("Title",""),"message_count":e.get("MessageCount",0),"updated_at":e.get("UpdatedAt","")} for e in entities], key=lambda c:c["updated_at"], reverse=True)
     return {"chats":chats}
@@ -2759,8 +2735,8 @@ async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizat
 async def get_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     uid = user.get("sub") if user.get("role")!="admin" else user_id
-    safe_uid = _odata_escape(uid)
-    safe_conv = _odata_escape(conversation_id)
+    safe_uid = odata_escape(uid)
+    safe_conv = odata_escape(conversation_id)
     es = await table_query("ChatHistory", f"PartitionKey eq '{safe_uid}' and RowKey eq '{safe_conv}'", top=1)
     if not es: raise HTTPException(404, "Não encontrada")
     return {"conversation_id":conversation_id,"title":es[0].get("Title",""),"messages":json.loads(es[0].get("Messages","[]")),"updated_at":es[0].get("UpdatedAt","")}

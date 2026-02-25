@@ -9,25 +9,11 @@ import time
 from datetime import datetime, timezone
 
 from storage import table_query, table_insert, table_merge
+from utils import create_logged_task
 
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_TABLE = "RateLimits"
-
-
-def _create_logged_task(coro, name: str = "") -> asyncio.Task:
-    """Create fire-and-forget task with explicit exception retrieval."""
-    task = asyncio.create_task(coro)
-
-    def _done(done_task: asyncio.Task) -> None:
-        if done_task.cancelled():
-            return
-        exc = done_task.exception()
-        if exc:
-            logger.error("[RateLimit] Background task %s failed: %s", name or "unnamed", exc)
-
-    task.add_done_callback(_done)
-    return task
 
 
 class TableStorageRateLimit:
@@ -58,7 +44,7 @@ class TableStorageRateLimit:
                 next_count = cached_count + 1
                 self._local_cache[cache_key] = next_count
                 limited = next_count > limit
-                _create_logged_task(
+                create_logged_task(
                     self._persist_count(key, int(window_start), next_count),
                     name="rate_limit_persist_fast",
                 )
@@ -80,7 +66,7 @@ class TableStorageRateLimit:
             self._local_cache[cache_key] = next_count
 
         limited = next_count > limit
-        _create_logged_task(
+        create_logged_task(
             self._persist_count(key, int(window_start), next_count),
             name="rate_limit_persist_slow",
         )

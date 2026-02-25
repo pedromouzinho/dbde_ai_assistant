@@ -42,6 +42,7 @@ from storage import (
     blob_upload_json,
     parse_blob_ref,
 )
+from utils import odata_escape, safe_blob_component, create_logged_task
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -174,10 +175,6 @@ conversations = ConversationStore(
 logger = logging.getLogger(__name__)
 
 
-def _odata_escape(value: str) -> str:
-    return (value or "").replace("'", "''")
-
-
 def _user_partition_key(user: Optional[dict]) -> str:
     raw = (user or {}).get("sub") or (user or {}).get("username") or "anon"
     # Azure Table key hygiene: avoid problematic characters for filters/URLs.
@@ -185,28 +182,8 @@ def _user_partition_key(user: Optional[dict]) -> str:
     return (safe or "anon")[:100]
 
 
-def _safe_blob_component(raw: str, max_len: int = 120) -> str:
-    txt = str(raw or "").strip()
-    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in txt)
-    if not safe:
-        safe = "x"
-    return safe[:max_len]
-
-
 def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
     return _conversation_locks.setdefault(conv_id, asyncio.Lock())
-
-
-def _create_logged_task(coro, label: str) -> None:
-    task = asyncio.create_task(coro)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except Exception as e:
-            logger.warning("[Agent] background task '%s' failed: %s", label, e, exc_info=True)
-
-    task.add_done_callback(_on_done)
 
 # =============================================================================
 # HISTORY MANAGEMENT
@@ -260,7 +237,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
     if current_files:
         return
     try:
-        safe_conv = _odata_escape(conv_id)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
     except Exception as e:
         logger.warning("[Agent] upload index query failed for %s: %s", conv_id, e)
@@ -489,8 +466,8 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
 async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> bool:
     """Tenta carregar conversa do Table Storage. Retorna True se encontrou."""
     try:
-        safe_pk = _odata_escape(partition_key)
-        safe_conv = _odata_escape(conv_id)
+        safe_pk = odata_escape(partition_key)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query(
             "ChatHistory",
             f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -856,8 +833,8 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                 "MessageCount": len(compact),
             }
 
-        safe_pk = _odata_escape(partition_key)
-        safe_conv = _odata_escape(conv_id)
+        safe_pk = odata_escape(partition_key)
+        safe_conv = odata_escape(conv_id)
         existing = await table_query(
             "ChatHistory",
             f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -976,11 +953,11 @@ async def _execute_tool_calls(
 
         result_blob_ref = ""
         try:
-            safe_user = _safe_blob_component(user_sub or "anon", 80)
-            safe_conv = _safe_blob_component(conv_id, 80)
-            safe_tool = _safe_blob_component(tc.name, 40)
+            safe_user = safe_blob_component(user_sub or "anon", max_len=80)
+            safe_conv = safe_blob_component(conv_id, max_len=80)
+            safe_tool = safe_blob_component(tc.name, max_len=40)
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            blob_name = f"{safe_user}/{safe_conv}/{ts}_{safe_tool}_{_safe_blob_component(tc.id, 60)}.json"
+            blob_name = f"{safe_user}/{safe_conv}/{ts}_{safe_tool}_{safe_blob_component(tc.id, max_len=60)}.json"
             uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, tool_result)
             result_blob_ref = str(uploaded.get("blob_ref", "") or "")
         except Exception as e:
@@ -1112,7 +1089,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
         try:
             await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
         except Exception:
-            _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
+            create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
     
     total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     
@@ -1255,7 +1232,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
         try:
             await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
         except Exception:
-            _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
+            create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
     
     total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     has_exportable = False
