@@ -13,8 +13,6 @@ from urllib.parse import quote
 from typing import Optional
 from collections import deque
 
-import httpx
-
 from config import (
     DEVOPS_PAT,
     DEVOPS_ORG,
@@ -30,7 +28,7 @@ from config import (
 )
 from llm_provider import llm_simple
 from export_engine import to_csv
-from http_helpers import devops_request_with_retry, search_request_with_retry
+from http_helpers import devops_request_with_retry
 from tools_knowledge import get_embedding
 from tools_export import _attach_auto_csv_export
 from tools_learning import _save_writer_profile, _load_writer_profile
@@ -143,7 +141,6 @@ def _validate_workitem_type(value: str, default: str = "User Story") -> str:
     return safe
 
 async def _resolve_parent_id_by_title_hint(
-    client,
     headers: dict,
     *,
     parent_type: str,
@@ -182,11 +179,11 @@ async def _resolve_parent_id_by_title_hint(
         "ORDER BY [System.ChangedDate] DESC"
     )
     resp = await devops_request_with_retry(
-        client,
         "POST",
         _devops_url("wit/wiql?api-version=7.1"),
         headers,
         {"query": wiql},
+        timeout=60,
     )
     if "error" in resp:
         return None, {
@@ -205,11 +202,11 @@ async def _resolve_parent_id_by_title_hint(
             "ORDER BY [System.ChangedDate] DESC"
         )
         fallback_resp = await devops_request_with_retry(
-            client,
             "POST",
             _devops_url("wit/wiql?api-version=7.1"),
             headers,
             {"query": fallback_wiql},
+            timeout=60,
         )
         if "error" not in fallback_resp:
             ids = [wi.get("id") for wi in fallback_resp.get("workItems", []) if wi.get("id")]
@@ -226,11 +223,11 @@ async def _resolve_parent_id_by_title_hint(
 
     batch_ids = ids[: min(50, len(ids))]
     det = await devops_request_with_retry(
-        client,
         "POST",
         _devops_url("wit/workitemsbatch?api-version=7.1"),
         headers,
         {"ids": batch_ids, "fields": ["System.Id", "System.Title", "System.WorkItemType", "System.AreaPath"]},
+        timeout=60,
     )
     if "error" in det:
         return None, {
@@ -296,38 +293,75 @@ async def tool_query_workitems(wiql_where, fields=None, top=200):
         f"AND {safe_where} ORDER BY [System.ChangedDate] DESC"
     )
     headers = _devops_headers()
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await devops_request_with_retry(client, "POST", _devops_url("wit/wiql?api-version=7.1"), headers, {"query": wiql})
-        if "error" in resp: return resp
-        work_items = resp.get("workItems", [])
-        total_count = len(work_items)
-        if top == 0: return {"total_count": total_count, "items": []}
-        work_items = work_items[:min(top, 1000) if top > 0 else total_count]
-        if not work_items: return {"total_count": 0, "items": []}
-        await asyncio.sleep(0.5)
-        all_details, failed_ids, ids = [], [], [wi["id"] for wi in work_items]
-        for i in range(0, len(ids), 100):
-            batch = ids[i:i+100]
-            r = await devops_request_with_retry(client, "POST", _devops_url("wit/workitemsbatch?api-version=7.1"), headers, {"ids": batch, "fields": use_fields})
-            if "error" in r: failed_ids.extend(batch); await asyncio.sleep(3); continue
-            all_details.extend(r.get("value",[])); await asyncio.sleep(0.5)
-        if failed_ids and len(failed_ids) <= 50:
-            await asyncio.sleep(2)
-            fl = ",".join(use_fields)
-            for fid in failed_ids[:]:
-                r = await devops_request_with_retry(client, "GET", _devops_url(f"wit/workitems/{fid}?fields={fl}&api-version=7.1"), headers, max_retries=3)
-                if "error" not in r and "id" in r: all_details.append(r); failed_ids.remove(fid)
-                await asyncio.sleep(0.3)
-        items = [_format_wi(it) for it in all_details]
-        if failed_ids and not items:
-            items = [{"id":fid,"type":"","title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed_ids]
-        result = {"total_count": total_count, "items_returned": len(items), "items": items}
-        await _attach_auto_csv_export(
-            result,
-            title_hint=f"query_workitems_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}",
+    resp = await devops_request_with_retry(
+        "POST",
+        _devops_url("wit/wiql?api-version=7.1"),
+        headers,
+        {"query": wiql},
+        timeout=60,
+    )
+    if "error" in resp:
+        return resp
+    work_items = resp.get("workItems", [])
+    total_count = len(work_items)
+    if top == 0:
+        return {"total_count": total_count, "items": []}
+    work_items = work_items[: min(top, 1000) if top > 0 else total_count]
+    if not work_items:
+        return {"total_count": 0, "items": []}
+    await asyncio.sleep(0.5)
+    all_details, failed_ids, ids = [], [], [wi["id"] for wi in work_items]
+    for i in range(0, len(ids), 100):
+        batch = ids[i : i + 100]
+        r = await devops_request_with_retry(
+            "POST",
+            _devops_url("wit/workitemsbatch?api-version=7.1"),
+            headers,
+            {"ids": batch, "fields": use_fields},
+            timeout=60,
         )
-        if failed_ids: result["_partial"] = True; result["_failed_batch_count"] = len(failed_ids)
-        return result
+        if "error" in r:
+            failed_ids.extend(batch)
+            await asyncio.sleep(3)
+            continue
+        all_details.extend(r.get("value", []))
+        await asyncio.sleep(0.5)
+    if failed_ids and len(failed_ids) <= 50:
+        await asyncio.sleep(2)
+        fl = ",".join(use_fields)
+        for fid in failed_ids[:]:
+            r = await devops_request_with_retry(
+                "GET",
+                _devops_url(f"wit/workitems/{fid}?fields={fl}&api-version=7.1"),
+                headers,
+                max_retries=3,
+                timeout=60,
+            )
+            if "error" not in r and "id" in r:
+                all_details.append(r)
+                failed_ids.remove(fid)
+            await asyncio.sleep(0.3)
+    items = [_format_wi(it) for it in all_details]
+    if failed_ids and not items:
+        items = [
+            {
+                "id": fid,
+                "type": "",
+                "title": "(rate limited)",
+                "state": "",
+                "url": f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}",
+            }
+            for fid in failed_ids
+        ]
+    result = {"total_count": total_count, "items_returned": len(items), "items": items}
+    await _attach_auto_csv_export(
+        result,
+        title_hint=f"query_workitems_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}",
+    )
+    if failed_ids:
+        result["_partial"] = True
+        result["_failed_batch_count"] = len(failed_ids)
+    return result
 
 async def tool_analyze_patterns(created_by=None, topic=None, work_item_type="User Story", area_path=None, sample_size=15):
     try:
@@ -354,15 +388,20 @@ async def tool_analyze_patterns(created_by=None, topic=None, work_item_type="Use
     samples = []
     if ids:
         det_fields = DEVOPS_FIELDS + ["System.Description","Microsoft.VSTS.Common.AcceptanceCriteria","System.Tags"]
-        async with httpx.AsyncClient(timeout=30) as c:
-            try:
-                r = await devops_request_with_retry(c, "POST", _devops_url("wit/workitemsbatch?api-version=7.1"), _devops_headers(), {"ids":ids[:sample_size],"fields":det_fields})
-                if "error" not in r:
-                    for it in r.get("value",[]):
-                        f=it.get("fields",{}); cb=f.get("System.CreatedBy",{})
-                        samples.append({"id":it["id"],"title":f.get("System.Title","").replace(" | "," — "),"created_by":cb.get("displayName","") if isinstance(cb,dict) else str(cb),"description":(f.get("System.Description","") or "")[:1000],"acceptance_criteria":(f.get("Microsoft.VSTS.Common.AcceptanceCriteria","") or "")[:1000],"tags":f.get("System.Tags","")})
-            except Exception as e:
-                logging.error("[Tools] tool_analyze_patterns LLM block failed: %s", e)
+        try:
+            r = await devops_request_with_retry(
+                "POST",
+                _devops_url("wit/workitemsbatch?api-version=7.1"),
+                _devops_headers(),
+                {"ids": ids[:sample_size], "fields": det_fields},
+                timeout=30,
+            )
+            if "error" not in r:
+                for it in r.get("value",[]):
+                    f=it.get("fields",{}); cb=f.get("System.CreatedBy",{})
+                    samples.append({"id":it["id"],"title":f.get("System.Title","").replace(" | "," — "),"created_by":cb.get("displayName","") if isinstance(cb,dict) else str(cb),"description":(f.get("System.Description","") or "")[:1000],"acceptance_criteria":(f.get("Microsoft.VSTS.Common.AcceptanceCriteria","") or "")[:1000],"tags":f.get("System.Tags","")})
+        except Exception as e:
+            logging.error("[Tools] tool_analyze_patterns LLM block failed: %s", e)
     if not samples: samples = [{"id":it.get("id"),"title":it.get("title","")} for it in result.get("items",[])]
     return {"total_found": result.get("total_count",0), "samples_returned": len(samples), "analysis_data": samples}
 
@@ -477,164 +516,181 @@ async def tool_query_hierarchy(
     child_title_filter = str(title_contains or "").strip()
 
     headers = _devops_headers()
-    async with httpx.AsyncClient(timeout=60) as client:
-        resolved_meta = {"attempted": False}
-        safe_parent_id = None
-        if parent_id:
-            try:
-                safe_parent_id = int(parent_id)
-            except (TypeError, ValueError):
-                return {"error": "parent_id inválido: deve ser inteiro positivo"}
-            if safe_parent_id <= 0:
-                return {"error": "parent_id inválido: deve ser inteiro positivo"}
-        elif parent_hint:
-            resolved_parent_id, resolved_meta = await _resolve_parent_id_by_title_hint(
-                client,
+    resolved_meta = {"attempted": False}
+    safe_parent_id = None
+    if parent_id:
+        try:
+            safe_parent_id = int(parent_id)
+        except (TypeError, ValueError):
+            return {"error": "parent_id inválido: deve ser inteiro positivo"}
+        if safe_parent_id <= 0:
+            return {"error": "parent_id inválido: deve ser inteiro positivo"}
+    elif parent_hint:
+        resolved_parent_id, resolved_meta = await _resolve_parent_id_by_title_hint(
+            headers,
+            parent_type=safe_parent_type,
+            area_path=safe_area,
+            title_hint=parent_hint,
+        )
+        if not resolved_parent_id and safe_area:
+            fallback_id, fallback_meta = await _resolve_parent_id_by_title_hint(
                 headers,
                 parent_type=safe_parent_type,
-                area_path=safe_area,
+                area_path="",
                 title_hint=parent_hint,
             )
-            if not resolved_parent_id and safe_area:
-                fallback_id, fallback_meta = await _resolve_parent_id_by_title_hint(
-                    client,
-                    headers,
-                    parent_type=safe_parent_type,
-                    area_path="",
-                    title_hint=parent_hint,
-                )
-                resolved_meta["fallback_without_area_attempted"] = True
-                resolved_meta["fallback_without_area_meta"] = fallback_meta
-                if fallback_id:
-                    resolved_parent_id = fallback_id
-                    resolved_meta["fallback_without_area_used"] = True
-            if resolved_parent_id:
-                safe_parent_id = int(resolved_parent_id)
-                # Neste caminho, o hint foi usado para resolver o PAI e não para filtrar o TÍTULO dos filhos.
-                child_title_filter = ""
-            else:
-                return {
-                    "error": (
-                        f"Não foi possível identificar {safe_parent_type} com título '{parent_hint}'. "
-                        "Indica o ID do parent para resultado exato."
-                    ),
-                    "total_count": 0,
-                    "items_returned": 0,
-                    "items": [],
-                    "parent_id": parent_id,
-                    "parent_type": safe_parent_type,
-                    "child_type": safe_child_type,
-                    "title_contains": child_title_filter,
-                    "parent_title_hint": parent_hint,
-                    "_parent_resolve": resolved_meta,
-                }
-
-        if safe_parent_id:
-            af = f"AND ([Target].[System.AreaPath] UNDER '{safe_area}')" if safe_area else ""
-            wiql = (
-                "SELECT [System.Id] FROM WorkItemLinks WHERE "
-                f"([Source].[System.Id] = {safe_parent_id}) "
-                "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
-                f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
-                f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                f"{af} MODE (Recursive)"
-            )
+            resolved_meta["fallback_without_area_attempted"] = True
+            resolved_meta["fallback_without_area_meta"] = fallback_meta
+            if fallback_id:
+                resolved_parent_id = fallback_id
+                resolved_meta["fallback_without_area_used"] = True
+        if resolved_parent_id:
+            safe_parent_id = int(resolved_parent_id)
+            # Neste caminho, o hint foi usado para resolver o PAI e não para filtrar o TÍTULO dos filhos.
+            child_title_filter = ""
         else:
-            source_af = f"AND [Source].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
-            target_af = f"AND [Target].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
-            wiql = (
-                "SELECT [System.Id] FROM WorkItemLinks WHERE "
-                f"([Source].[System.WorkItemType] = '{_safe_wiql_literal(safe_parent_type, 80)}' "
-                f"{source_af} AND [Source].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
-                f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
-                f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                f"{target_af} "
-                "MODE (Recursive)"
-            )
-
-        resp = await devops_request_with_retry(client, "POST", _devops_url("wit/wiql?api-version=7.1"), headers, {"query": wiql})
-        if "error" in resp: return resp
-        rels = resp.get("workItemRelations",[])
-        tids = list(set(r["target"]["id"] for r in rels if r.get("target") and r.get("rel")))
-        if not tids: tids = [wi["id"] for wi in resp.get("workItems",[])]
-        total_raw = len(tids)
-        if not tids:
             return {
+                "error": (
+                    f"Não foi possível identificar {safe_parent_type} com título '{parent_hint}'. "
+                    "Indica o ID do parent para resultado exato."
+                ),
                 "total_count": 0,
-                "total_raw_count": 0,
                 "items_returned": 0,
                 "items": [],
-                "parent_id": safe_parent_id if safe_parent_id else parent_id,
+                "parent_id": parent_id,
                 "parent_type": safe_parent_type,
                 "child_type": safe_child_type,
                 "title_contains": child_title_filter,
                 "parent_title_hint": parent_hint,
+                "_parent_resolve": resolved_meta,
             }
-        flds = DEVOPS_FIELDS + ["System.Parent"]
-        all_det, failed = [], []
-        for i in range(0,len(tids),100):
-            batch = tids[i:i+100]
-            r = await devops_request_with_retry(client,"POST",_devops_url("wit/workitemsbatch?api-version=7.1"),headers,{"ids":batch,"fields":flds})
-            if "error" not in r: all_det.extend(r.get("value",[])) 
-            else: failed.extend(batch)
-            await asyncio.sleep(0.5)
-        items = []
-        for it in all_det:
-            fi = _format_wi(it); fi["parent_id"] = it.get("fields",{}).get("System.Parent"); items.append(fi)
-        # Filtro defensivo final: garante tipo e área pedidos, mesmo se WIQL trouxer ruído.
-        filtered_out = 0
-        if safe_child_type or safe_area:
-            expected_type = str(safe_child_type or "").strip().lower()
-            expected_area = str(safe_area or "").strip().lower()
-            filtered = []
-            for item in items:
-                item_type = str(item.get("type", "") or "").strip().lower()
-                item_area = str(item.get("area", "") or "").strip().lower()
-                type_ok = not expected_type or item_type == expected_type
-                area_ok = not expected_area or item_area.startswith(expected_area)
-                if type_ok and area_ok:
-                    filtered.append(item)
-                else:
-                    filtered_out += 1
-            items = filtered
-        title_filter = _normalize_match_text(child_title_filter)
-        if title_filter:
-            terms = [t for t in title_filter.split(" ") if t]
-            if terms:
-                by_title = []
-                for item in items:
-                    title_norm = _normalize_match_text(str(item.get("title", "") or ""))
-                    if all(term in title_norm for term in terms):
-                        by_title.append(item)
-                    else:
-                        filtered_out += 1
-                items = by_title
 
-        if failed and not items:
-            items = [{"id":fid,"type":child_type,"title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed]
-        matched_count = len(items)
-        result = {
-            "total_count": matched_count,
-            "total_raw_count": total_raw,
-            "items_returned": matched_count,
+    if safe_parent_id:
+        af = f"AND ([Target].[System.AreaPath] UNDER '{safe_area}')" if safe_area else ""
+        wiql = (
+            "SELECT [System.Id] FROM WorkItemLinks WHERE "
+            f"([Source].[System.Id] = {safe_parent_id}) "
+            "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
+            f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
+            f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
+            f"{af} MODE (Recursive)"
+        )
+    else:
+        source_af = f"AND [Source].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
+        target_af = f"AND [Target].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
+        wiql = (
+            "SELECT [System.Id] FROM WorkItemLinks WHERE "
+            f"([Source].[System.WorkItemType] = '{_safe_wiql_literal(safe_parent_type, 80)}' "
+            f"{source_af} AND [Source].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
+            "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
+            f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
+            f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
+            f"{target_af} "
+            "MODE (Recursive)"
+        )
+
+    resp = await devops_request_with_retry(
+        "POST",
+        _devops_url("wit/wiql?api-version=7.1"),
+        headers,
+        {"query": wiql},
+        timeout=60,
+    )
+    if "error" in resp:
+        return resp
+    rels = resp.get("workItemRelations", [])
+    tids = list(set(r["target"]["id"] for r in rels if r.get("target") and r.get("rel")))
+    if not tids:
+        tids = [wi["id"] for wi in resp.get("workItems", [])]
+    total_raw = len(tids)
+    if not tids:
+        return {
+            "total_count": 0,
+            "total_raw_count": 0,
+            "items_returned": 0,
+            "items": [],
             "parent_id": safe_parent_id if safe_parent_id else parent_id,
-            "parent_type":safe_parent_type,
-            "child_type":safe_child_type,
+            "parent_type": safe_parent_type,
+            "child_type": safe_child_type,
             "title_contains": child_title_filter,
             "parent_title_hint": parent_hint,
-            "items":items,
         }
-        await _attach_auto_csv_export(
-            result,
-            title_hint=f"hierarchy_{safe_parent_type}_{safe_child_type}_{(safe_parent_id if safe_parent_id else 'all')}",
+    flds = DEVOPS_FIELDS + ["System.Parent"]
+    all_det, failed = [], []
+    for i in range(0, len(tids), 100):
+        batch = tids[i : i + 100]
+        r = await devops_request_with_retry(
+            "POST",
+            _devops_url("wit/workitemsbatch?api-version=7.1"),
+            headers,
+            {"ids": batch, "fields": flds},
+            timeout=60,
         )
-        if resolved_meta.get("attempted"):
-            result["_parent_resolve"] = resolved_meta
-        if filtered_out:
-            result["_post_filtered_out"] = filtered_out
-        if failed: result["_partial"]=True; result["_failed_batch_count"]=len(failed)
-        return result
+        if "error" not in r:
+            all_det.extend(r.get("value", []))
+        else:
+            failed.extend(batch)
+        await asyncio.sleep(0.5)
+    items = []
+    for it in all_det:
+        fi = _format_wi(it)
+        fi["parent_id"] = it.get("fields", {}).get("System.Parent")
+        items.append(fi)
+    # Filtro defensivo final: garante tipo e área pedidos, mesmo se WIQL trouxer ruído.
+    filtered_out = 0
+    if safe_child_type or safe_area:
+        expected_type = str(safe_child_type or "").strip().lower()
+        expected_area = str(safe_area or "").strip().lower()
+        filtered = []
+        for item in items:
+            item_type = str(item.get("type", "") or "").strip().lower()
+            item_area = str(item.get("area", "") or "").strip().lower()
+            type_ok = not expected_type or item_type == expected_type
+            area_ok = not expected_area or item_area.startswith(expected_area)
+            if type_ok and area_ok:
+                filtered.append(item)
+            else:
+                filtered_out += 1
+        items = filtered
+    title_filter = _normalize_match_text(child_title_filter)
+    if title_filter:
+        terms = [t for t in title_filter.split(" ") if t]
+        if terms:
+            by_title = []
+            for item in items:
+                title_norm = _normalize_match_text(str(item.get("title", "") or ""))
+                if all(term in title_norm for term in terms):
+                    by_title.append(item)
+                else:
+                    filtered_out += 1
+            items = by_title
+
+    if failed and not items:
+        items = [{"id":fid,"type":child_type,"title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed]
+    matched_count = len(items)
+    result = {
+        "total_count": matched_count,
+        "total_raw_count": total_raw,
+        "items_returned": matched_count,
+        "parent_id": safe_parent_id if safe_parent_id else parent_id,
+        "parent_type":safe_parent_type,
+        "child_type":safe_child_type,
+        "title_contains": child_title_filter,
+        "parent_title_hint": parent_hint,
+        "items":items,
+    }
+    await _attach_auto_csv_export(
+        result,
+        title_hint=f"hierarchy_{safe_parent_type}_{safe_child_type}_{(safe_parent_id if safe_parent_id else 'all')}",
+    )
+    if resolved_meta.get("attempted"):
+        result["_parent_resolve"] = resolved_meta
+    if filtered_out:
+        result["_post_filtered_out"] = filtered_out
+    if failed:
+        result["_partial"] = True
+        result["_failed_batch_count"] = len(failed)
+    return result
 
 async def tool_compute_kpi(wiql_where, group_by=None, kpi_type="count"):
     result = await tool_query_workitems(wiql_where=wiql_where, top=1000)
@@ -711,40 +767,16 @@ async def tool_create_workitem(
     url = _devops_url(f"wit/workitems/${wi_type_encoded}?api-version=7.1")
     headers = _devops_headers()
     headers["Content-Type"] = "application/json-patch+json"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    url,
-                    headers=headers,
-                    content=json.dumps(patch_doc),
-                )
-                if resp.status_code == 429:
-                    wait = min(int(resp.headers.get("Retry-After", 3 * (attempt + 1))), 30)
-                    _log(f"create_workitem 429, attempt {attempt+1}/3, wait {wait}s")
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                if resp.status_code >= 400:
-                    _log(f"create_workitem {resp.status_code}: {resp.text[:200]}")
-                    return {"error": f"DevOps {resp.status_code}: {resp.text[:200]}"}
-                data = resp.json()
-                break
-            except httpx.TimeoutException:
-                if attempt == 2:
-                    return {"error": "DevOps timeout ao criar work item"}
-                await asyncio.sleep(2 * (attempt + 1))
-            except httpx.RequestError as e:
-                if attempt == 2:
-                    return {"error": f"DevOps request error ao criar work item: {str(e)}"}
-                await asyncio.sleep(2 * (attempt + 1))
-            except Exception as e:
-                return {"error": f"Erro ao criar work item: {str(e)}"}
-        else:
-            return {"error": "Max retries ao criar work item"}
+    data = await devops_request_with_retry(
+        "POST",
+        url,
+        headers,
+        content_body=json.dumps(patch_doc),
+        max_retries=3,
+        timeout=30,
+    )
+    if "error" in data:
+        return data
 
     wi_id = data.get("id")
     wi_url = data.get("_links", {}).get("html", {}).get("href", "")
@@ -789,14 +821,13 @@ async def tool_refine_workitem(
     fields_param = ",".join(fields)
     headers = _devops_headers()
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        wi = await devops_request_with_retry(
-            client,
-            "GET",
-            _devops_url(f"wit/workitems/{safe_id}?fields={fields_param}&api-version=7.1"),
-            headers,
-            max_retries=3,
-        )
+    wi = await devops_request_with_retry(
+        "GET",
+        _devops_url(f"wit/workitems/{safe_id}?fields={fields_param}&api-version=7.1"),
+        headers,
+        max_retries=3,
+        timeout=45,
+    )
     if "error" in wi:
         return wi
     if not isinstance(wi, dict) or not wi.get("id"):
