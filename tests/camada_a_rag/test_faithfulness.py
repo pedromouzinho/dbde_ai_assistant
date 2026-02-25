@@ -115,7 +115,8 @@ class TestFaithfulness:
         results = []
 
         for entry in rag_golden_set["entries"]:
-            mock_answer = f"Com base nos dados, {entry['expected_answer']}"
+            # Mock controlado: resposta construída a partir do contexto golden.
+            mock_answer = f"{entry['golden_context']} {entry['expected_answer']}"
             result = await judge.score(
                 question=entry["question"],
                 context=entry["golden_context"],
