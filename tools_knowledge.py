@@ -25,6 +25,23 @@ from config import (
 from llm_provider import get_embedding_provider
 from http_helpers import search_request_with_retry
 
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=max(25, int(RERANK_TIMEOUT_SECONDS or 25)))
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 def _build_rerank_headers() -> dict:
     headers = {"Content-Type": "application/json"}
     token = str(RERANK_API_KEY or "").strip()
@@ -67,8 +84,8 @@ async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, d
     headers = _build_rerank_headers()
 
     try:
-        async with httpx.AsyncClient(timeout=RERANK_TIMEOUT_SECONDS) as client:
-            resp = await client.post(RERANK_ENDPOINT, headers=headers, json=payload)
+        client = _get_http_client()
+        resp = await client.post(RERANK_ENDPOINT, headers=headers, json=payload)
         if resp.status_code >= 400:
             logging.warning("[Tools] rerank HTTP %s: %s", resp.status_code, resp.text[:300])
             return items, {"applied": False, "reason": f"http_{resp.status_code}"}

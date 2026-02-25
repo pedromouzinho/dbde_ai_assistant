@@ -17,6 +17,7 @@ _FIGMA_API_BASE = "https://api.figma.com/v1"
 _FIGMA_CACHE_TTL_SECONDS = 300
 _MAX_CACHE_ENTRIES = 200
 _figma_cache = {}
+_http_client: httpx.AsyncClient | None = None
 
 
 def _get_figma_token() -> str:
@@ -50,38 +51,52 @@ def _cache_set(key: str, data):
     _figma_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=25)
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 async def _figma_get(path: str, params=None):
     token = _get_figma_token()
     if not token:
         return {"error": "Integração Figma não configurada (token em falta)"}
     headers = {"X-Figma-Token": token}
     url = f"{_FIGMA_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=25) as client:
-        for attempt in range(1, 4):
-            try:
-                resp = await client.get(url, headers=headers, params=params)
-                if resp.status_code == 429:
-                    wait = min(int(resp.headers.get("Retry-After", "2")), 20)
-                    if attempt == 3:
-                        return {"error": "Figma 429: limite de requests"}
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    if attempt == 3:
-                        return {"error": f"Figma {resp.status_code}: erro servidor"}
-                    await asyncio.sleep(attempt)
-                    continue
-                if resp.status_code >= 400:
-                    return {"error": f"Figma {resp.status_code}: {resp.text[:200]}"}
-                return resp.json()
-            except httpx.TimeoutException:
+    client = _get_http_client()
+    for attempt in range(1, 4):
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After", "2")), 20)
                 if attempt == 3:
-                    return {"error": "Figma timeout"}
-                await asyncio.sleep(attempt)
-            except Exception as e:
+                    return {"error": "Figma 429: limite de requests"}
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code >= 500:
                 if attempt == 3:
-                    return {"error": f"Figma erro: {str(e)}"}
+                    return {"error": f"Figma {resp.status_code}: erro servidor"}
                 await asyncio.sleep(attempt)
+                continue
+            if resp.status_code >= 400:
+                return {"error": f"Figma {resp.status_code}: {resp.text[:200]}"}
+            return resp.json()
+        except httpx.TimeoutException:
+            if attempt == 3:
+                return {"error": "Figma timeout"}
+            await asyncio.sleep(attempt)
+        except Exception as e:
+            if attempt == 3:
+                return {"error": f"Figma erro: {str(e)}"}
+            await asyncio.sleep(attempt)
     return {"error": "Figma erro desconhecido"}
 
 
