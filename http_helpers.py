@@ -23,12 +23,16 @@ async def _request_with_retry(
     max_retries: int = 3,
     timeout: int = 30,
     log_prefix: str = "HTTP",
+    client: httpx.AsyncClient | None = None,
 ) -> dict:
     request_method = (method or "GET").upper()
     if request_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
         return {"error": f"{log_prefix} método não suportado: {request_method}"}
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=timeout)
+    try:
         for attempt in range(1, max_retries + 1):
             try:
                 request_kwargs: dict[str, Any] = {"headers": headers}
@@ -91,7 +95,9 @@ async def _request_with_retry(
                     return {"error": f"{log_prefix} erro: {str(e)}"}
                 _log(log_prefix, f"erro attempt {attempt}/{max_retries}: {str(e)}; retry em {wait}s")
                 await asyncio.sleep(wait)
-
+    finally:
+        if owns_client and client is not None:
+            await client.aclose()
     return {"error": f"{log_prefix} erro desconhecido"}
 
 
@@ -104,6 +110,7 @@ async def devops_request_with_retry(
     content_body: str | bytes | None = None,
     max_retries: int = 5,
     timeout: int = 30,
+    client: httpx.AsyncClient | None = None,
 ) -> dict:
     """Call Azure DevOps REST API with retry for 429/5xx/timeouts."""
     return await _request_with_retry(
@@ -115,6 +122,7 @@ async def devops_request_with_retry(
         max_retries=max_retries,
         timeout=timeout,
         log_prefix="DevOps",
+        client=client,
     )
 
 
@@ -124,6 +132,7 @@ async def search_request_with_retry(
     json_body: Any,
     max_retries: int = 3,
     timeout: int = 30,
+    client: httpx.AsyncClient | None = None,
 ) -> dict:
     """POST to Azure AI Search endpoint with retry for 429/5xx/timeouts."""
     return await _request_with_retry(
@@ -134,4 +143,5 @@ async def search_request_with_retry(
         max_retries=max_retries,
         timeout=timeout,
         log_prefix="Search",
+        client=client,
     )
