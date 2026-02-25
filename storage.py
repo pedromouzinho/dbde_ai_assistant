@@ -376,10 +376,10 @@ async def table_merge(table_name: str, entity: dict):
     
     body = {k: v for k, v in entity.items() if k not in ("PartitionKey", "RowKey")}
     
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.request("MERGE", url, headers=headers, json=body)
-        if resp.status_code not in (204, 200):
-            raise Exception(f"Table merge failed: {resp.status_code} - {resp.text[:200]}")
+    client = _require_http_client()
+    resp = await client.request("MERGE", url, headers=headers, json=body, timeout=15)
+    if resp.status_code not in (204, 200):
+        raise Exception(f"Table merge failed: {resp.status_code} - {resp.text[:200]}")
 
 
 async def table_delete(table_name: str, partition_key: str, row_key: str):
@@ -394,10 +394,10 @@ async def table_delete(table_name: str, partition_key: str, row_key: str):
     headers = _base_headers(auth, date_str)
     headers["If-Match"] = "*"
     
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(url, headers=headers)
-        if resp.status_code not in (204, 200, 404):
-            raise Exception(f"Table delete failed: {resp.status_code}")
+    client = _require_http_client()
+    resp = await client.delete(url, headers=headers, timeout=15)
+    if resp.status_code not in (204, 200, 404):
+        raise Exception(f"Table delete failed: {resp.status_code}")
 
 
 # =============================================================================
