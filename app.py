@@ -113,8 +113,9 @@ from storage import (
 from tools import (
     get_embedding, get_devops_debug_log, get_generated_file,
     _store_generated_file,
-    _devops_request_with_retry, _devops_url, _devops_headers,
+    _devops_url, _devops_headers,
 )
+from http_helpers import devops_request_with_retry as _devops_request_with_retry
 from tool_registry import get_registered_tool_names
 from learning import invalidate_prompt_rules_cache
 from agent import (
