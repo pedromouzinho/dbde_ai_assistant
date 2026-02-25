@@ -237,6 +237,3 @@ def _register_miro_tool() -> None:
         logging.info("[Miro] search_miro registada")
     else:
         logging.warning("[Miro] search_miro registada sem token (vai devolver erro controlado)")
-
-
-_register_miro_tool()

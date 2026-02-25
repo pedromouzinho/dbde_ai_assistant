@@ -264,6 +264,3 @@ def _register_figma_tool() -> None:
         logging.info("[Figma] search_figma registada")
     else:
         logging.warning("[Figma] search_figma registada sem token (vai devolver erro controlado)")
-
-
-_register_figma_tool()

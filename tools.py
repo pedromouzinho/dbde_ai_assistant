@@ -134,12 +134,20 @@ def _register_builtin_tools() -> None:
 
 _register_builtin_tools()
 
-# Optional integrations (registo condicional por token em env).
-for _optional_module in ("tools_figma", "tools_miro"):
-    try:
-        __import__(_optional_module)
-    except Exception:
-        logging.exception("[Tools] optional module %s failed to load", _optional_module)
+# Optional integrations (registo explícito sem side-effects de import).
+try:
+    from tools_figma import _register_figma_tool
+
+    _register_figma_tool()
+except Exception:
+    logging.exception("[Tools] optional module tools_figma failed to load/register")
+
+try:
+    from tools_miro import _register_miro_tool
+
+    _register_miro_tool()
+except Exception:
+    logging.exception("[Tools] optional module tools_miro failed to load/register")
 
 
 _SEARCH_FIGMA_PROXY_DEFINITION = {
