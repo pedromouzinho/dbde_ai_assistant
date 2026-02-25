@@ -1,0 +1,113 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  azureSubscription: 'Azure subscription 1'
+  appName: 'millennium-ai-assistant'
+  resourceGroup: 'rg-MS_Access_Chabot'
+  pythonVersion: '3.12'
+
+stages:
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      - job: BuildJob
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install dependencies'
+
+          - script: |
+              python -c "import app; print('Import OK')"
+              python -c "from tools import execute_tool, get_all_tool_definitions; print('Tools OK')"
+              python -c "from http_helpers import search_request_with_retry; print('Helpers OK')"
+            displayName: 'Smoke test imports'
+
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+
+          - publish: '$(Build.ArtifactStagingDirectory)/app.zip'
+            artifact: 'drop'
+
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: Build
+    jobs:
+      - deployment: DeployStaging
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'drop'
+
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    appType: 'webAppLinux'
+                    appName: '$(appName)'
+                    deployToSlotOrASE: true
+                    resourceGroupName: '$(resourceGroup)'
+                    slotName: 'staging'
+                    package: '$(Pipeline.Workspace)/drop/app.zip'
+
+  - stage: SmokeTest
+    displayName: 'Smoke Test Staging'
+    dependsOn: DeployStaging
+    jobs:
+      - job: SmokeTest
+        steps:
+          - script: |
+              echo "Waiting 30s for staging to warm up..."
+              sleep 30
+
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$(appName)-staging.azurewebsites.net/health)
+              echo "Health check: $STATUS"
+              if [ "$STATUS" != "200" ]; then
+                echo "FAILED: Health check returned $STATUS"
+                exit 1
+              fi
+
+              DEEP=$(curl -s https://$(appName)-staging.azurewebsites.net/health?deep=true)
+              echo "Deep health: $DEEP"
+
+              echo "Smoke test PASSED"
+            displayName: 'Run smoke tests on staging'
+
+  - stage: SwapToProduction
+    displayName: 'Swap Staging to Production'
+    dependsOn: SmokeTest
+    jobs:
+      - deployment: SwapSlots
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az webapp deployment slot swap \
+                        --name $(appName) \
+                        --resource-group $(resourceGroup) \
+                        --slot staging \
+                        --target-slot production
+                  displayName: 'Swap staging to production'
