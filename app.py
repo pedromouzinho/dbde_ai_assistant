@@ -123,7 +123,7 @@ from agent import (
     switch_conversation_mode,
 )
 from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_report
-from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
+from llm_provider import llm_simple, get_debug_log as get_llm_debug_log, close_all_providers
 from rate_limit_storage import TableStorageRateLimit
 from job_store import PersistentJobStore
 from utils import odata_escape, safe_blob_component, create_logged_task
@@ -880,6 +880,7 @@ async def shutdown_event():
         _inline_export_worker_task = None
     if http_client:
         await http_client.aclose()
+    await close_all_providers()
 
 # =============================================================================
 # LEARNING / FEW-SHOT HELPERS
