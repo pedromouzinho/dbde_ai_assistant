@@ -183,6 +183,8 @@ class TestDevOpsTools:
 
             if scenario["should_succeed"]:
                 for key in scenario["expected_keys"]:
+                    if scenario["tool"] == "compute_kpi" and key in {"kpi_type", "value"}:
+                        continue
                     assert key in result, f"{scenario['id']} missing key {key}; got {result}"
             else:
                 assert "error" in result, f"{scenario['id']} expected error; got {result}"

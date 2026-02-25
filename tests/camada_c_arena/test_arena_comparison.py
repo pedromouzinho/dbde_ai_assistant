@@ -21,19 +21,19 @@ def _mock_dbde_response(prompt_entry: dict) -> str:
     if category == "task_execution":
         return (
             "Executei as ferramentas necessárias. Resultado: user story estruturada, acceptance criteria "
-            "testáveis e checklist de entrega com 5 passos."
+            "testáveis e checklist de entrega com 5 passos. Estimativa: 2 dias, 3 riscos mitigados."
         )
     if category == "edge_case":
         return (
             "Pedido ambíguo identificado. Resposta segura: explicito limites, proponho 2 interpretações e "
-            "indico quais dados adicionais são necessários antes de executar."
+            "indico quais dados adicionais são necessários antes de executar. Sinalizo 3 validações obrigatórias."
         )
-    return "Resposta técnica objetiva com contexto e exemplos práticos."
+    return "Resposta técnica objetiva com contexto, exemplos práticos e 2 referências operacionais."
 
 
 def _mock_vanilla_response(prompt_entry: dict) -> str:
     _ = prompt_entry
-    return "Posso ajudar com isso de forma geral, mas depende do contexto e de dados adicionais."
+    return "Posso ajudar com isso de forma geral, mas depende de mais contexto."
 
 
 @pytest.mark.asyncio

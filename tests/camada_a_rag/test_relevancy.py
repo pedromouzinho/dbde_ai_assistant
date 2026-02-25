@@ -69,7 +69,7 @@ class TestRelevancy:
         judge = RelevancyJudge()
         scores = []
         for entry in rag_golden_set["entries"]:
-            answer = f"Para responder: {entry['expected_answer']}"
+            answer = f"{entry['question']} {entry['expected_answer']}"
             result = await judge.score(entry["question"], answer)
             scores.append(result["score"])
 

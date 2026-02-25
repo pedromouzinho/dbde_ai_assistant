@@ -32,6 +32,7 @@ OPTIONAL_TOOLS = ["search_figma", "search_miro"]
 
 def _load_registry_or_skip():
     try:
+        import tools  # noqa: F401 - garante registo das tools no registry
         from tool_registry import execute_tool, get_all_tool_definitions, get_registered_tool_names
 
         return execute_tool, get_all_tool_definitions, get_registered_tool_names
