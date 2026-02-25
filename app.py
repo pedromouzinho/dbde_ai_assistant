@@ -834,7 +834,7 @@ async def startup_event():
     except Exception as e:
         logger.warning("Blob container init error: %s — continuing anyway", e)
     if INLINE_WORKER_ENABLED_EFFECTIVE:
-        _inline_worker_task = asyncio.create_task(_upload_worker_loop(), name="upload-inline-worker")
+        _inline_worker_task = create_logged_task(_upload_worker_loop(), name="upload-inline-worker")
         logger.info(
             "Inline upload worker enabled (poll=%.1fs, batch=%s)",
             UPLOAD_WORKER_POLL_SECONDS,
@@ -847,7 +847,7 @@ async def startup_event():
             INLINE_WORKER_RUNTIME_GUARD,
         )
     if EXPORT_INLINE_WORKER_ENABLED_EFFECTIVE:
-        _inline_export_worker_task = asyncio.create_task(_export_worker_loop(), name="export-inline-worker")
+        _inline_export_worker_task = create_logged_task(_export_worker_loop(), name="export-inline-worker")
         logger.info(
             "Inline export worker enabled (poll=%.1fs, batch=%s)",
             EXPORT_WORKER_POLL_SECONDS,
