@@ -2328,44 +2328,43 @@ async def _run_digest_section(section_name: str, wiql_query: str) -> dict:
     batch_errors = []
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            wiql_resp = await _devops_request_with_retry(
-                client,
-                "POST",
-                _devops_url("wit/wiql?api-version=7.1"),
-                headers,
-                {"query": wiql_query},
-                max_retries=3,
-            )
-            if "error" in wiql_resp:
-                section["error"] = wiql_resp["error"]
-                return section
-
-            ids = [wi.get("id") for wi in wiql_resp.get("workItems", []) if wi.get("id")]
-            section["count"] = len(ids)
-            if not ids:
-                return section
-
-            details = []
-            for i in range(0, len(ids), 100):
-                batch = ids[i:i + 100]
-                batch_resp = await _devops_request_with_retry(
-                    client,
-                    "POST",
-                    _devops_url("wit/workitemsbatch?api-version=7.1"),
-                    headers,
-                    {"ids": batch, "fields": _DIGEST_FIELDS},
-                    max_retries=3,
-                )
-                if "error" in batch_resp:
-                    batch_errors.append(batch_resp["error"])
-                    continue
-                details.extend(batch_resp.get("value", []))
-
-            section["items"] = [_digest_format_item(item) for item in details]
-            if batch_errors:
-                section["error"] = "; ".join(batch_errors[:3])
+        wiql_resp = await _devops_request_with_retry(
+            "POST",
+            _devops_url("wit/wiql?api-version=7.1"),
+            headers,
+            {"query": wiql_query},
+            max_retries=3,
+            timeout=60,
+        )
+        if "error" in wiql_resp:
+            section["error"] = wiql_resp["error"]
             return section
+
+        ids = [wi.get("id") for wi in wiql_resp.get("workItems", []) if wi.get("id")]
+        section["count"] = len(ids)
+        if not ids:
+            return section
+
+        details = []
+        for i in range(0, len(ids), 100):
+            batch = ids[i:i + 100]
+            batch_resp = await _devops_request_with_retry(
+                "POST",
+                _devops_url("wit/workitemsbatch?api-version=7.1"),
+                headers,
+                {"ids": batch, "fields": _DIGEST_FIELDS},
+                max_retries=3,
+                timeout=60,
+            )
+            if "error" in batch_resp:
+                batch_errors.append(batch_resp["error"])
+                continue
+            details.extend(batch_resp.get("value", []))
+
+        section["items"] = [_digest_format_item(item) for item in details]
+        if batch_errors:
+            section["error"] = "; ".join(batch_errors[:3])
+        return section
     except Exception as e:
         section["error"] = f"{section_name} failed: {str(e)}"
         return section
