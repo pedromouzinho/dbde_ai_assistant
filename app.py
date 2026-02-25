@@ -125,6 +125,7 @@ from agent import (
 from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_report
 from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
 from rate_limit_storage import TableStorageRateLimit
+from job_store import PersistentJobStore
 
 # =============================================================================
 # APP SETUP
@@ -623,7 +624,7 @@ async def _load_fresh_export_job_state(job_id: str, in_memory_job: Optional[dict
     if not storage_job:
         return in_memory_job
     if not in_memory_job:
-        export_jobs_store[job_id] = storage_job
+        await export_jobs_store.put(job_id, storage_job)
         return storage_job
 
     mem_status = str(in_memory_job.get("status", "")).lower()
@@ -637,7 +638,7 @@ async def _load_fresh_export_job_state(job_id: str, in_memory_job: Optional[dict
     status_promoted = mem_status in ("queued", "processing") and stg_status in ("completed", "failed")
     storage_newer = stg_ts is not None and (mem_ts is None or stg_ts >= mem_ts)
     if status_promoted or storage_newer:
-        export_jobs_store[job_id] = storage_job
+        await export_jobs_store.put(job_id, storage_job)
         return storage_job
     return in_memory_job
 
@@ -684,7 +685,7 @@ async def _queue_export_job(
         "error": "",
         "result": None,
     }
-    export_jobs_store[job_id] = job
+    await export_jobs_store.put(job_id, job)
     await _persist_export_job(job)
     return job
 
@@ -728,13 +729,13 @@ async def _process_export_job(job: dict) -> None:
 
 async def _run_export_job(job_id: str) -> None:
     _cleanup_export_jobs()
-    job = export_jobs_store.get(job_id)
+    job = await export_jobs_store.get_or_fetch(job_id)
     if not job:
         loaded = await _load_export_job_from_storage(job_id)
         if not loaded:
             return
         job = loaded
-        export_jobs_store[job_id] = job
+        await export_jobs_store.put(job_id, job)
 
     if str(job.get("status", "")).lower() in ("completed", "failed"):
         return
@@ -755,7 +756,7 @@ async def _run_export_job(job_id: str) -> None:
         finally:
             job["finished_at"] = datetime.now(timezone.utc).isoformat()
             job["updated_at"] = datetime.now(timezone.utc).isoformat()
-            export_jobs_store[str(job.get("job_id", ""))] = job
+            await export_jobs_store.put(str(job.get("job_id", "")), job)
             await _persist_export_job(job)
 
 
@@ -794,13 +795,13 @@ async def process_export_jobs_once(max_jobs: int = EXPORT_WORKER_BATCH_SIZE) -> 
         job["status"] = "processing"
         job["started_at"] = datetime.now(timezone.utc).isoformat()
         job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        export_jobs_store[job_id] = job
+        await export_jobs_store.put(job_id, job)
         await _persist_export_job(job)
         claimed += 1
 
         latest = await _load_export_job_from_storage(job_id)
         if latest:
-            export_jobs_store[job_id] = latest
+            await export_jobs_store.put(job_id, latest)
             if str(latest.get("claim_token", "")) != claim_token:
                 skipped += 1
                 continue
@@ -996,10 +997,10 @@ EXPORT_WORKER_INSTANCE_ID = os.getenv("EXPORT_WORKER_INSTANCE_ID", f"export-web-
 EXPORT_INLINE_WORKER_ENABLED_EFFECTIVE = bool(EXPORT_INLINE_WORKER_ENABLED and INLINE_WORKER_RUNTIME_GUARD)
 EXPORT_JOB_TTL_SECONDS = 24 * 3600
 
-upload_jobs_store: Dict[str, Dict[str, Any]] = {}
+upload_jobs_store = PersistentJobStore("UploadJobs", partition_key="upload-cache")
 _upload_jobs_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOAD_JOBS)
 _upload_conv_locks: Dict[str, asyncio.Lock] = {}
-export_jobs_store: Dict[str, Dict[str, Any]] = {}
+export_jobs_store = PersistentJobStore("ExportJobs", partition_key="export-cache")
 _export_jobs_semaphore = asyncio.Semaphore(max(1, EXPORT_MAX_CONCURRENT_JOBS))
 
 
@@ -1201,7 +1202,7 @@ async def _load_fresh_job_state(job_id: str, in_memory_job: Optional[dict]) -> O
     if not storage_job:
         return in_memory_job
     if not in_memory_job:
-        upload_jobs_store[job_id] = storage_job
+        await upload_jobs_store.put(job_id, storage_job)
         return storage_job
 
     mem_status = str(in_memory_job.get("status", "")).lower()
@@ -1216,7 +1217,7 @@ async def _load_fresh_job_state(job_id: str, in_memory_job: Optional[dict]) -> O
     status_promoted = mem_status in ("queued", "processing") and stg_status in ("completed", "failed")
     storage_newer = stg_ts is not None and (mem_ts is None or stg_ts >= mem_ts)
     if status_promoted or storage_newer:
-        upload_jobs_store[job_id] = storage_job
+        await upload_jobs_store.put(job_id, storage_job)
         return storage_job
     return in_memory_job
 
@@ -1480,7 +1481,7 @@ async def _mark_job_failed(job: dict, reason: str) -> dict:
     job["error"] = reason
     job["finished_at"] = now_iso
     job["updated_at"] = now_iso
-    upload_jobs_store[str(job.get("job_id", ""))] = job
+    await upload_jobs_store.put(str(job.get("job_id", "")), job)
     await _persist_upload_job(job)
     return job
 
@@ -1760,13 +1761,13 @@ async def _process_upload_job(job: dict) -> None:
 
 async def _run_upload_job(job_id: str) -> None:
     _cleanup_upload_jobs()
-    job = upload_jobs_store.get(job_id)
+    job = await upload_jobs_store.get_or_fetch(job_id)
     if not job:
         loaded = await _load_upload_job_from_storage(job_id)
         if not loaded:
             return
         job = loaded
-        upload_jobs_store[job_id] = job
+        await upload_jobs_store.put(job_id, job)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     if str(job.get("status", "")).lower() in ("completed", "failed"):
@@ -1787,7 +1788,7 @@ async def _run_upload_job(job_id: str) -> None:
         finally:
             job["finished_at"] = datetime.now(timezone.utc).isoformat()
             job["updated_at"] = datetime.now(timezone.utc).isoformat()
-            upload_jobs_store[str(job.get("job_id", ""))] = job
+            await upload_jobs_store.put(str(job.get("job_id", "")), job)
             await _persist_upload_job(job)
 
 
@@ -1825,7 +1826,7 @@ async def _queue_upload_job(
         "text_blob_name": blob_paths["text_blob_name"],
         "chunks_blob_name": blob_paths["chunks_blob_name"],
     }
-    upload_jobs_store[job_id] = job
+    await upload_jobs_store.put(job_id, job)
     await _persist_upload_job(job)
     # Processamento é feito por worker (inline loop ou worker externo).
     return job
@@ -1867,13 +1868,13 @@ async def process_upload_jobs_once(max_jobs: int = UPLOAD_WORKER_BATCH_SIZE) -> 
         job["status"] = "processing"
         job["started_at"] = datetime.now(timezone.utc).isoformat()
         job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        upload_jobs_store[job_id] = job
+        await upload_jobs_store.put(job_id, job)
         await _persist_upload_job(job)
         claimed += 1
 
         latest = await _load_upload_job_from_storage(job_id)
         if latest:
-            upload_jobs_store[job_id] = latest
+            await upload_jobs_store.put(job_id, latest)
             if str(latest.get("claim_token", "")) != claim_token:
                 skipped += 1
                 continue
@@ -2096,7 +2097,7 @@ async def upload_job_status(
     user = get_current_user(credentials)
     _cleanup_upload_jobs()
 
-    job = upload_jobs_store.get(job_id)
+    job = await upload_jobs_store.get_or_fetch(job_id)
     job = await _load_fresh_job_state(job_id, job)
 
     if not job:
@@ -2136,7 +2137,7 @@ async def upload_jobs_status_batch(
     stale_msg = "Upload interrompido por timeout/stale (possível restart do servidor). Reenvia o ficheiro."
     items = []
     for job_id in job_ids:
-        job = upload_jobs_store.get(job_id)
+        job = await upload_jobs_store.get_or_fetch(job_id)
         job = await _load_fresh_job_state(job_id, job)
         if not job:
             items.append({"job_id": job_id, "status": "not_found", "error": "Upload job não encontrado"})
@@ -2533,7 +2534,7 @@ async def export_job_status(request: Request, job_id: str, credentials: HTTPAuth
     is_admin = user.get("role") == "admin"
 
     _cleanup_export_jobs()
-    job = export_jobs_store.get(job_id)
+    job = await export_jobs_store.get_or_fetch(job_id)
     job = await _load_fresh_export_job_state(job_id, job)
     if not job:
         raise HTTPException(404, "Export job não encontrado")
