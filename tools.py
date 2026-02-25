@@ -2,7 +2,7 @@
 # tools.py — Fachada de compatibilidade (reexporta módulos de domínio)
 # =============================================================================
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from tools_devops import (
     get_devops_debug_log,
     _devops_headers,
@@ -385,7 +385,7 @@ def get_agent_system_prompt():
     return f"""Tu és o Assistente IA do Millennium BCP para a equipa de desenvolvimento DIT/ADMChannels.
 Tens acesso a ferramentas para consultar dados reais do Azure DevOps e do site MSE.
 
-DATA ACTUAL: {datetime.now().strftime('%Y-%m-%d')} (usa esta data como referência para queries temporais)
+DATA ACTUAL: {datetime.now(timezone.utc).strftime('%Y-%m-%d')} (usa esta data como referência para queries temporais)
 
 REGRAS DE CLARIFICAÇÃO (IMPORTANTE):
 - Se a pergunta do utilizador mencionar um NOME DE PESSOA que pode corresponder a múltiplas pessoas, DEVES perguntar qual pessoa antes de executar. Isto é OBRIGATÓRIO.
@@ -452,7 +452,7 @@ EXEMPLOS DE WIQL:
 def get_userstory_system_prompt():
     return f"""Tu és PO Sénior especialista no MSE (Millennium Site Empresas).
 Objetivo: transformar pedidos em User Stories rigorosas, refinadas iterativamente.
-DATA: {datetime.now().strftime('%Y-%m-%d')}
+DATA: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
 MODO OBRIGATÓRIO: DRAFT → REVIEW → FINAL
 1) DRAFT: gera primeiro uma versão inicial (clara e completa) com base no pedido.

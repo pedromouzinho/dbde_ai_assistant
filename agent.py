@@ -316,7 +316,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
     if files:
         uploaded_files_store[conv_id] = {
             "files": files[-MAX_FILES_CONTEXT:],
-            "uploaded_at": datetime.now().isoformat(),
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "from_index": True,
         }
 
@@ -519,7 +519,7 @@ async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> b
         conversations[conv_id] = messages
         conversation_meta[conv_id] = {
             "mode": stored_mode,
-            "created_at": row.get("CreatedAt", datetime.now().isoformat()),
+            "created_at": row.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
             "loaded_from_storage": True,
         }
 
@@ -540,7 +540,7 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
             # Conversa nova
             sp = get_userstory_system_prompt() if mode == "userstory" else get_agent_system_prompt()
             conversations[conv_id] = [{"role": "system", "content": sp}]
-            conversation_meta[conv_id] = {"mode": mode, "created_at": datetime.now().isoformat()}
+            conversation_meta[conv_id] = {"mode": mode, "created_at": datetime.now(timezone.utc).isoformat()}
     else:
         conversations.touch(conv_id)
     return conv_id
@@ -851,8 +851,8 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                 "RowKey": conv_id,
                 "Messages": messages_json,
                 "Mode": meta.get("mode", "general"),
-                "CreatedAt": meta.get("created_at", datetime.now().isoformat()),
-                "UpdatedAt": datetime.now().isoformat(),
+                "CreatedAt": meta.get("created_at", datetime.now(timezone.utc).isoformat()),
+                "UpdatedAt": datetime.now(timezone.utc).isoformat(),
                 "MessageCount": len(compact),
             }
 
@@ -1019,7 +1019,7 @@ async def _execute_tool_calls(
 # =============================================================================
 
 async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse:
-    start = datetime.now()
+    start = datetime.now(timezone.utc)
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
@@ -1114,7 +1114,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
         except Exception:
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
     
-    total_time = int((datetime.now() - start).total_seconds() * 1000)
+    total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     
     return AgentChatResponse(
         answer=answer,
@@ -1136,7 +1136,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
 async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGenerator[str, None]:
     """SSE streaming — yields 'data: {json}\n\n' strings."""
-    start = datetime.now()
+    start = datetime.now(timezone.utc)
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
@@ -1257,7 +1257,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
         except Exception:
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
     
-    total_time = int((datetime.now() - start).total_seconds() * 1000)
+    total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     has_exportable = False
     export_idx = None
     for idx, d in enumerate(tool_details):

@@ -1022,7 +1022,7 @@ def _normalize_uploaded_conv_entry(conv_id: str) -> dict:
 
     normalized = {
         "files": files,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
     uploaded_files_store[conv_id] = normalized
     return normalized
@@ -1052,7 +1052,7 @@ def _append_uploaded_entry(conv_id: str, store_entry: dict) -> list:
     if len(files) > MAX_FILES_PER_CONVERSATION:
         files = files[-MAX_FILES_PER_CONVERSATION:]
     conv_entry["files"] = files
-    conv_entry["updated_at"] = datetime.now().isoformat()
+    conv_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
     uploaded_files_store[conv_id] = conv_entry
     return [_file_entry_summary(f) for f in conv_entry.get("files", [])]
 
@@ -1323,7 +1323,7 @@ async def _refresh_conversation_files_from_index(conv_id: str, user_sub: str = "
     entries = [_upload_index_row_to_memory_entry(r) for r in rows_sorted[-MAX_FILES_PER_CONVERSATION:]]
     uploaded_files_store[conv_id] = {
         "files": entries,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "from_index": True,
     }
     return [_file_entry_summary(e) for e in entries]
@@ -1611,7 +1611,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "row_count": row_count,
         "col_names": col_names,
         "truncated": truncated,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
     if image_base64:
         store_entry["image_base64"] = image_base64

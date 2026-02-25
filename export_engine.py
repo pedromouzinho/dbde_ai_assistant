@@ -12,7 +12,7 @@ import logging
 import html as html_lib
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from urllib.parse import urlparse
 
@@ -296,6 +296,7 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     
     # Subtitle
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    # Local time intentional for user-facing display.
     sub = ws.cell(row=2, column=1, value=f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: {tool_result.get('total_count', len(rows))} registos")
     sub.font = Font(size=9, color="666666", italic=True)
     
@@ -362,6 +363,7 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         # Subtitle
         pdf.set_font(font_family, '', 9)
         pdf.set_text_color(100, 100, 100)
+        # Local time intentional for user-facing display.
         pdf.multi_cell(0, 5, _latin1_safe(f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | {EXPORT_AGENT_NAME}"))
         if summary:
             pdf.set_font(font_family, 'I', 8.5)
@@ -512,6 +514,7 @@ def to_svg_bar_chart(tool_result: dict, title: str = "Chart") -> str:
         y += bar_h
     
     # Footer
+    # Local time intentional for user-facing display.
     svg.append(f'<text x="{chart_w//2}" y="{total_h - 10}" text-anchor="middle" font-size="9" fill="#999">{EXPORT_AGENT_NAME} | {datetime.now().strftime("%d/%m/%Y")}</text>')
     svg.append('</svg>')
     
@@ -528,6 +531,7 @@ def to_html_report(tool_result: dict, title: str = "Relatório", summary: str = 
     safe_title = html_lib.escape(str(title or "Relatório"))
     safe_summary = html_lib.escape(str(summary or ""))
     total_count = html_lib.escape(str(tool_result.get('total_count', len(rows))))
+    # Local time intentional for user-facing display.
     generated_at = html_lib.escape(datetime.now().strftime('%d/%m/%Y %H:%M'))
     
     html = f"""<!DOCTYPE html>

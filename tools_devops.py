@@ -40,7 +40,7 @@ _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
 
 def _log(msg):
-    _devops_debug_log.append({"ts": datetime.now().isoformat(), "msg": msg})
+    _devops_debug_log.append({"ts": datetime.now(timezone.utc).isoformat(), "msg": msg})
     logging.info("[Tools] %s", msg)
 
 _WIQL_BLOCKLIST_RE = re.compile(
@@ -322,7 +322,10 @@ async def tool_query_workitems(wiql_where, fields=None, top=200):
         if failed_ids and not items:
             items = [{"id":fid,"type":"","title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed_ids]
         result = {"total_count": total_count, "items_returned": len(items), "items": items}
-        await _attach_auto_csv_export(result, title_hint=f"query_workitems_{datetime.now().strftime('%Y%m%d_%H%M')}")
+        await _attach_auto_csv_export(
+            result,
+            title_hint=f"query_workitems_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}",
+        )
         if failed_ids: result["_partial"] = True; result["_failed_batch_count"] = len(failed_ids)
         return result
 
@@ -875,4 +878,3 @@ Responde APENAS em JSON válido neste formato:
         "ready_to_apply": True,
         "note": "Esta tool não altera o work item no DevOps; gera proposta para revisão DRAFT->REVIEW->FINAL.",
     }
-

@@ -37,7 +37,7 @@ def get_debug_log() -> list:
     return list(_llm_debug_log)
 
 def _log(msg: str):
-    entry = {"ts": datetime.now().isoformat(), "msg": msg}
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg}
     _llm_debug_log.append(entry)
     logger.info("[LLM] %s", msg)
 
