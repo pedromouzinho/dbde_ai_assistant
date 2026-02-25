@@ -51,7 +51,38 @@ Avalia cada critério de 1-5 para cada resposta. Responde em JSON:
                 "reasoning": "mock heuristic",
             }
 
-        raise NotImplementedError("Real LLM mode not yet integrated")
+        from llm_provider import llm_simple
+        import json as _json
+
+        criteria_text = "\n".join(f"- {c}" for c in criteria) if criteria else "- Qualidade geral"
+        prompt = self.JUDGE_PROMPT.format(
+            question=question,
+            criteria=criteria_text,
+            response_a=response_a,
+            response_b=response_b,
+        )
+
+        raw = await llm_simple(
+            prompt,
+            tier=eval_config.JUDGE_MODEL_TIER,
+            max_tokens=eval_config.JUDGE_MAX_TOKENS,
+        )
+
+        try:
+            parsed = _json.loads(raw)
+            return {
+                "winner": str(parsed.get("winner", "tie")),
+                "score_a": float(parsed.get("score_a", 3.0)),
+                "score_b": float(parsed.get("score_b", 3.0)),
+                "reasoning": str(parsed.get("reasoning", "no reasoning")),
+            }
+        except Exception:
+            return {
+                "winner": "tie",
+                "score_a": 3.0,
+                "score_b": 3.0,
+                "reasoning": f"parse_error: {str(raw)[:200]}",
+            }
 
     def _heuristic_score(self, response, criteria):
         text = str(response or "")
