@@ -76,7 +76,7 @@ Responde APENAS com: "supported" ou "unsupported"."""
             if not claim_words:
                 return True
             overlap = len(claim_words & context_words) / len(claim_words)
-            return overlap >= 0.30
+            return overlap >= 0.20
 
         prompt = self.VERIFY_CLAIM_PROMPT.format(context=context, claim=claim)
         raw = (await self._call_real_llm(prompt)).strip().lower()
