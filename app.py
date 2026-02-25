@@ -16,18 +16,18 @@ import logging
 import traceback
 import re
 import hashlib
+import time
 from pathlib import Path
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, Tuple
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
 
 
 class JSONFormatter(logging.Formatter):
@@ -124,6 +124,7 @@ from agent import (
 )
 from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_report
 from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
+from rate_limit_storage import TableStorageRateLimit
 
 # =============================================================================
 # APP SETUP
@@ -174,21 +175,88 @@ def _user_or_ip_rate_key(request: Request) -> str:
     return f"ip:{_client_ip(request)}"
 
 
-def _retry_after_from_limit_detail(exc: RateLimitExceeded) -> int:
-    detail = str(getattr(exc, "detail", "") or "")
-    m = re.search(r"per\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", detail, re.IGNORECASE)
-    if not m:
-        return 60
-    qty = int(m.group(1))
-    unit = m.group(2).lower()
-    factor = 1
-    if unit.startswith("minute"):
-        factor = 60
-    elif unit.startswith("hour"):
-        factor = 3600
-    elif unit.startswith("day"):
-        factor = 86400
-    return max(1, qty * factor)
+@dataclass(frozen=True)
+class _RateLimitRule:
+    max_requests: int
+    window_seconds: int
+    key_func: Callable[[Request], str]
+    scope: Optional[str] = None
+
+
+class _DecoratorRateLimiter:
+    """Compat layer para manter @limiter.limit e @limiter.shared_limit."""
+
+    def __init__(self, key_func: Callable[[Request], str]):
+        self._default_key_func = key_func
+
+    @staticmethod
+    def _parse_limit(limit_spec: str) -> Tuple[int, int]:
+        text = str(limit_spec or "").strip().lower()
+        match = re.fullmatch(r"(\d+)\s*/\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
+        if not match:
+            raise ValueError(f"Rate limit inválido: {limit_spec}")
+        amount = int(match.group(1))
+        unit = match.group(2)
+        factor = 1
+        if unit.startswith("minute"):
+            factor = 60
+        elif unit.startswith("hour"):
+            factor = 3600
+        elif unit.startswith("day"):
+            factor = 86400
+        return amount, factor
+
+    def limit(self, limit_spec: str, key_func: Optional[Callable[[Request], str]] = None):
+        max_requests, window_seconds = self._parse_limit(limit_spec)
+        resolved_key_func = key_func or self._default_key_func
+
+        def decorator(fn):
+            setattr(
+                fn,
+                "__dbde_rate_limit__",
+                _RateLimitRule(
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    key_func=resolved_key_func,
+                    scope=None,
+                ),
+            )
+            return fn
+
+        return decorator
+
+    def shared_limit(
+        self,
+        limit_spec: str,
+        scope: str,
+        key_func: Optional[Callable[[Request], str]] = None,
+    ):
+        max_requests, window_seconds = self._parse_limit(limit_spec)
+        resolved_key_func = key_func or self._default_key_func
+        shared_scope = str(scope or "").strip()
+
+        def decorator(fn):
+            setattr(
+                fn,
+                "__dbde_rate_limit__",
+                _RateLimitRule(
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    key_func=resolved_key_func,
+                    scope=shared_scope if shared_scope else None,
+                ),
+            )
+            return fn
+
+        return decorator
+
+    @staticmethod
+    def resolve(request: Request) -> Optional[_RateLimitRule]:
+        route = request.scope.get("route")
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        return getattr(endpoint, "__dbde_rate_limit__", None)
 
 
 def _request_is_https(request: Request) -> bool:
@@ -196,7 +264,9 @@ def _request_is_https(request: Request) -> bool:
     return request.url.scheme == "https" or proto == "https"
 
 
-limiter = Limiter(key_func=_user_or_ip_rate_key, default_limits=[])
+_rate_limiter_backend = TableStorageRateLimit()
+_last_rate_cache_cleanup = 0.0
+limiter = _DecoratorRateLimiter(key_func=_user_or_ip_rate_key)
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION, description=APP_DESCRIPTION)
 app.state.limiter = limiter
@@ -209,23 +279,38 @@ app.add_middleware(
 http_client: Optional[httpx.AsyncClient] = None
 
 
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
-    retry_after = _retry_after_from_limit_detail(exc)
-    return JSONResponse(
-        status_code=429,
-        content={"detail": f"Limite de pedidos excedido. Tenta novamente em {retry_after} segundos."},
-        headers={"Retry-After": str(retry_after)},
-    )
-
-
 @app.middleware("http")
 async def enforce_allowed_origins(request: Request, call_next):
+    global _last_rate_cache_cleanup
     token_ref = set_request_cookie_token((request.cookies.get(AUTH_COOKIE_NAME) or "").strip())
     try:
         origin = request.headers.get("origin")
         if origin and _allowed_origins_set and origin not in _allowed_origins_set:
             return JSONResponse(status_code=403, content={"detail": "Origin não permitida"})
+
+        now = time.time()
+        if now - _last_rate_cache_cleanup > 60:
+            _rate_limiter_backend.cleanup_local_cache()
+            _last_rate_cache_cleanup = now
+
+        rule = limiter.resolve(request)
+        if rule:
+            route = request.scope.get("route")
+            route_template = str(getattr(route, "path", request.url.path) or request.url.path)
+            scope = rule.scope or f"route:{route_template}"
+            rate_key = f"{scope}:{rule.key_func(request)}"
+            limited = await _rate_limiter_backend.is_rate_limited(
+                key=rate_key,
+                limit=rule.max_requests,
+                window_seconds=rule.window_seconds,
+            )
+            if limited:
+                retry_after = max(1, int(rule.window_seconds))
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": f"Limite de pedidos excedido. Tenta novamente em {retry_after} segundos."},
+                    headers={"Retry-After": str(retry_after)},
+                )
         return await call_next(request)
     finally:
         reset_request_cookie_token(token_ref)
