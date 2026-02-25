@@ -615,6 +615,7 @@ def _parse_provider_spec(spec: str) -> tuple[str, str]:
 
 
 def _should_route_tier_with_model_router(tier: str) -> bool:
+    """Check if this tier should use the Model Router deployment."""
     if not MODEL_ROUTER_ENABLED:
         return False
     if MODEL_ROUTER_NON_PROD_ONLY and IS_PRODUCTION:
