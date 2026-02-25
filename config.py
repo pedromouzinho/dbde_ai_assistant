@@ -9,6 +9,7 @@ import os
 import secrets
 import logging
 import hashlib
+import re
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -228,7 +229,8 @@ UPLOAD_WORKER_BATCH_SIZE = int(_get_env("UPLOAD_WORKER_BATCH_SIZE", "4"))
 # =============================================================================
 # EXPORT CONFIG
 # =============================================================================
-EXPORT_BRAND_COLOR = "#DE3163"  # Cerise (branding UI/export)
+_EXPORT_BRAND_COLOR_RAW = _get_env("EXPORT_BRAND_COLOR", "#DE3163")
+EXPORT_BRAND_COLOR = _EXPORT_BRAND_COLOR_RAW if re.fullmatch(r"#[0-9A-Fa-f]{6}", _EXPORT_BRAND_COLOR_RAW) else "#DE3163"
 EXPORT_BRAND_NAME = "Millennium BCP"
 EXPORT_AGENT_NAME = "Assistente AI DBDE"
 EXPORT_AUTO_ASYNC_ENABLED = _get_env("EXPORT_AUTO_ASYNC_ENABLED", "true").lower() == "true"
