@@ -37,8 +37,8 @@ class TableStorageRateLimit:
         window_start = int(now / window_seconds) * window_seconds
         cache_key = f"{key}:{window_start}"
 
-        # Fast path: cache local desta instância.
         async with self._lock:
+            # Fast path: cache local desta instância.
             cached_count = self._local_cache.get(cache_key)
             if cached_count is not None:
                 next_count = cached_count + 1
@@ -50,27 +50,26 @@ class TableStorageRateLimit:
                 )
                 return limited
 
-        # Slow path: consultar storage.
-        count = 0
-        try:
-            filter_expr = f"PartitionKey eq '{key}' and RowKey eq '{int(window_start)}'"
-            rows = await table_query(RATE_LIMIT_TABLE, filter_expr, top=1)
-            if rows:
-                count = int(rows[0].get("Count", 0) or 0)
-        except Exception as e:
-            logger.warning("[RateLimit] Table read failed, allowing request: %s", e)
+            # Slow path: consultar storage DENTRO do lock para evitar corridas.
             count = 0
+            try:
+                filter_expr = f"PartitionKey eq '{key}' and RowKey eq '{int(window_start)}'"
+                rows = await table_query(RATE_LIMIT_TABLE, filter_expr, top=1)
+                if rows:
+                    count = int(rows[0].get("Count", 0) or 0)
+            except Exception as e:
+                logger.warning("[RateLimit] Table read failed, allowing request: %s", e)
+                count = 0
 
-        next_count = count + 1
-        async with self._lock:
+            next_count = count + 1
             self._local_cache[cache_key] = next_count
 
-        limited = next_count > limit
-        create_logged_task(
-            self._persist_count(key, int(window_start), next_count),
-            name="rate_limit_persist_slow",
-        )
-        return limited
+            limited = next_count > limit
+            create_logged_task(
+                self._persist_count(key, int(window_start), next_count),
+                name="rate_limit_persist_slow",
+            )
+            return limited
 
     async def _persist_count(self, key: str, window_start: int, count: int):
         """Persist count no Table Storage (best-effort)."""
