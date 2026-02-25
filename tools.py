@@ -3,7 +3,7 @@
 # =============================================================================
 
 import json, base64, asyncio, logging, uuid, re, math, unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from urllib.parse import quote
 from typing import Optional
@@ -89,7 +89,7 @@ async def _save_writer_profile(
     if not row_key or not analysis:
         return False
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     entity = {
         "PartitionKey": _WRITER_PROFILE_PARTITION,
         "RowKey": row_key,
@@ -159,12 +159,17 @@ async def _load_writer_profile(author_name: str):
 
 def _as_dt(value):
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
         return value
     txt = str(value or "").strip()
     if not txt:
         return None
     try:
-        return datetime.fromisoformat(txt)
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
@@ -179,7 +184,7 @@ def _generated_blob_paths(download_id: str, fmt: str = "") -> tuple[str, str]:
 
 async def _cleanup_generated_files() -> None:
     async with _generated_files_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expired_ids = [
             fid for fid, meta in _generated_files_store.items()
             if (
@@ -225,7 +230,7 @@ async def _store_generated_file(content: bytes, mime_type: str, filename: str, f
             "mime_type": mime_type,
             "filename": filename,
             "format": fmt,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
         }
     try:
         content_blob_name, meta_blob_name = _generated_blob_paths(fid, fmt)
@@ -244,7 +249,7 @@ async def _store_generated_file(content: bytes, mime_type: str, filename: str, f
                 "mime_type": mime_type,
                 "format": fmt,
                 "size_bytes": len(content),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "ttl_seconds": _GENERATED_FILE_TTL_SECONDS,
                 "content_blob_name": content_blob_name,
             },
@@ -306,8 +311,8 @@ async def get_generated_file(download_id: str):
     await _cleanup_generated_files()
     entry = _generated_files_store.get(download_id)
     if entry:
-        created_at = _as_dt(entry.get("created_at")) or datetime.utcnow()
-        if (datetime.utcnow() - created_at).total_seconds() <= _GENERATED_FILE_TTL_SECONDS:
+        created_at = _as_dt(entry.get("created_at")) or datetime.now(timezone.utc)
+        if (datetime.now(timezone.utc) - created_at).total_seconds() <= _GENERATED_FILE_TTL_SECONDS:
             return entry
         async with _generated_files_lock:
             _generated_files_store.pop(download_id, None)
@@ -321,7 +326,7 @@ async def get_generated_file(download_id: str):
 
         created_at = _as_dt(meta.get("created_at"))
         ttl_seconds = int(meta.get("ttl_seconds", _GENERATED_FILE_TTL_SECONDS) or _GENERATED_FILE_TTL_SECONDS)
-        if created_at and (datetime.utcnow() - created_at).total_seconds() > max(60, ttl_seconds):
+        if created_at and (datetime.now(timezone.utc) - created_at).total_seconds() > max(60, ttl_seconds):
             return None
 
         blob_name = str(meta.get("content_blob_name", "") or "")
@@ -337,7 +342,7 @@ async def get_generated_file(download_id: str):
             "mime_type": str(meta.get("mime_type", "") or "application/octet-stream"),
             "filename": str(meta.get("filename", "") or f"download-{download_id}"),
             "format": str(meta.get("format", "") or ""),
-            "created_at": created_at or datetime.utcnow(),
+            "created_at": created_at or datetime.now(timezone.utc),
         }
         async with _generated_files_lock:
             _generated_files_store[download_id] = hydrated

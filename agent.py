@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, AsyncGenerator, Callable, Iterator
 from collections.abc import MutableMapping
 
@@ -67,7 +67,7 @@ class ConversationStore(MutableMapping[str, List[dict]]):
 
     @staticmethod
     def _utcnow() -> datetime:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
     def _touch(self, key: str) -> None:
         self._last_accessed[key] = self._utcnow()
@@ -979,7 +979,7 @@ async def _execute_tool_calls(
             safe_user = _safe_blob_component(user_sub or "anon", 80)
             safe_conv = _safe_blob_component(conv_id, 80)
             safe_tool = _safe_blob_component(tc.name, 40)
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             blob_name = f"{safe_user}/{safe_conv}/{ts}_{safe_tool}_{_safe_blob_component(tc.id, 60)}.json"
             uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, tool_result)
             result_blob_ref = str(uploaded.get("blob_ref", "") or "")

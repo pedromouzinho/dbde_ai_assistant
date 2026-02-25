@@ -5,7 +5,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -34,14 +34,14 @@ def _cache_get(key: str):
     hit = _miro_cache.get(key)
     if not hit:
         return None
-    if datetime.utcnow() - hit["ts"] > timedelta(seconds=_MIRO_CACHE_TTL_SECONDS):
+    if datetime.now(timezone.utc) - hit["ts"] > timedelta(seconds=_MIRO_CACHE_TTL_SECONDS):
         _miro_cache.pop(key, None)
         return None
     return hit["data"]
 
 
 def _cache_set(key: str, data):
-    _miro_cache[key] = {"ts": datetime.utcnow(), "data": data}
+    _miro_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
 async def _miro_get(path: str, params=None):
