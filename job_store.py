@@ -86,7 +86,8 @@ class PersistentJobStore:
                 logger.warning("[JobStore:%s] Persist failed for %s: %s", self._table, job_id, e)
 
     def pop(self, job_id: str, default=None) -> Optional[Dict]:
-        """Remove from local cache. Does not delete from Table Storage."""
+        """Remove entry from LOCAL cache only. Does NOT delete from Table Storage.
+        For full deletion, use table_delete() separately."""
         return self._local.pop(job_id, default)
 
     def items(self):
