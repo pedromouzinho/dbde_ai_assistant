@@ -2879,33 +2879,61 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
 async def health(
     request: Request,
     deep: bool = False,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    result = {"status": "healthy", "mode": "basic", "checks": {"app": "ok"}}
     if not deep:
-        return {"status": "healthy", "mode": "basic", "checks": {"app": "ok"}}
+        return result
 
-    user = get_current_user(credentials)
-    if user.get("role") != "admin":
-        raise HTTPException(403, "Apenas admins")
-
+    result["mode"] = "deep"
     checks = {}
+
+    # 1) Table Storage
     try:
-        emb = await get_embedding("test")
-        checks["embeddings"] = "ok" if emb else "error"
-    except Exception as e: checks["embeddings"] = f"error: {str(e)[:80]}"
-    
-    for name, idx in [("devops", DEVOPS_INDEX), ("omni", OMNI_INDEX)]:
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{idx}/docs/$count?api-version={API_VERSION_SEARCH}", headers={"api-key":SEARCH_KEY})
-                checks[f"search_{name}"] = f"ok ({r.text} docs)" if r.status_code==200 else f"error: {r.status_code}"
-        except Exception as e: checks[f"search_{name}"] = f"error: {str(e)[:80]}"
-    
-    if DEBUG_MODE:
-        checks["devops_log"] = get_devops_debug_log()[-5:]
-        checks["llm_log"] = get_llm_debug_log()[-5:]
-    
-    return {"status": "healthy" if all("ok" in str(v) for k,v in checks.items() if "log" not in k) else "degraded", "checks": checks}
+        await table_query("feedback", top=1)
+        checks["table_storage"] = "ok"
+    except Exception as e:
+        checks["table_storage"] = f"error: {str(e)[:100]}"
+
+    # 2) Blob Storage
+    try:
+        probe_blob = "__health_probe__.txt"
+        _ = await blob_download_bytes(UPLOAD_BLOB_CONTAINER_RAW, probe_blob)
+        checks["blob_storage"] = "ok"
+    except Exception as e:
+        checks["blob_storage"] = f"error: {str(e)[:100]}"
+
+    # 3) Azure OpenAI (tier fast)
+    try:
+        _ = await llm_simple("ping", tier="fast", max_tokens=5)
+        checks["llm_fast"] = "ok"
+    except Exception as e:
+        checks["llm_fast"] = f"error: {str(e)[:100]}"
+
+    # 4) Azure AI Search
+    try:
+        from http_helpers import search_request_with_retry
+        url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{DEVOPS_INDEX}/docs/search?api-version={API_VERSION_SEARCH}"
+        headers = {"Content-Type": "application/json", "api-key": SEARCH_KEY}
+        payload = {"search": "*", "top": 1}
+        search_resp = await search_request_with_retry(url=url, headers=headers, json_body=payload, max_retries=2)
+        checks["ai_search"] = "ok" if "error" not in search_resp else f"error: {str(search_resp.get('error', 'unknown'))[:100]}"
+    except Exception as e:
+        checks["ai_search"] = f"error: {str(e)[:100]}"
+
+    # 5) Rerank
+    try:
+        if RERANK_ENABLED:
+            endpoint_configured = bool(str(RERANK_ENDPOINT or "").strip())
+            checks["rerank"] = "configured" if endpoint_configured else "error: missing endpoint"
+        else:
+            checks["rerank"] = "disabled"
+    except Exception as e:
+        checks["rerank"] = f"error: {str(e)[:100]}"
+
+    result["checks"] = checks
+    all_ok = all(v == "ok" or v in ("configured", "disabled") for v in checks.values())
+    result["status"] = "healthy" if all_ok else "degraded"
+    return result
 
 @app.get("/debug/conversations")
 async def debug_conversations(credentials: HTTPAuthorizationCredentials = Depends(security)):
