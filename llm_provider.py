@@ -506,6 +506,13 @@ class AnthropicProvider(LLMProvider):
             "POST", self.api_url, json=body, headers=self._headers(),
         ) as resp:
             if resp.status_code != 200:
+                body_bytes = await resp.aread()
+                body_preview = body_bytes[:500].decode("utf-8", errors="replace")
+                logger.warning(
+                    "Anthropic streaming failed (status=%d), falling back to non-streaming. Body: %s",
+                    resp.status_code,
+                    body_preview,
+                )
                 # Fallback to non-streaming
                 body.pop("stream")
                 response = await self.chat(messages, tools, temperature, max_tokens)
