@@ -262,6 +262,7 @@ DEVOPS_STATES = ["New", "Active", "Closed", "Resolved", "Removed"]
 # =============================================================================
 DEBUG_LOG_SIZE = int(_get_env("DEBUG_LOG_SIZE", "50"))
 DEBUG_MODE = _get_env("DEBUG_MODE", "false").lower() == "true"
+LOG_FORMAT = _get_env("LOG_FORMAT", "text").lower()  # "json" para produção, "text" para dev
 
 # =============================================================================
 # APP METADATA

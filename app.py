@@ -29,6 +29,34 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+def configure_logging(log_format: str = "text") -> None:
+    handler = logging.StreamHandler()
+    if str(log_format or "text").strip().lower() == "json":
+        handler.setFormatter(JSONFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+
+
+# Bootstrap logging before optional imports that may emit warnings.
+configure_logging(
+    (os.getenv("LOG_FORMAT") or os.getenv("APPSETTING_LOG_FORMAT") or "text").strip().lower()
+)
+
 _pptx_import_traceback = ""
 
 try:
@@ -50,7 +78,7 @@ from config import (
     MODEL_ROUTER_ENABLED, MODEL_ROUTER_SPEC, MODEL_ROUTER_TARGET_TIERS, MODEL_ROUTER_NON_PROD_ONLY,
     IS_PRODUCTION,
     RERANK_ENABLED, RERANK_MODEL, RERANK_ENDPOINT, RERANK_TOP_N, RERANK_AUTH_MODE,
-    ALLOWED_ORIGINS, DEBUG_MODE,
+    ALLOWED_ORIGINS, DEBUG_MODE, LOG_FORMAT,
     AUTH_COOKIE_NAME, AUTH_COOKIE_SECURE, AUTH_COOKIE_MAX_AGE_SECONDS,
     UPLOAD_MAX_FILES_PER_CONVERSATION, UPLOAD_MAX_FILE_BYTES,
     UPLOAD_MAX_CONCURRENT_JOBS, UPLOAD_MAX_PENDING_JOBS_PER_USER,
@@ -710,6 +738,7 @@ async def _export_worker_loop() -> None:
 @app.on_event("startup")
 async def startup_event():
     global http_client, _inline_worker_task, _inline_export_worker_task
+    configure_logging(LOG_FORMAT)
     http_client = httpx.AsyncClient(timeout=60)
     init_http_client(http_client)
     logger.info("HTTP client OK")
