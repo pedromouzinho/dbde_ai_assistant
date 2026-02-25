@@ -174,6 +174,8 @@ else:
 JWT_EXPIRATION_HOURS = int(_get_env("JWT_EXPIRATION_HOURS", "10"))
 ADMIN_INITIAL_PASSWORD = _get_env("ADMIN_INITIAL_PASSWORD", "")
 AUTH_COOKIE_NAME = _get_env("AUTH_COOKIE_NAME", "dbde_token")
+_jwt_secret_previous_env = _get_env("JWT_SECRET_PREVIOUS", "")
+JWT_SECRET_PREVIOUS = _jwt_secret_previous_env if _jwt_secret_previous_env else None
 AUTH_COOKIE_SECURE = _get_env("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_COOKIE_MAX_AGE_SECONDS = int(_get_env("AUTH_COOKIE_MAX_AGE_SECONDS", "86400"))
 ALLOWED_ORIGINS = _get_env(

@@ -17,7 +17,7 @@ from typing import Optional
 from fastapi import HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from config import JWT_SECRET, JWT_EXPIRATION_HOURS, AUTH_COOKIE_NAME
+from config import JWT_SECRET, JWT_SECRET_PREVIOUS, JWT_EXPIRATION_HOURS, AUTH_COOKIE_NAME
 logger = logging.getLogger(__name__)
 
 
@@ -49,31 +49,42 @@ def jwt_encode(payload: dict, secret: str = JWT_SECRET) -> str:
 
 
 def jwt_decode(token: str, secret: str = JWT_SECRET) -> dict:
+    """Decode JWT. Tenta secret actual; se falhar e houver previous, tenta esse."""
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            raise ValueError("Invalid token format")
-        header_b64, payload_b64, sig_b64 = parts
-        expected_sig = _b64url_encode(
-            _hmac.new(secret.encode(), f"{header_b64}.{payload_b64}".encode(), _hashlib.sha256).digest()
-        )
-        if not _hmac.compare_digest(sig_b64, expected_sig):
-            raise ValueError("Invalid signature")
-        payload = json.loads(_b64url_decode(payload_b64))
-        if "exp" not in payload:
-            raise ValueError("Token missing exp")
-        exp_raw = payload["exp"]
-        if not isinstance(exp_raw, str):
-            raise ValueError("Token exp inválido")
-        exp = datetime.fromisoformat(exp_raw)
-        if exp.tzinfo is None:
-            # Compat: tokens antigos podem ter timestamps naive.
-            exp = exp.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) > exp:
-            raise ValueError("Token expired")
-        return payload
-    except (ValueError, json.JSONDecodeError, Exception) as e:
+        return _jwt_decode_single(token, secret)
+    except ValueError as e:
+        if JWT_SECRET_PREVIOUS and secret == JWT_SECRET:
+            try:
+                return _jwt_decode_single(token, JWT_SECRET_PREVIOUS)
+            except ValueError:
+                pass
         raise ValueError(f"JWT decode error: {e}")
+
+
+def _jwt_decode_single(token: str, secret: str) -> dict:
+    """Decode JWT com um único secret. Raises ValueError se falhar."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("Invalid token format")
+    header_b64, payload_b64, sig_b64 = parts
+    expected_sig = _b64url_encode(
+        _hmac.new(secret.encode(), f"{header_b64}.{payload_b64}".encode(), _hashlib.sha256).digest()
+    )
+    if not _hmac.compare_digest(sig_b64, expected_sig):
+        raise ValueError("Invalid signature")
+    payload = json.loads(_b64url_decode(payload_b64))
+    if "exp" not in payload:
+        raise ValueError("Token missing exp")
+    exp_raw = payload["exp"]
+    if not isinstance(exp_raw, str):
+        raise ValueError("Token exp inválido")
+    exp = datetime.fromisoformat(exp_raw)
+    if exp.tzinfo is None:
+        # Compat: tokens antigos podem ter timestamps naive.
+        exp = exp.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > exp:
+        raise ValueError("Token expired")
+    return payload
 
 
 # =============================================================================
