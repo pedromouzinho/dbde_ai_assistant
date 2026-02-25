@@ -134,6 +134,7 @@ from job_store import PersistentJobStore
 security = HTTPBearer(auto_error=False)
 _allowed_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 _allowed_origins_set = set(_allowed_origins)
+_AUTH_EXEMPT_PATHS = {"/health", "/api/info", "/docs", "/openapi.json", "/redoc"}
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 _inline_worker_task: Optional[asyncio.Task] = None
@@ -283,6 +284,10 @@ http_client: Optional[httpx.AsyncClient] = None
 @app.middleware("http")
 async def enforce_allowed_origins(request: Request, call_next):
     global _last_rate_cache_cleanup
+    req_path = str(request.url.path or "").strip()
+    if req_path in _AUTH_EXEMPT_PATHS or req_path.startswith("/health"):
+        return await call_next(request)
+
     token_ref = set_request_cookie_token((request.cookies.get(AUTH_COOKIE_NAME) or "").strip())
     try:
         origin = request.headers.get("origin")
