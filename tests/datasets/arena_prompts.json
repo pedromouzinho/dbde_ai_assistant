@@ -1,0 +1,226 @@
+{
+  "version": "1.0",
+  "description": "Prompts para comparação Arena — DBDE vs LLM genérico",
+  "prompts": [
+    {
+      "id": "ARENA-001",
+      "category": "domain_specific",
+      "prompt": "Quero o estado atual do projecto DBDE com bugs, features e velocidade média.",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-002",
+      "category": "domain_specific",
+      "prompt": "Mostra backlog crítico da área IT.DIT DBDE com prioridades.",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-003",
+      "category": "domain_specific",
+      "prompt": "Há bloqueios activos nas user stories de onboarding?",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-004",
+      "category": "domain_specific",
+      "prompt": "Qual o throughput semanal da equipa DBDE?",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-005",
+      "category": "domain_specific",
+      "prompt": "Quero o estado atual do projecto DBDE com bugs, features e velocidade média.",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-006",
+      "category": "domain_specific",
+      "prompt": "Mostra backlog crítico da área IT.DIT DBDE com prioridades.",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-007",
+      "category": "domain_specific",
+      "prompt": "Há bloqueios activos nas user stories de onboarding?",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-008",
+      "category": "domain_specific",
+      "prompt": "Qual o throughput semanal da equipa DBDE?",
+      "evaluation_criteria": [
+        "Usa ferramentas para obter dados reais",
+        "Apresenta números concretos",
+        "Estrutura clara e acionável"
+      ],
+      "expected_dbde_advantage": "Acesso directo a dados DevOps reais"
+    },
+    {
+      "id": "ARENA-009",
+      "category": "task_execution",
+      "prompt": "Cria uma user story para dark mode na app móvel.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-010",
+      "category": "task_execution",
+      "prompt": "Refina a US 12345 com acceptance criteria claros.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-011",
+      "category": "task_execution",
+      "prompt": "Gera gráfico de bugs por estado e explica tendências.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-012",
+      "category": "task_execution",
+      "prompt": "Prepara resumo executivo com KPIs do sprint.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-013",
+      "category": "task_execution",
+      "prompt": "Cria uma user story para dark mode na app móvel.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-014",
+      "category": "task_execution",
+      "prompt": "Refina a US 12345 com acceptance criteria claros.",
+      "evaluation_criteria": [
+        "Executa tarefa com formato correcto",
+        "Inclui detalhes operacionais úteis",
+        "Minimiza ambiguidade"
+      ],
+      "expected_dbde_advantage": "Execução orientada a tools do assistente DBDE"
+    },
+    {
+      "id": "ARENA-015",
+      "category": "general_knowledge",
+      "prompt": "Explica o que é OAuth 2.0.",
+      "evaluation_criteria": [
+        "Correcção técnica",
+        "Clareza",
+        "Concisão"
+      ],
+      "expected_dbde_advantage": "Pode empatar com LLM genérico"
+    },
+    {
+      "id": "ARENA-016",
+      "category": "general_knowledge",
+      "prompt": "Quais boas práticas para testes unitários?",
+      "evaluation_criteria": [
+        "Correcção técnica",
+        "Clareza",
+        "Concisão"
+      ],
+      "expected_dbde_advantage": "Pode empatar com LLM genérico"
+    },
+    {
+      "id": "ARENA-017",
+      "category": "general_knowledge",
+      "prompt": "O que significa CI/CD?",
+      "evaluation_criteria": [
+        "Correcção técnica",
+        "Clareza",
+        "Concisão"
+      ],
+      "expected_dbde_advantage": "Pode empatar com LLM genérico"
+    },
+    {
+      "id": "ARENA-018",
+      "category": "edge_case",
+      "prompt": "Responde em 2 linhas e gera dados detalhados ao mesmo tempo.",
+      "evaluation_criteria": [
+        "Gestão de ambiguidade",
+        "Sinalização de limites",
+        "Resposta útil sem inventar dados"
+      ],
+      "expected_dbde_advantage": "Maior robustez com guardrails e tool routing"
+    },
+    {
+      "id": "ARENA-019",
+      "category": "edge_case",
+      "prompt": "Compara backlog DBDE com documentação pública sem contexto adicional.",
+      "evaluation_criteria": [
+        "Gestão de ambiguidade",
+        "Sinalização de limites",
+        "Resposta útil sem inventar dados"
+      ],
+      "expected_dbde_advantage": "Maior robustez com guardrails e tool routing"
+    },
+    {
+      "id": "ARENA-020",
+      "category": "edge_case",
+      "prompt": "Decide prioridade sem critérios definidos nem dados.",
+      "evaluation_criteria": [
+        "Gestão de ambiguidade",
+        "Sinalização de limites",
+        "Resposta útil sem inventar dados"
+      ],
+      "expected_dbde_advantage": "Maior robustez com guardrails e tool routing"
+    }
+  ]
+}
