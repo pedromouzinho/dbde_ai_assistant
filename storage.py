@@ -10,7 +10,7 @@ import hmac
 import json
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 from urllib.parse import quote, unquote
 
@@ -187,7 +187,7 @@ async def ensure_blob_container(container_name: str) -> bool:
     if not container_name:
         return False
     client = _require_http_client()
-    now = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     ms_headers = {
         "x-ms-date": now,
         "x-ms-version": BLOB_API_VERSION,
@@ -236,7 +236,7 @@ async def blob_upload_bytes(
     client = _require_http_client()
     payload = data if isinstance(data, (bytes, bytearray)) else bytes(data or b"")
     blob_name = blob_name.lstrip("/")
-    now = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     ms_headers = {
         "x-ms-date": now,
         "x-ms-version": BLOB_API_VERSION,
@@ -278,7 +278,7 @@ async def blob_upload_json(container: str, blob_name: str, payload: dict) -> dic
 async def blob_download_bytes(container: str, blob_name: str) -> Optional[bytes]:
     client = _require_http_client()
     blob_name = blob_name.lstrip("/")
-    now = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     ms_headers = {
         "x-ms-date": now,
         "x-ms-version": BLOB_API_VERSION,
@@ -320,7 +320,7 @@ async def blob_download_json(container: str, blob_name: str) -> Optional[dict]:
 async def table_insert(table_name: str, entity: dict) -> bool:
     """Insere entidade numa Azure Table."""
     url = f"https://{STORAGE_ACCOUNT}.table.core.windows.net/{table_name}"
-    date_str = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     auth = _table_auth_header("POST", table_name, date_str)
     
     try:
@@ -339,7 +339,7 @@ async def table_insert(table_name: str, entity: dict) -> bool:
 async def table_query(table_name: str, filter_str: str = "", top: int = 50) -> list:
     """Query entidades de uma Azure Table."""
     url = f"https://{STORAGE_ACCOUNT}.table.core.windows.net/{table_name}()"
-    date_str = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     auth = _table_auth_header("GET", f"{table_name}()", date_str)
     
     params = {"$top": str(top)}
@@ -365,7 +365,7 @@ async def table_merge(table_name: str, entity: dict):
     rk = entity["RowKey"]
     entity_path = _table_entity_path(table_name, pk, rk)
     url = f"https://{STORAGE_ACCOUNT}.table.core.windows.net/{entity_path}"
-    date_str = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     
     resource = f"/{STORAGE_ACCOUNT}/{entity_path}"
     auth = _table_auth_header_raw("MERGE", resource, date_str)
@@ -385,7 +385,7 @@ async def table_delete(table_name: str, partition_key: str, row_key: str):
     """Apaga uma entidade do Table Storage."""
     entity_path = _table_entity_path(table_name, partition_key, row_key)
     url = f"https://{STORAGE_ACCOUNT}.table.core.windows.net/{entity_path}"
-    date_str = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
     
     resource = f"/{STORAGE_ACCOUNT}/{entity_path}"
     auth = _table_auth_header_raw("DELETE", resource, date_str)
@@ -407,7 +407,7 @@ async def ensure_tables_exist():
     """Cria as tabelas necessárias se não existirem."""
     for table_name in REQUIRED_TABLES:
         url = f"https://{STORAGE_ACCOUNT}.table.core.windows.net/Tables"
-        date_str = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         auth = _table_auth_header("POST", "Tables", date_str)
         
         try:
@@ -449,7 +449,7 @@ async def _ensure_admin_user():
                 "DisplayName": "Pedro Mousinho",
                 "PasswordHash": hash_password(initial_password),
                 "Role": "admin",
-                "CreatedAt": datetime.utcnow().isoformat(),
+                "CreatedAt": datetime.now(timezone.utc).isoformat(),
                 "Active": True,
             }
             await table_insert("Users", entity)

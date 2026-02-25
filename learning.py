@@ -5,7 +5,7 @@
 import asyncio
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 
 from config import (
@@ -70,14 +70,14 @@ async def _search_examples_semantic(embedding, filter_expr="", top=3):
 
 
 async def get_learned_rules():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     needs_refresh = (
         _prompt_rules_cache["last_refresh"] is None
         or (now - _prompt_rules_cache["last_refresh"]).total_seconds() > 3600
     )
     if needs_refresh:
         async with _prompt_rules_lock:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             needs_refresh = (
                 _prompt_rules_cache["last_refresh"] is None
                 or (now - _prompt_rules_cache["last_refresh"]).total_seconds() > 3600
@@ -105,7 +105,7 @@ async def get_learned_rules():
 async def get_few_shot_examples(question):
     try:
         cache_key = hashlib.md5(question.strip().lower().encode()).hexdigest()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         cached = _few_shot_cache.get(cache_key)
         if cached and (now - cached["ts"]).total_seconds() < _FEW_SHOT_CACHE_TTL:
@@ -144,7 +144,7 @@ async def get_few_shot_examples(question):
                 )
 
         txt = txt + "\n---\n"
-        _few_shot_cache[cache_key] = {"result": txt, "ts": datetime.utcnow()}
+        _few_shot_cache[cache_key] = {"result": txt, "ts": datetime.now(timezone.utc)}
 
         if len(_few_shot_cache) > _FEW_SHOT_CACHE_MAX:
             oldest_key = min(_few_shot_cache.items(), key=lambda item: item[1]["ts"])[0]

@@ -51,9 +51,9 @@ if ANTHROPIC_FOUNDRY_RESOURCE:
 else:
     ANTHROPIC_API_BASE = _get_env("ANTHROPIC_API_BASE", "https://api.anthropic.com/v1/messages")
 
-ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-6")
-ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6")
-ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5")
+ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-5-20251101")
+ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-5-20250929")
+ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
 # =============================================================================
 # LLM PROVIDER CONFIG

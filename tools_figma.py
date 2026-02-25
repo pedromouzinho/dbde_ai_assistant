@@ -5,7 +5,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -15,6 +15,7 @@ from tool_registry import register_tool
 
 _FIGMA_API_BASE = "https://api.figma.com/v1"
 _FIGMA_CACHE_TTL_SECONDS = 300
+_MAX_CACHE_ENTRIES = 200
 _figma_cache = {}
 
 
@@ -34,14 +35,19 @@ def _cache_get(key: str):
     hit = _figma_cache.get(key)
     if not hit:
         return None
-    if datetime.utcnow() - hit["ts"] > timedelta(seconds=_FIGMA_CACHE_TTL_SECONDS):
+    if datetime.now(timezone.utc) - hit["ts"] > timedelta(seconds=_FIGMA_CACHE_TTL_SECONDS):
         _figma_cache.pop(key, None)
         return None
     return hit["data"]
 
 
 def _cache_set(key: str, data):
-    _figma_cache[key] = {"ts": datetime.utcnow(), "data": data}
+    if key in _figma_cache:
+        _figma_cache.pop(key, None)
+    if len(_figma_cache) >= _MAX_CACHE_ENTRIES:
+        oldest_key = next(iter(_figma_cache))
+        _figma_cache.pop(oldest_key, None)
+    _figma_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
 async def _figma_get(path: str, params=None):

@@ -3,7 +3,7 @@
 # =============================================================================
 
 import json, base64, asyncio, logging, uuid, re, math, unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from urllib.parse import quote
 from typing import Optional
@@ -46,6 +46,7 @@ def _log(msg):
     logging.info("[Tools] %s", msg)
 
 _generated_files_store = {}
+_generated_files_lock = asyncio.Lock()
 _GENERATED_FILE_TTL_SECONDS = 30 * 60
 _GENERATED_FILE_MAX = 100
 _GENERATED_FILE_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB
@@ -88,7 +89,7 @@ async def _save_writer_profile(
     if not row_key or not analysis:
         return False
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     entity = {
         "PartitionKey": _WRITER_PROFILE_PARTITION,
         "RowKey": row_key,
@@ -158,12 +159,17 @@ async def _load_writer_profile(author_name: str):
 
 def _as_dt(value):
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
         return value
     txt = str(value or "").strip()
     if not txt:
         return None
     try:
-        return datetime.fromisoformat(txt)
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
@@ -176,35 +182,36 @@ def _generated_blob_paths(download_id: str, fmt: str = "") -> tuple[str, str]:
     return f"{base}/content.{ext}", f"{base}/meta.json"
 
 
-def _cleanup_generated_files() -> None:
-    now = datetime.utcnow()
-    expired_ids = [
-        fid for fid, meta in _generated_files_store.items()
-        if (
-            (now - (_as_dt(meta.get("created_at")) or now)).total_seconds()
-            > _GENERATED_FILE_TTL_SECONDS
-        )
-    ]
-    for fid in expired_ids:
-        _generated_files_store.pop(fid, None)
+async def _cleanup_generated_files() -> None:
+    async with _generated_files_lock:
+        now = datetime.now(timezone.utc)
+        expired_ids = [
+            fid for fid, meta in _generated_files_store.items()
+            if (
+                (now - (_as_dt(meta.get("created_at")) or now)).total_seconds()
+                > _GENERATED_FILE_TTL_SECONDS
+            )
+        ]
+        for fid in expired_ids:
+            _generated_files_store.pop(fid, None)
 
-    def _total_bytes() -> int:
-        total = 0
-        for meta in _generated_files_store.values():
-            content = meta.get("content", b"")
-            if isinstance(content, (bytes, bytearray)):
-                total += len(content)
-        return total
+        def _total_bytes() -> int:
+            total = 0
+            for meta in _generated_files_store.values():
+                content = meta.get("content", b"")
+                if isinstance(content, (bytes, bytearray)):
+                    total += len(content)
+            return total
 
-    while (
-        len(_generated_files_store) > _GENERATED_FILE_MAX
-        or _total_bytes() > _GENERATED_FILE_MAX_TOTAL_BYTES
-    ):
-        oldest_id = min(
-            _generated_files_store.items(),
-            key=lambda item: item[1].get("created_at", now),
-        )[0]
-        _generated_files_store.pop(oldest_id, None)
+        while (
+            len(_generated_files_store) > _GENERATED_FILE_MAX
+            or _total_bytes() > _GENERATED_FILE_MAX_TOTAL_BYTES
+        ):
+            oldest_id = min(
+                _generated_files_store.items(),
+                key=lambda item: item[1].get("created_at", now),
+            )[0]
+            _generated_files_store.pop(oldest_id, None)
 
 
 async def _store_generated_file(content: bytes, mime_type: str, filename: str, fmt: str) -> str:
@@ -215,15 +222,16 @@ async def _store_generated_file(content: bytes, mime_type: str, filename: str, f
             _GENERATED_FILE_MAX_TOTAL_BYTES,
         )
         return ""
-    _cleanup_generated_files()
+    await _cleanup_generated_files()
     fid = uuid.uuid4().hex
-    _generated_files_store[fid] = {
-        "content": content,
-        "mime_type": mime_type,
-        "filename": filename,
-        "format": fmt,
-        "created_at": datetime.utcnow(),
-    }
+    async with _generated_files_lock:
+        _generated_files_store[fid] = {
+            "content": content,
+            "mime_type": mime_type,
+            "filename": filename,
+            "format": fmt,
+            "created_at": datetime.now(timezone.utc),
+        }
     try:
         content_blob_name, meta_blob_name = _generated_blob_paths(fid, fmt)
         await blob_upload_bytes(
@@ -241,14 +249,14 @@ async def _store_generated_file(content: bytes, mime_type: str, filename: str, f
                 "mime_type": mime_type,
                 "format": fmt,
                 "size_bytes": len(content),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "ttl_seconds": _GENERATED_FILE_TTL_SECONDS,
                 "content_blob_name": content_blob_name,
             },
         )
     except Exception as e:
         logging.warning("[Tools] persistent generated file store failed for %s: %s", fid, e)
-    _cleanup_generated_files()
+    await _cleanup_generated_files()
     return fid
 
 
@@ -300,13 +308,14 @@ async def _attach_auto_csv_export(result: dict, title_hint: str, min_rows: int =
 
 
 async def get_generated_file(download_id: str):
-    _cleanup_generated_files()
+    await _cleanup_generated_files()
     entry = _generated_files_store.get(download_id)
     if entry:
-        created_at = _as_dt(entry.get("created_at")) or datetime.utcnow()
-        if (datetime.utcnow() - created_at).total_seconds() <= _GENERATED_FILE_TTL_SECONDS:
+        created_at = _as_dt(entry.get("created_at")) or datetime.now(timezone.utc)
+        if (datetime.now(timezone.utc) - created_at).total_seconds() <= _GENERATED_FILE_TTL_SECONDS:
             return entry
-        _generated_files_store.pop(download_id, None)
+        async with _generated_files_lock:
+            _generated_files_store.pop(download_id, None)
 
     # Cross-instance fallback: load metadata/content from Blob Storage.
     try:
@@ -317,7 +326,7 @@ async def get_generated_file(download_id: str):
 
         created_at = _as_dt(meta.get("created_at"))
         ttl_seconds = int(meta.get("ttl_seconds", _GENERATED_FILE_TTL_SECONDS) or _GENERATED_FILE_TTL_SECONDS)
-        if created_at and (datetime.utcnow() - created_at).total_seconds() > max(60, ttl_seconds):
+        if created_at and (datetime.now(timezone.utc) - created_at).total_seconds() > max(60, ttl_seconds):
             return None
 
         blob_name = str(meta.get("content_blob_name", "") or "")
@@ -333,10 +342,11 @@ async def get_generated_file(download_id: str):
             "mime_type": str(meta.get("mime_type", "") or "application/octet-stream"),
             "filename": str(meta.get("filename", "") or f"download-{download_id}"),
             "format": str(meta.get("format", "") or ""),
-            "created_at": created_at or datetime.utcnow(),
+            "created_at": created_at or datetime.now(timezone.utc),
         }
-        _generated_files_store[download_id] = hydrated
-        _cleanup_generated_files()
+        async with _generated_files_lock:
+            _generated_files_store[download_id] = hydrated
+        await _cleanup_generated_files()
         return hydrated
     except Exception as e:
         logging.warning("[Tools] get_generated_file persistent fallback failed for %s: %s", download_id, e)

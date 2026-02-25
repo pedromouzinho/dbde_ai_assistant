@@ -11,7 +11,7 @@ import logging
 import hmac as _hmac
 import hashlib as _hashlib
 from contextvars import ContextVar, Token
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Depends, Request
@@ -40,7 +40,7 @@ def _b64url_decode(s: str) -> bytes:
 def jwt_encode(payload: dict, secret: str = JWT_SECRET) -> str:
     data = dict(payload or {})
     if "exp" not in data:
-        data["exp"] = (datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)).isoformat()
+        data["exp"] = (datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)).isoformat()
     header = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     pay = _b64url_encode(json.dumps(data, default=str).encode())
     sig_input = f"{header}.{pay}".encode()
@@ -66,7 +66,10 @@ def jwt_decode(token: str, secret: str = JWT_SECRET) -> dict:
         if not isinstance(exp_raw, str):
             raise ValueError("Token exp inválido")
         exp = datetime.fromisoformat(exp_raw)
-        if datetime.utcnow() > exp:
+        if exp.tzinfo is None:
+            # Compat: tokens antigos podem ter timestamps naive.
+            exp = exp.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > exp:
             raise ValueError("Token expired")
         return payload
     except (ValueError, json.JSONDecodeError, Exception) as e:
