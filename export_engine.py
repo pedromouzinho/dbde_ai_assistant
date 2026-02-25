@@ -71,7 +71,17 @@ def _latin1_safe(text: str, max_len: int = 0) -> str:
     """Sanitize text for fpdf2 core fonts (Latin-1 only)."""
     if not text:
         return ""
-    safe = text.encode('latin-1', 'replace').decode('latin-1')
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", text)
+    cleaned = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    cleaned = (
+        cleaned.replace("—", "-")
+        .replace("–", "-")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+    )
+    safe = cleaned.encode("latin-1", errors="replace").decode("latin-1")
     if max_len > 0:
         safe = safe[:max_len]
     return safe
