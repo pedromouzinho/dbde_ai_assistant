@@ -11,7 +11,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import Optional
 from urllib.parse import quote, unquote
 
 import httpx
@@ -31,9 +31,6 @@ from auth import hash_password
 # Global HTTP client — inicializado pelo app.py no startup
 http_client: Optional[httpx.AsyncClient] = None
 logger = logging.getLogger(__name__)
-
-# Fallback em memória se Table Storage falhar
-feedback_memory: List[Dict] = []
 
 # Tables que o sistema necessita
 REQUIRED_TABLES = [
