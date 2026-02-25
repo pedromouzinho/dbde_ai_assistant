@@ -42,7 +42,7 @@ from storage import (
     blob_upload_json,
     parse_blob_ref,
 )
-from utils import odata_escape, safe_blob_component, create_logged_task
+from utils import odata_escape, safe_blob_component
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -1087,9 +1087,11 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
     if should_persist:
         try:
-            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
-        except Exception:
-            create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
+            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Conversation persist timeout for %s, continuing", conv_id)
+        except Exception as e:
+            logger.error("Conversation persist failed for %s: %s", conv_id, e)
     
     total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     
@@ -1230,9 +1232,11 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
 
     if should_persist:
         try:
-            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
-        except Exception:
-            create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
+            await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Conversation persist timeout for %s, continuing", conv_id)
+        except Exception as e:
+            logger.error("Conversation persist failed for %s: %s", conv_id, e)
     
     total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     has_exportable = False
