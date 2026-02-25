@@ -1,10 +1,8 @@
 # =============================================================================
 # tools.py — Fachada de compatibilidade (reexporta módulos de domínio)
 # =============================================================================
-
 import logging
 from datetime import datetime
-
 from tools_devops import (
     get_devops_debug_log,
     _devops_headers,
@@ -39,10 +37,8 @@ from http_helpers import (
     devops_request_with_retry as _devops_request_with_retry,
     search_request_with_retry,
 )
-
 # Backward-compatible aliases used by existing imports.
 _search_request_with_retry = search_request_with_retry
-
 # Tool definitions, registration, dispatch, system prompts
 # (wiring central mantém-se aqui)
 from tool_registry import (
@@ -51,7 +47,6 @@ from tool_registry import (
     execute_tool as registry_execute_tool,
     get_all_tool_definitions as registry_get_all_tool_definitions,
 )
-
 _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"query_workitems","description":"Query Azure DevOps via WIQL para contagens, listagens, filtros. Dados em TEMPO REAL.","parameters":{"type":"object","properties":{"wiql_where":{"type":"string","description":"WHERE WIQL. Ex: [System.WorkItemType]='User Story' AND [System.State]='Active'"},"fields":{"type":"array","items":{"type":"string"},"description":"Campos extra a retornar. Default: Id,Title,State,Type,AssignedTo,CreatedBy,AreaPath,CreatedDate. Adicionar 'System.Description' e 'Microsoft.VSTS.Common.AcceptanceCriteria' quando o user pedir detalhes/descrição/AC."},"top":{"type":"integer","description":"Max resultados. 0=só contagem."}},"required":["wiql_where"]}}},
     {"type":"function","function":{"name":"search_workitems","description":"Pesquisa semântica em work items indexados. Retorna AMOSTRA dos mais relevantes.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferências SPIN'"},"top":{"type":"integer","description":"Nº resultados. Default: 30."},"filter":{"type":"string","description":"Filtro OData."}},"required":["query"]}}},
