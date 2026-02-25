@@ -15,6 +15,7 @@ from tool_registry import register_tool
 
 _MIRO_API_BASE = "https://api.miro.com/v2"
 _MIRO_CACHE_TTL_SECONDS = 300
+_MAX_CACHE_ENTRIES = 200
 _miro_cache = {}
 
 
@@ -41,6 +42,11 @@ def _cache_get(key: str):
 
 
 def _cache_set(key: str, data):
+    if key in _miro_cache:
+        _miro_cache.pop(key, None)
+    if len(_miro_cache) >= _MAX_CACHE_ENTRIES:
+        oldest_key = next(iter(_miro_cache))
+        _miro_cache.pop(oldest_key, None)
     _miro_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 

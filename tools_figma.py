@@ -15,6 +15,7 @@ from tool_registry import register_tool
 
 _FIGMA_API_BASE = "https://api.figma.com/v1"
 _FIGMA_CACHE_TTL_SECONDS = 300
+_MAX_CACHE_ENTRIES = 200
 _figma_cache = {}
 
 
@@ -41,6 +42,11 @@ def _cache_get(key: str):
 
 
 def _cache_set(key: str, data):
+    if key in _figma_cache:
+        _figma_cache.pop(key, None)
+    if len(_figma_cache) >= _MAX_CACHE_ENTRIES:
+        oldest_key = next(iter(_figma_cache))
+        _figma_cache.pop(oldest_key, None)
     _figma_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
