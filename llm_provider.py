@@ -11,7 +11,7 @@ import uuid
 import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
