@@ -18,7 +18,7 @@ import re
 import hashlib
 from pathlib import Path
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -358,7 +358,7 @@ def _build_export_zip_bytes(data: dict, title: str, summary: str = "") -> bytes:
         zf.writestr(f"{safe_title}.pdf", pdf_buf.getvalue())
         manifest = {
             "title": safe_title,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "formats": ["csv", "xlsx", "pdf"],
             "rows": _export_rows_count(data),
         }
@@ -436,7 +436,7 @@ def _export_job_public_view(job: dict) -> dict:
 
 
 def _cleanup_export_jobs() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expired_ids = []
     for job_id, meta in export_jobs_store.items():
         updated_at = meta.get("updated_at", meta.get("created_at"))
@@ -470,8 +470,8 @@ async def _persist_export_job(job: dict) -> None:
             "PayloadBlobRef": str(job.get("payload_blob_ref", ""))[:800],
             "WorkerId": str(job.get("worker_id", ""))[:120],
             "ClaimToken": str(job.get("claim_token", ""))[:120],
-            "CreatedAt": str(job.get("created_at", datetime.utcnow().isoformat())),
-            "UpdatedAt": str(job.get("updated_at", datetime.utcnow().isoformat())),
+            "CreatedAt": str(job.get("created_at", datetime.now(timezone.utc).isoformat())),
+            "UpdatedAt": str(job.get("updated_at", datetime.now(timezone.utc).isoformat())),
             "StartedAt": str(job.get("started_at", ""))[:64],
             "FinishedAt": str(job.get("finished_at", ""))[:64],
             "Error": str(job.get("error", ""))[:800],
@@ -538,7 +538,7 @@ async def _queue_export_job(
     data: dict,
 ) -> dict:
     job_id = uuid.uuid4().hex
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     blob_name = (
         f"export-jobs/{_safe_blob_component(user_sub or 'anon', max_len=90)}/"
         f"{_safe_blob_component(job_id, max_len=90)}/payload.json"
@@ -626,7 +626,7 @@ async def _run_export_job(job_id: str) -> None:
     if str(job.get("status", "")).lower() in ("completed", "failed"):
         return
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     job["status"] = "processing"
     job["started_at"] = job.get("started_at") or now_iso
     job["updated_at"] = now_iso
@@ -640,8 +640,8 @@ async def _run_export_job(job_id: str) -> None:
             job["error"] = str(e)
             job["result"] = None
         finally:
-            job["finished_at"] = datetime.utcnow().isoformat()
-            job["updated_at"] = datetime.utcnow().isoformat()
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
             export_jobs_store[str(job.get("job_id", ""))] = job
             await _persist_export_job(job)
 
@@ -679,8 +679,8 @@ async def process_export_jobs_once(max_jobs: int = EXPORT_WORKER_BATCH_SIZE) -> 
         job["worker_id"] = EXPORT_WORKER_INSTANCE_ID
         job["claim_token"] = claim_token
         job["status"] = "processing"
-        job["started_at"] = datetime.utcnow().isoformat()
-        job["updated_at"] = datetime.utcnow().isoformat()
+        job["started_at"] = datetime.now(timezone.utc).isoformat()
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
         export_jobs_store[job_id] = job
         await _persist_export_job(job)
         claimed += 1
@@ -782,7 +782,7 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
     try:
         emb = await get_embedding(question)
         if not emb: return
-        doc = {"id":example_id,"question":question[:2000],"answer":answer[:4000],"tools_used":",".join(tools_used) if tools_used else "","rating":rating,"feedback_note":feedback_note[:500],"example_type":example_type,"created_at":datetime.utcnow().isoformat(),"question_vector":emb}
+        doc = {"id":example_id,"question":question[:2000],"answer":answer[:4000],"tools_used":",".join(tools_used) if tools_used else "","rating":rating,"feedback_note":feedback_note[:500],"example_type":example_type,"created_at":datetime.now(timezone.utc).isoformat(),"question_vector":emb}
         url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{EXAMPLES_INDEX}/docs/index?api-version={API_VERSION_SEARCH}"
         async with httpx.AsyncClient(timeout=30) as c:
             await c.post(url, json={"value":[{"@search.action":"mergeOrUpload",**doc}]}, headers={"api-key":SEARCH_KEY,"Content-Type":"application/json"})
@@ -791,7 +791,7 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
 
 async def log_audit(user_id, action, question="", tools_used=None, tokens=None, duration_ms=0):
     try:
-        ts = datetime.utcnow()
+        ts = datetime.now(timezone.utc)
         await table_insert("AuditLog", {"PartitionKey":ts.strftime("%Y-%m"),"RowKey":f"{ts.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}","UserId":user_id or "anon","Action":action,"Question":(question or "")[:500],"ToolsUsed":",".join(tools_used) if tools_used else "","TotalTokens":tokens.get("total_tokens",0) if tokens else 0,"DurationMs":duration_ms,"Timestamp":ts.isoformat()})
     except Exception as e:
         logger.error("[App] log_audit failed: %s", e)
@@ -951,7 +951,7 @@ async def _append_uploaded_entry_safe(conv_id: str, store_entry: dict) -> list:
 
 
 def _cleanup_upload_jobs() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expired = []
     for job_id, meta in upload_jobs_store.items():
         updated_at = meta.get("updated_at", meta.get("created_at"))
@@ -1045,7 +1045,7 @@ def _is_job_stale(job: dict, now: Optional[datetime] = None) -> bool:
     status = str(job.get("status", "")).lower()
     if status not in ("queued", "processing"):
         return False
-    now_dt = now or datetime.utcnow()
+    now_dt = now or datetime.now(timezone.utc)
     ref_dt = _parse_iso_dt(str(job.get("updated_at", "") or "")) or _parse_iso_dt(str(job.get("created_at", "") or ""))
     if not ref_dt:
         return False
@@ -1315,8 +1315,8 @@ async def _persist_upload_job(job: dict) -> None:
             "ContentType": str(job.get("content_type", ""))[:120],
             "Status": str(job.get("status", "queued"))[:32],
             "SizeBytes": int(job.get("size_bytes", 0) or 0),
-            "CreatedAt": str(job.get("created_at", datetime.utcnow().isoformat())),
-            "UpdatedAt": str(job.get("updated_at", datetime.utcnow().isoformat())),
+            "CreatedAt": str(job.get("created_at", datetime.now(timezone.utc).isoformat())),
+            "UpdatedAt": str(job.get("updated_at", datetime.now(timezone.utc).isoformat())),
             "StartedAt": str(job.get("started_at", ""))[:64],
             "FinishedAt": str(job.get("finished_at", ""))[:64],
             "Error": str(job.get("error", ""))[:800],
@@ -1361,7 +1361,7 @@ async def _mark_job_failed(job: dict, reason: str) -> dict:
         return job
     if str(job.get("status", "")).lower() in ("completed", "failed"):
         return job
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     job["status"] = "failed"
     job["error"] = reason
     job["finished_at"] = now_iso
@@ -1619,7 +1619,7 @@ async def _process_upload_job(job: dict) -> None:
         "Filename": filename[:240],
         "ContentType": content_type[:120],
         "FileSizeBytes": int(job.get("size_bytes", 0) or 0),
-        "UploadedAt": datetime.utcnow().isoformat(),
+        "UploadedAt": datetime.now(timezone.utc).isoformat(),
         "RowCount": int(store_entry.get("row_count", 0) or 0),
         "ColNamesJson": json.dumps(col_names if isinstance(col_names, list) else [], ensure_ascii=False)[:32000],
         "ColAnalysisJson": json.dumps(col_analysis if isinstance(col_analysis, list) else [], ensure_ascii=False)[:32000],
@@ -1654,7 +1654,7 @@ async def _run_upload_job(job_id: str) -> None:
         job = loaded
         upload_jobs_store[job_id] = job
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     if str(job.get("status", "")).lower() in ("completed", "failed"):
         return
 
@@ -1671,8 +1671,8 @@ async def _run_upload_job(job_id: str) -> None:
             job["error"] = str(e)
             job["result"] = None
         finally:
-            job["finished_at"] = datetime.utcnow().isoformat()
-            job["updated_at"] = datetime.utcnow().isoformat()
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
             upload_jobs_store[str(job.get("job_id", ""))] = job
             await _persist_upload_job(job)
 
@@ -1692,7 +1692,7 @@ async def _queue_upload_job(
         content,
         content_type=content_type or "application/octet-stream",
     )
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     job = {
         "job_id": job_id,
         "status": "queued",
@@ -1751,8 +1751,8 @@ async def process_upload_jobs_once(max_jobs: int = UPLOAD_WORKER_BATCH_SIZE) -> 
         job["worker_id"] = WORKER_INSTANCE_ID
         job["claim_token"] = claim_token
         job["status"] = "processing"
-        job["started_at"] = datetime.utcnow().isoformat()
-        job["updated_at"] = datetime.utcnow().isoformat()
+        job["started_at"] = datetime.now(timezone.utc).isoformat()
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
         upload_jobs_store[job_id] = job
         await _persist_upload_job(job)
         claimed += 1
@@ -2318,7 +2318,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
     }
 
     payload = {
-        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "project": "IT.DIT",
     }
     section_items = list(sections_wiql.items())
@@ -2518,7 +2518,7 @@ async def create_user(request: Request, payload: CreateUserRequest, credentials:
     safe_username = _odata_escape(payload.username)
     existing = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if existing: raise HTTPException(409, "Username já existe")
-    entity = {"PartitionKey":"user","RowKey":payload.username,"PasswordHash":hash_password(payload.password),"DisplayName":payload.display_name or payload.username,"Role":payload.role or "user","IsActive":True,"CreatedAt":datetime.utcnow().isoformat(),"CreatedBy":user.get("sub")}
+    entity = {"PartitionKey":"user","RowKey":payload.username,"PasswordHash":hash_password(payload.password),"DisplayName":payload.display_name or payload.username,"Role":payload.role or "user","IsActive":True,"CreatedAt":datetime.now(timezone.utc).isoformat(),"CreatedBy":user.get("sub")}
     await table_insert("Users", entity)
     return {"status":"ok","username":payload.username}
 
@@ -2581,7 +2581,7 @@ async def submit_feedback(request: Request, payload: FeedbackRequest, credential
         if um: question = um[-1].get("content","") if isinstance(um[-1].get("content"),str) else str(um[-1].get("content",""))
         if am: answer = am[-1].get("content","")
     
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     safe_conv = cid.replace("-","")[:32]
     entity = {"PartitionKey":safe_conv,"RowKey":f"{payload.message_index}_{ts.replace(':','').replace('-','').replace('.','')}", "Rating":payload.rating,"Note":payload.note or "","Question":question[:2000],"Answer":answer[:4000],"Timestamp_str":ts}
     stored = await table_insert("feedback", entity)
@@ -2620,7 +2620,7 @@ async def save_chat(request: Request, payload: SaveChatRequest, credentials: HTT
     msgs = [{"role":m.get("role",""),"content":m.get("content","")} for m in payload.messages]
     msgs_json = json.dumps(msgs, ensure_ascii=False)
     while len(msgs_json)>60000 and len(msgs)>4: msgs.pop(1); msgs_json = json.dumps(msgs, ensure_ascii=False)
-    entity = {"PartitionKey":uid,"RowKey":payload.conversation_id,"Title":(payload.title or "Nova conversa")[:100],"Messages":msgs_json,"MessageCount":len(payload.messages),"UpdatedAt":datetime.utcnow().isoformat()}
+    entity = {"PartitionKey":uid,"RowKey":payload.conversation_id,"Title":(payload.title or "Nova conversa")[:100],"Messages":msgs_json,"MessageCount":len(payload.messages),"UpdatedAt":datetime.now(timezone.utc).isoformat()}
     if not await table_insert("ChatHistory", entity): await table_merge("ChatHistory", entity)
     return {"status":"ok","conversation_id":payload.conversation_id}
 
@@ -2663,7 +2663,7 @@ async def add_rule(request: Request, rule_text: str, category: str = "general", 
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Admin only")
     rid = f"rule_{uuid.uuid4().hex[:8]}"
-    await table_insert("PromptRules", {"PartitionKey":"active","RowKey":rid,"RuleText":rule_text,"Category":category,"CreatedBy":user.get("sub"),"CreatedAt":datetime.utcnow().isoformat()})
+    await table_insert("PromptRules", {"PartitionKey":"active","RowKey":rid,"RuleText":rule_text,"Category":category,"CreatedBy":user.get("sub"),"CreatedAt":datetime.now(timezone.utc).isoformat()})
     invalidate_prompt_rules_cache()
     return {"status":"ok","rule_id":rid}
 
@@ -2838,7 +2838,7 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
     return {
         "service": APP_TITLE,
         "version": APP_VERSION,
-        "runtime_utc": datetime.utcnow().isoformat(),
+        "runtime_utc": datetime.now(timezone.utc).isoformat(),
         "files": files,
         "markers": markers,
         "manifest_check": manifest_result,
