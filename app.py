@@ -18,7 +18,7 @@ import re
 import hashlib
 import time
 from pathlib import Path
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable, Tuple
@@ -1005,7 +1005,8 @@ EXPORT_JOB_TTL_SECONDS = 24 * 3600
 
 upload_jobs_store = PersistentJobStore("UploadJobs", partition_key="upload-cache")
 _upload_jobs_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOAD_JOBS)
-_upload_conv_locks: Dict[str, asyncio.Lock] = {}
+_upload_conv_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+_UPLOAD_CONV_LOCKS_MAX = 500
 export_jobs_store = PersistentJobStore("ExportJobs", partition_key="export-cache")
 _export_jobs_semaphore = asyncio.Semaphore(max(1, EXPORT_MAX_CONCURRENT_JOBS))
 
@@ -1061,8 +1062,12 @@ def _append_uploaded_entry(conv_id: str, store_entry: dict) -> list:
 def _get_upload_conv_lock(conv_id: str) -> asyncio.Lock:
     lock = _upload_conv_locks.get(conv_id)
     if lock is None:
+        while len(_upload_conv_locks) >= _UPLOAD_CONV_LOCKS_MAX:
+            _upload_conv_locks.popitem(last=False)
         lock = asyncio.Lock()
         _upload_conv_locks[conv_id] = lock
+    else:
+        _upload_conv_locks.move_to_end(conv_id)
     return lock
 
 
