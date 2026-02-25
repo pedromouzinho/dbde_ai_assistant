@@ -893,8 +893,13 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
         if not emb: return
         doc = {"id":example_id,"question":question[:2000],"answer":answer[:4000],"tools_used":",".join(tools_used) if tools_used else "","rating":rating,"feedback_note":feedback_note[:500],"example_type":example_type,"created_at":datetime.now(timezone.utc).isoformat(),"question_vector":emb}
         url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{EXAMPLES_INDEX}/docs/index?api-version={API_VERSION_SEARCH}"
-        async with httpx.AsyncClient(timeout=30) as c:
-            await c.post(url, json={"value":[{"@search.action":"mergeOrUpload",**doc}]}, headers={"api-key":SEARCH_KEY,"Content-Type":"application/json"})
+        payload = {"value": [{"@search.action": "mergeOrUpload", **doc}]}
+        headers = {"api-key": SEARCH_KEY, "Content-Type": "application/json"}
+        if http_client:
+            await http_client.post(url, json=payload, headers=headers, timeout=30)
+        else:
+            async with httpx.AsyncClient(timeout=30) as c:
+                await c.post(url, json=payload, headers=headers)
     except Exception as e:
         logger.error("[App] _index_example failed: %s", e)
 
