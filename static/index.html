@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Assistente AI DBDE v7.3.0</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23DE3163'/><text x='50' y='70' font-size='60' font-weight='bold' fill='white' text-anchor='middle' font-family='sans-serif'>M</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%231A1A1A'/><text x='50' y='72' font-size='64' font-weight='800' fill='%23DE3163' text-anchor='middle' font-family='sans-serif' letter-spacing='-2'>M</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -131,6 +131,14 @@ const DEFAULT_MAX_BATCH_TOTAL_BYTES = 60 * 1024 * 1024;
 const UPLOAD_POLL_INTERVAL_MS = 1200;
 const UPLOAD_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 const DEVOPS_WORKITEM_BASE_URL = "https://dev.azure.com/ptbcp/IT.DIT/_workitems/edit/";
+// Logo oficial Millennium — "M" estilizado cerise sobre fundo escuro
+const MILLENNIUM_LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="16" fill="#1A1A1A"/>
+  <text x="50" y="72" font-size="64" font-weight="800" fill="#DE3163"
+        text-anchor="middle" font-family="'Montserrat', sans-serif"
+        letter-spacing="-2">M</text>
+</svg>`;
+const MILLENNIUM_LOGO_DATA_URI = "data:image/svg+xml," + encodeURIComponent(MILLENNIUM_LOGO_SVG);
 
 // ─── Markdown Renderer ──────────────────────────────────────────────────────
 function escapeHtml(text) {
@@ -536,9 +544,10 @@ function TypingIndicator({ text }) {
     return React.createElement("div", {
         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
     },
-        React.createElement("div", {
-            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-        }, "M"),
+        React.createElement("img", {
+            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+        }),
         React.createElement("div", {
             style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "12px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 13, color: "#888" }
         },
@@ -632,9 +641,10 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
     return React.createElement("div", {
         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
     },
-        React.createElement("div", {
-            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-        }, "M"),
+        React.createElement("img", {
+            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+        }),
         React.createElement("div", { style: { flex: 1, minWidth: 0, maxWidth: 900 } },
             React.createElement(ToolBadges, { tools: message.tools_used, details: message.tool_details }),
             React.createElement("div", {
@@ -737,9 +747,10 @@ function LoginScreen({ onLogin }) {
             style: { width: 380, padding: 40, background: "white", borderRadius: 20, boxShadow: "0 8px 40px rgba(0,0,0,0.08)" }
         },
             React.createElement("div", { style: { textAlign: "center", marginBottom: 32 } },
-                React.createElement("div", {
-                    style: { width: 56, height: 56, borderRadius: 16, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "inline-flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 24, fontWeight: 700, marginBottom: 16, boxShadow: "0 4px 16px rgba(222,49,99,0.25)" }
-                }, "M"),
+                React.createElement("img", {
+                    src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                    style: { width: 56, height: 56, borderRadius: 16, marginBottom: 16, boxShadow: "0 4px 16px rgba(26,26,26,0.15)" }
+                }),
                 React.createElement("div", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a1a" } }, "Assistente AI DBDE"),
                 React.createElement("div", { style: { fontSize: 13, color: "#888", marginTop: 4 } }, "Millennium BCP · v7.3.0")
             ),
@@ -1971,9 +1982,10 @@ function App() {
             // Sidebar header
             React.createElement("div", { style: { padding: "20px 20px 16px", borderBottom: "1px solid #EBEBEB" } },
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 16 } },
-                    React.createElement("div", {
-                        style: { width: 36, height: 36, borderRadius: 10, background: "linear-gradient(135deg, #DE3163 0%, #8B0022 100%)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 16, fontWeight: 700, flexShrink: 0 }
-                    }, "M"),
+                    React.createElement("img", {
+                        src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                        style: { width: 36, height: 36, borderRadius: 10, flexShrink: 0 }
+                    }),
                     React.createElement("div", null,
                         React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: "#1a1a1a", lineHeight: 1.2 } }, "Assistente AI"),
                         React.createElement("div", { style: { fontSize: 11, color: "#999", fontWeight: 500 } }, "DBDE v7.3.0")
@@ -2104,9 +2116,10 @@ function App() {
                     // Welcome screen
                     (!active || active.messages.length === 0) && !loading &&
                     React.createElement("div", { style: { textAlign: "center", paddingTop: "12vh", animation: "fadeUp 0.5s ease" } },
-                        React.createElement("div", {
-                            style: { width: 64, height: 64, borderRadius: 18, background: "linear-gradient(135deg, #DE3163 0%, #8B0022 100%)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", color: "white", fontSize: 28, fontWeight: 700, boxShadow: "0 8px 32px rgba(222,49,99,0.2)" }
-                        }, "M"),
+                        React.createElement("img", {
+                            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                            style: { width: 64, height: 64, borderRadius: 18, margin: "0 auto 20px", boxShadow: "0 8px 32px rgba(26,26,26,0.15)" }
+                        }),
                         React.createElement("div", { style: { fontSize: 22, fontWeight: 700, color: "#1a1a1a", marginBottom: 8 } },
                             agentMode === "userstory" ? "User Story Writer" : "Assistente AI DBDE"
                         ),
@@ -2141,9 +2154,10 @@ function App() {
                     loading && (streamingText || streamingRenderedBlocks.length > 0 || streamingActiveBlock) && React.createElement("div", {
                         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
                     },
-                        React.createElement("div", {
-                            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-                        }, "M"),
+                        React.createElement("img", {
+                            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+                        }),
                         React.createElement("div", {
                             className: "msg-content",
                             style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", maxWidth: "min(900px, 100%)" }
