@@ -3,6 +3,10 @@
 # =============================================================================
 # Todas as variáveis de ambiente, constantes e configurações num único local.
 # Nenhum outro ficheiro faz os.getenv() — tudo passa por aqui.
+# CHANGELOG:
+# v7.3.0 (Fase G): Reranking activado, US generation fine-tuned,
+#         web search, chat export, file generation improvements
+# v7.2.7 (Fase E): Refactoring completo, eval suite
 # =============================================================================
 
 import os
@@ -284,6 +288,6 @@ LOG_FORMAT = _get_env("LOG_FORMAT", "text").lower()  # "json" para produção, "
 # =============================================================================
 # APP METADATA
 # =============================================================================
-APP_VERSION = "7.2.7"
+APP_VERSION = "7.3.0"
 APP_TITLE = "Millennium BCP AI Agent"
 APP_DESCRIPTION = "Agente IA multi-modelo com streaming, exports e integração DevOps"
