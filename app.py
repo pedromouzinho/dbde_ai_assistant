@@ -7,6 +7,7 @@
 
 import io
 import json
+import html
 import base64
 import zipfile
 import os
@@ -92,6 +93,7 @@ from config import (
     EXPORT_AUTO_ASYNC_ENABLED, EXPORT_ASYNC_THRESHOLD_ROWS, EXPORT_MAX_CONCURRENT_JOBS,
     EXPORT_JOB_STALE_SECONDS, EXPORT_INLINE_WORKER_ENABLED, EXPORT_WORKER_POLL_SECONDS,
     EXPORT_WORKER_BATCH_SIZE,
+    EXPORT_BRAND_COLOR, EXPORT_BRAND_NAME, EXPORT_AGENT_NAME,
 )
 from models import (
     AgentChatRequest, AgentChatResponse,
@@ -498,6 +500,92 @@ def _build_export_file(format_name: str, data: dict, title: str, summary: str = 
     if fmt == "zip":
         return _build_export_zip_bytes(data, safe_title, summary or ""), "application/zip", f"{safe_title}.zip"
     raise HTTPException(400, f"Formato não suportado: {fmt}")
+
+
+def _render_chat_segment_to_html(raw_content: Any) -> str:
+    if isinstance(raw_content, str):
+        text = raw_content
+    elif isinstance(raw_content, list):
+        chunks = []
+        for part in raw_content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                chunks.append(str(part.get("text", "")))
+        text = "\n".join(chunks)
+    else:
+        text = str(raw_content or "")
+
+    safe = html.escape(text)
+    parts = safe.split("```")
+    if len(parts) == 1:
+        return safe.replace("\n", "<br>")
+
+    rendered = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 0:
+            rendered.append(part.replace("\n", "<br>"))
+        else:
+            rendered.append(f"<pre><code>{part}</code></pre>")
+    return "".join(rendered)
+
+
+def _render_chat_html(messages: list, title: str) -> str:
+    safe_title = html.escape(_safe_export_title(title or "Chat Export"))
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    rows = []
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content_html = _render_chat_segment_to_html(msg.get("content", ""))
+        role_label = "Utilizador" if role == "user" else "Assistente"
+        bubble_class = "msg-user" if role == "user" else "msg-assistant"
+        msg_ts = str(msg.get("timestamp", "") or msg.get("created_at", "") or "").strip()
+        ts_html = f"<div class='msg-ts'>{html.escape(msg_ts)}</div>" if msg_ts else ""
+        rows.append(
+            f"<div class='msg-row {bubble_class}'>"
+            f"<div class='msg-meta'>{role_label}</div>"
+            f"<div class='msg-content'>{content_html}</div>"
+            f"{ts_html}"
+            "</div>"
+        )
+
+    body = "\n".join(rows) if rows else "<div class='msg-empty'>Sem mensagens para exportar.</div>"
+    return f"""<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{safe_title}</title>
+  <style>
+    body {{ font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif; background:#f6f7fb; color:#1f2937; margin:0; }}
+    .wrap {{ max-width: 980px; margin: 24px auto; padding: 0 16px; }}
+    .header {{ background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:16px 18px; margin-bottom:16px; }}
+    .title {{ margin:0; font-size:20px; color:{EXPORT_BRAND_COLOR}; }}
+    .meta {{ margin-top:6px; font-size:12px; color:#6b7280; }}
+    .chat {{ display:flex; flex-direction:column; gap:12px; }}
+    .msg-row {{ max-width:80%; border-radius:14px; padding:10px 12px; border:1px solid #e5e7eb; background:#fff; }}
+    .msg-user {{ margin-left:auto; background:#eef6ff; border-color:#bfdbfe; }}
+    .msg-assistant {{ margin-right:auto; background:#f3f4f6; border-color:#e5e7eb; }}
+    .msg-meta {{ font-size:11px; font-weight:700; letter-spacing:0.02em; color:#6b7280; margin-bottom:6px; text-transform:uppercase; }}
+    .msg-content {{ font-size:14px; line-height:1.55; }}
+    .msg-content pre {{ background:#111827; color:#f9fafb; padding:10px; border-radius:8px; overflow:auto; }}
+    .msg-ts {{ margin-top:6px; font-size:11px; color:#9ca3af; }}
+    .footer {{ margin-top:18px; font-size:12px; color:#6b7280; text-align:center; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1 class="title">{safe_title}</h1>
+      <div class="meta">{html.escape(EXPORT_BRAND_NAME)} · exportado em {exported_at}</div>
+    </div>
+    <div class="chat">{body}</div>
+    <div class="footer">Exportado por {html.escape(EXPORT_AGENT_NAME)} v{APP_VERSION}</div>
+  </div>
+</body>
+</html>"""
 
 
 def _export_job_from_storage_row(row: dict, fallback_job_id: str = "") -> dict:
@@ -2522,6 +2610,51 @@ async def export_data_async(request: Request, export_request: ExportRequest, cre
         "row_count": _export_rows_count(data),
         "status_endpoint": f"/api/export/status/{job.get('job_id')}",
     }
+
+
+@app.post("/api/export-chat")
+@limiter.limit("10/minute", key_func=_user_or_ip_rate_key)
+async def export_chat(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Exporta histórico de chat em HTML/PDF."""
+    get_current_user(credentials)
+    body = await request.json()
+    messages = body.get("messages", [])
+    format_type = str(body.get("format", "html") or "html").strip().lower()
+    title = str(body.get("title", "Chat Export") or "Chat Export")
+
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse({"error": "Sem mensagens para exportar"}, status_code=400)
+
+    html_content = _render_chat_html(messages, title)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_title = _safe_export_title(title or "Chat Export")
+
+    if format_type == "pdf":
+        try:
+            import weasyprint
+
+            pdf_bytes = weasyprint.HTML(string=html_content).write_pdf()
+            filename = f"{safe_title}_{ts}.pdf"
+            download_id = await _store_generated_file(pdf_bytes, "application/pdf", filename, "pdf")
+            if not download_id:
+                raise HTTPException(500, "Falha ao armazenar PDF exportado")
+            return {"url": f"/api/download/{download_id}", "format": "pdf", "filename": filename}
+        except ImportError:
+            format_type = "html"
+
+    filename = f"{safe_title}_{ts}.html"
+    download_id = await _store_generated_file(
+        html_content.encode("utf-8"),
+        "text/html; charset=utf-8",
+        filename,
+        "html",
+    )
+    if not download_id:
+        raise HTTPException(500, "Falha ao armazenar HTML exportado")
+    payload = {"url": f"/api/download/{download_id}", "format": "html", "filename": filename}
+    if str(body.get("format", "html")).strip().lower() == "pdf":
+        payload["note"] = "PDF não disponível, exportado como HTML."
+    return payload
 
 
 @app.get("/api/export/status/{job_id}")
