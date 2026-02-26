@@ -15,7 +15,7 @@
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: #F7F7F8;
+            background: #EAE4DC;
             overflow: hidden;
             -webkit-font-smoothing: antialiased;
         }
@@ -84,7 +84,7 @@
             padding: 8px 14px; border-bottom: 1px solid #f0f0f0;
             max-width: 300px; overflow: hidden; text-overflow: ellipsis;
         }
-        .msg-content tbody tr:nth-child(even) { background: #FAFAFA; }
+        .msg-content tbody tr:nth-child(even) { background: #F5F0EB; }
         .msg-content tbody tr:hover { background: #FFF5F7; }
 
         /* Sidebar hover */
@@ -741,7 +741,7 @@ function LoginScreen({ onLogin }) {
     }
 
     return React.createElement("div", {
-        style: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: "linear-gradient(135deg, #F7F7F8 0%, #FFF0F3 100%)" }
+        style: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: "linear-gradient(135deg, #EAE4DC 0%, #FFF0F3 100%)" }
     },
         React.createElement("div", {
             style: { width: 380, padding: 40, background: "white", borderRadius: 20, boxShadow: "0 8px 40px rgba(0,0,0,0.08)" }
@@ -1967,7 +1967,7 @@ function App() {
     // ─── Render ──────────────────────────────────────────────────────────
 
     return React.createElement("div", {
-        style: { display: "flex", height: "100vh", overflow: "hidden", background: "#F7F7F8" }
+        style: { display: "flex", height: "100vh", overflow: "hidden", background: "#EAE4DC" }
     },
 
         // ─── Sidebar ─────────────────────────────────────────────────────
@@ -2109,7 +2109,7 @@ function App() {
 
             // ─── Chat area ────────────────────────────────────────────────
             React.createElement("div", {
-                style: { flex: 1, overflowY: "auto", padding: "24px 24px 8px", background: "#F7F7F8" }
+                style: { flex: 1, overflowY: "auto", padding: "24px 24px 8px", background: "#EAE4DC" }
             },
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto" } },
 
@@ -2252,7 +2252,7 @@ function App() {
                             ? `Pergunta sobre os ${activeUploadedFiles.length} ficheiros anexados...`
                             : agentMode === "userstory" ? "Descreve a funcionalidade para gerar User Stories..." : "Faz uma pergunta sobre DevOps, KPIs, User Stories...",
                         rows: 1,
-                        style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#FAFAFA", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
+                        style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#F5F0EB", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
                         onFocus: e => e.target.style.borderColor = "#DE3163",
                         onBlur: e => e.target.style.borderColor = "#E0E0E0",
                         onInput: e => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px"; }
