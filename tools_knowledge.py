@@ -247,14 +247,13 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
     }
 
     market_parts = str(WEB_SEARCH_MARKET or "pt-PT").split("-")
-    search_lang = market_parts[0] if market_parts else "pt"
     country = market_parts[1] if len(market_parts) > 1 else "PT"
+    country = str(country or "PT").lower()
 
     params = {
         "q": query,
         "count": top,
         "country": country,
-        "search_lang": search_lang,
         "text_decorations": "false",
         "result_filter": "web",
     }
