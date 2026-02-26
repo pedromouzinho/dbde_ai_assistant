@@ -21,6 +21,11 @@ from config import (
     RERANK_TOP_N,
     RERANK_TIMEOUT_SECONDS,
     RERANK_AUTH_MODE,
+    WEB_SEARCH_ENABLED,
+    WEB_SEARCH_API_KEY,
+    WEB_SEARCH_ENDPOINT,
+    WEB_SEARCH_MAX_RESULTS,
+    WEB_SEARCH_MARKET,
 )
 from llm_provider import get_embedding_provider
 from http_helpers import search_request_with_retry
@@ -217,3 +222,60 @@ async def tool_search_website(query, top=10):
     if rerank_meta.get("applied"):
         result["_rerank"] = rerank_meta
     return result
+
+
+async def tool_search_web(query: str, top: int = 5) -> dict:
+    """Pesquisa web via Bing Search API. Retorna snippets relevantes."""
+    if not WEB_SEARCH_ENABLED or not WEB_SEARCH_API_KEY:
+        return {"error": "Pesquisa web não está configurada. Contactar administrador."}
+
+    query = str(query or "").strip()[:200]
+    if not query:
+        return {"error": "Query de pesquisa vazia."}
+
+    safe_max = max(1, int(WEB_SEARCH_MAX_RESULTS or 5))
+    top = min(max(1, int(top or 5)), safe_max)
+
+    headers = {"Ocp-Apim-Subscription-Key": WEB_SEARCH_API_KEY}
+    params = {
+        "q": query,
+        "count": top,
+        "mkt": WEB_SEARCH_MARKET,
+        "responseFilter": "Webpages",
+        "textDecorations": False,
+        "textFormat": "Raw",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(WEB_SEARCH_ENDPOINT, headers=headers, params=params)
+    except Exception as e:
+        return {"error": f"Pesquisa web falhou: {str(e)}"}
+
+    if resp.status_code != 200:
+        return {"error": f"Bing API {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        data = resp.json()
+    except Exception:
+        return {"error": "Resposta inválida da Bing API."}
+
+    pages = (data.get("webPages") or {}).get("value") or []
+    results = []
+    for page in pages[:top]:
+        if not isinstance(page, dict):
+            continue
+        results.append(
+            {
+                "title": str(page.get("name", "") or ""),
+                "url": str(page.get("url", "") or ""),
+                "snippet": str(page.get("snippet", "") or "")[:500],
+            }
+        )
+
+    return {
+        "query": query,
+        "total_estimated": (data.get("webPages") or {}).get("totalEstimatedMatches", 0),
+        "results": results,
+        "results_count": len(results),
+    }

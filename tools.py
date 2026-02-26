@@ -3,6 +3,7 @@
 # =============================================================================
 import logging
 from datetime import datetime, timezone
+from config import WEB_SEARCH_ENABLED
 from tools_devops import (
     get_devops_debug_log,
     _devops_headers,
@@ -20,6 +21,7 @@ from tools_knowledge import (
     get_embedding,
     tool_search_workitems,
     tool_search_website,
+    tool_search_web,
 )
 from tools_export import (
     get_generated_file,
@@ -62,6 +64,25 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
 ]
 
+if WEB_SEARCH_ENABLED:
+    _BUILTIN_TOOL_DEFINITIONS.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "search_web",
+                "description": "Pesquisa na web (Bing). Usar quando o utilizador pedir informação actual/externa que não está no DevOps nem no site MSE.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Texto de pesquisa web."},
+                        "top": {"type": "integer", "description": "Número de resultados. Default: 5."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+    )
+
 _TOOL_DEFINITION_BY_NAME = {
     d.get("function", {}).get("name"): d
     for d in _BUILTIN_TOOL_DEFINITIONS
@@ -70,7 +91,7 @@ _TOOL_DEFINITION_BY_NAME = {
 
 
 def _tool_dispatch() -> dict:
-    return {
+    dispatch = {
         "query_workitems": lambda arguments: tool_query_workitems(arguments.get("wiql_where",""), arguments.get("fields"), arguments.get("top",200)),
         "search_workitems": lambda arguments: tool_search_workitems(arguments.get("query",""), arguments.get("top",30), arguments.get("filter")),
         "search_website": lambda arguments: tool_search_website(arguments.get("query",""), arguments.get("top",10)),
@@ -123,6 +144,12 @@ def _tool_dispatch() -> dict:
             arguments.get("columns"),
         ),
     }
+    if WEB_SEARCH_ENABLED:
+        dispatch["search_web"] = lambda arguments: tool_search_web(
+            arguments.get("query", ""),
+            arguments.get("top", 5),
+        )
+    return dispatch
 
 
 def _register_builtin_tools() -> None:
@@ -260,6 +287,8 @@ def get_agent_system_prompt():
         return ", ".join(parts[:-1]) + " ou " + parts[-1]
 
     data_sources = ["DevOps", "AI Search", "site MSE"]
+    if WEB_SEARCH_ENABLED:
+        data_sources.append("web externa")
     if uploaded_doc_enabled:
         data_sources.append("documento carregado")
     if figma_enabled:
@@ -353,6 +382,13 @@ def get_agent_system_prompt():
             "   Exemplos: \"lista os boards do miro\", \"o que foi discutido no board X?\"\n"
             "   REGRA: Nao usar search_website para pedidos de Miro. Usa sempre search_miro."
         )
+        next_rule += 1
+    if WEB_SEARCH_ENABLED:
+        routing_rules.append(
+            f"{next_rule}. Para INFORMAÇÃO EXTERNA/ACTUAL que não está no DevOps nem no site MSE -> usa search_web\n"
+            "   Exemplos: \"o que é DORA regulation\", \"novidades Azure DevOps 2026\"\n"
+            "   REGRA: Usar apenas quando as outras ferramentas não têm a informação. Cita sempre a fonte (URL)."
+        )
     routing_rules_text = "\n".join(routing_rules)
 
     usage_examples = [
@@ -387,6 +423,13 @@ def get_agent_system_prompt():
             [
                 "- \"Lista os boards do Miro\" -> search_miro",
                 "- \"O que foi discutido no board X?\" -> search_miro com board_id",
+            ]
+        )
+    if WEB_SEARCH_ENABLED:
+        usage_examples.extend(
+            [
+                "- \"O que é a regulação DORA?\" -> search_web",
+                "- \"Novidades Azure DevOps 2026\" -> search_web",
             ]
         )
     usage_examples_text = "\n".join(usage_examples)
