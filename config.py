@@ -125,6 +125,11 @@ WEB_SEARCH_API_KEY = _get_env("WEB_SEARCH_API_KEY", "")
 WEB_SEARCH_ENDPOINT = _get_env("WEB_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search")
 WEB_SEARCH_MAX_RESULTS = int(_get_env("WEB_SEARCH_MAX_RESULTS", "5"))
 WEB_SEARCH_MARKET = _get_env("WEB_SEARCH_MARKET", "pt-PT")
+WEB_ANSWERS_ENABLED = _get_env("WEB_ANSWERS_ENABLED", "false").lower() == "true"
+WEB_ANSWERS_API_KEY = _get_env("WEB_ANSWERS_API_KEY", "")
+WEB_ANSWERS_ENDPOINT = _get_env("WEB_ANSWERS_ENDPOINT", "https://api.search.brave.com/res/v1/chat/completions")
+WEB_ANSWERS_MODEL = _get_env("WEB_ANSWERS_MODEL", "brave")
+WEB_ANSWERS_TIMEOUT_SECONDS = float(_get_env("WEB_ANSWERS_TIMEOUT_SECONDS", "20"))
 
 # =============================================================================
 # AZURE DEVOPS

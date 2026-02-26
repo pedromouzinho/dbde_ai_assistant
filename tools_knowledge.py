@@ -26,6 +26,11 @@ from config import (
     WEB_SEARCH_ENDPOINT,
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_MARKET,
+    WEB_ANSWERS_ENABLED,
+    WEB_ANSWERS_API_KEY,
+    WEB_ANSWERS_ENDPOINT,
+    WEB_ANSWERS_MODEL,
+    WEB_ANSWERS_TIMEOUT_SECONDS,
 )
 from llm_provider import get_embedding_provider
 from http_helpers import search_request_with_retry
@@ -281,9 +286,48 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
             }
         )
 
-    return {
+    result = {
         "query": query,
         "total_estimated": len(web_results),
         "results": results,
         "results_count": len(results),
     }
+
+    # Optional: enrich with Brave Answers when explicitly configured.
+    if WEB_ANSWERS_ENABLED and WEB_ANSWERS_API_KEY:
+        answer_headers = {
+            "X-Subscription-Token": WEB_ANSWERS_API_KEY,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        answer_payload = {
+            "messages": [{"role": "user", "content": query}],
+            "model": WEB_ANSWERS_MODEL,
+            "stream": False,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=max(5.0, float(WEB_ANSWERS_TIMEOUT_SECONDS or 20))) as client:
+                answer_resp = await client.post(
+                    WEB_ANSWERS_ENDPOINT,
+                    headers=answer_headers,
+                    json=answer_payload,
+                )
+            if answer_resp.status_code == 200:
+                answer_data = answer_resp.json()
+                answer_text = (
+                    (answer_data.get("choices") or [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                if isinstance(answer_text, str) and answer_text.strip():
+                    result["answer"] = answer_text.strip()[:4000]
+            else:
+                logging.warning(
+                    "[WebSearch] Brave Answers HTTP %s: %s",
+                    answer_resp.status_code,
+                    answer_resp.text[:200],
+                )
+        except Exception as e:
+            logging.warning("[WebSearch] Brave Answers failed: %s", e)
+
+    return result
