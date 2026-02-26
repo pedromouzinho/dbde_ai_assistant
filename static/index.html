@@ -2435,7 +2435,7 @@ function App() {
 
             // ─── Chat area ────────────────────────────────────────────────
             React.createElement("div", {
-                style: { flex: 1, overflowY: "auto", padding: "24px 24px 8px", background: "#EAE4DC" }
+                style: { flex: 1, overflowY: "auto", padding: "28px 28px 12px", background: "#EAE4DC" }
             },
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto" } },
 
@@ -2546,7 +2546,7 @@ function App() {
             ),
 
             // ─── Input area ───────────────────────────────────────────────
-            React.createElement("div", { style: { background: "white", borderTop: "1px solid #EBEBEB", padding: "16px 24px 20px" } },
+            React.createElement("div", { style: { background: "white", borderTop: "1px solid rgba(0,0,0,0.06)", padding: "18px 28px 22px" } },
                 // File indicator
                 uploadingFiles && React.createElement("div", {
                     style: { maxWidth: 900, margin: "0 auto 8px", display: "flex", alignItems: "center", gap: 8, background: "#FFF7ED", border: "1px solid #FDD8A5", borderRadius: 10, padding: "8px 14px" }
@@ -2597,16 +2597,29 @@ function App() {
                     // File button
                     React.createElement("button", {
                         onClick: () => fileInputRef.current && fileInputRef.current.click(), disabled: loading || uploadingFiles, title: "Carregar ficheiro",
-                        style: { width: 46, height: 46, borderRadius: 14, background: "white", color: "#888", border: "1.5px solid #E0E0E0", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.15s ease", fontSize: 18 },
-                        onMouseEnter: e => { e.currentTarget.style.borderColor = "#DE3163"; e.currentTarget.style.color = "#DE3163"; },
-                        onMouseLeave: e => { e.currentTarget.style.borderColor = "#E0E0E0"; e.currentTarget.style.color = "#888"; },
+                        style: {
+                            width: 44, height: 44, borderRadius: 12,
+                            background: "transparent", color: "#bbb",
+                            border: "1.5px solid rgba(0,0,0,0.08)",
+                            cursor: "pointer", display: "flex", alignItems: "center",
+                            justifyContent: "center", flexShrink: 0,
+                            transition: "all 0.2s ease", fontSize: 17,
+                        },
+                        onMouseEnter: e => { e.currentTarget.style.borderColor = "#DE3163"; e.currentTarget.style.color = "#DE3163"; e.currentTarget.style.background = "rgba(222,49,99,0.04)"; },
+                        onMouseLeave: e => { e.currentTarget.style.borderColor = "rgba(0,0,0,0.08)"; e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "transparent"; },
                     }, "📎"),
                     // Image button
                     React.createElement("button", {
                         onClick: () => imageInputRef.current && imageInputRef.current.click(), disabled: loading, title: "Anexar imagens",
-                        style: { width: 46, height: 46, borderRadius: 14, background: imagePreviews.length > 0 ? "#FFF0F3" : "white", color: imagePreviews.length > 0 ? "#DE3163" : "#888", border: imagePreviews.length > 0 ? "1.5px solid #DE3163" : "1.5px solid #E0E0E0", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.15s ease", fontSize: 18 },
-                        onMouseEnter: e => { if (!imagePreviews.length) { e.currentTarget.style.borderColor = "#DE3163"; e.currentTarget.style.color = "#DE3163"; } },
-                        onMouseLeave: e => { if (!imagePreviews.length) { e.currentTarget.style.borderColor = "#E0E0E0"; e.currentTarget.style.color = "#888"; } },
+                        style: {
+                            width: 44, height: 44, borderRadius: 12,
+                            background: imagePreviews.length > 0 ? "rgba(222,49,99,0.06)" : "transparent",
+                            color: imagePreviews.length > 0 ? "#DE3163" : "#bbb",
+                            border: imagePreviews.length > 0 ? "1.5px solid rgba(222,49,99,0.3)" : "1.5px solid rgba(0,0,0,0.08)",
+                            cursor: "pointer", display: "flex", alignItems: "center",
+                            justifyContent: "center", flexShrink: 0,
+                            transition: "all 0.2s ease", fontSize: 17,
+                        },
                     }, "🖼️"),
                     // Text input
                     React.createElement("textarea", {
@@ -2616,19 +2629,37 @@ function App() {
                             ? `Pergunta sobre os ${activeUploadedFiles.length} ficheiros anexados...`
                             : agentMode === "userstory" ? "Descreve a funcionalidade para gerar User Stories..." : "Faz uma pergunta sobre DevOps, KPIs, User Stories...",
                         rows: 1,
-                        style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#F5F0EB", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
-                        onFocus: e => e.target.style.borderColor = "#DE3163",
-                        onBlur: e => e.target.style.borderColor = "#E0E0E0",
+                        style: {
+                            flex: 1, resize: "none",
+                            border: "1.5px solid rgba(0,0,0,0.08)",
+                            borderRadius: 14, padding: "12px 20px",
+                            fontSize: 14, fontFamily: "'Montserrat', sans-serif",
+                            lineHeight: 1.5, background: "#FAFAF8", color: "#1a1a1a",
+                            transition: "all 0.2s ease",
+                            minHeight: 46, maxHeight: 120, outline: "none",
+                        },
+                        onFocus: e => { e.target.style.borderColor = "#DE3163"; e.target.style.background = "white"; e.target.style.boxShadow = "0 0 0 3px rgba(222,49,99,0.06)"; },
+                        onBlur: e => { e.target.style.borderColor = "rgba(0,0,0,0.08)"; e.target.style.background = "#FAFAF8"; e.target.style.boxShadow = "none"; },
                         onInput: e => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px"; }
                     }),
                     // Send button
                     React.createElement("button", {
                         className: "send-btn", onClick: send, disabled: !input.trim() || loading || uploadingFiles,
-                        style: { width: 46, height: 46, borderRadius: 14, background: "#DE3163", color: "white", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.15s ease", fontSize: 18 }
+                        style: {
+                            width: 44, height: 44, borderRadius: 12,
+                            background: "#1A1A1A", color: "white",
+                            border: "none", cursor: "pointer",
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            flexShrink: 0, transition: "all 0.2s ease", fontSize: 16,
+                        }
                     }, "➤")
                 ),
                 React.createElement("div", {
-                    style: { maxWidth: 900, margin: "6px auto 0", textAlign: "center", fontSize: 11, color: "#ccc" }
+                    style: {
+                        maxWidth: 900, margin: "8px auto 0",
+                        textAlign: "center", fontSize: 10, color: "#ccc",
+                        fontWeight: 400, letterSpacing: "0.2px",
+                    }
                 }, uploadingFiles
                     ? "A processar anexos. O envio da mensagem fica disponível no fim."
                     : `Enter para enviar · Shift+Enter nova linha · 📎 ficheiros · Ctrl+V colar imagens · lote até ${Math.max(1, Math.round(maxBatchTotalBytes / (1024 * 1024)))}MB`)
