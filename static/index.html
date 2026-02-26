@@ -2067,10 +2067,7 @@ function App() {
     const tierLabels = { fast: "⚡ Fast", standard: "🧠 Thinking", pro: "🔬 Pro" };
     const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
     const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
-    const suggestions = React.useMemo(
-        () => getDynamicSuggestions(agentMode, conversations, activeUploadedFiles),
-        [agentMode, suggestionSeed, activeIdx]
-    );
+    const suggestions = getDynamicSuggestions(agentMode, conversations, activeUploadedFiles);
 
     // ─── Render ──────────────────────────────────────────────────────────
 
