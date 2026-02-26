@@ -70,7 +70,7 @@ if WEB_SEARCH_ENABLED:
             "type": "function",
             "function": {
                 "name": "search_web",
-                "description": "Pesquisa na web (Bing). Usar quando o utilizador pedir informação actual/externa que não está no DevOps nem no site MSE.",
+                "description": "Pesquisa na web. Usar quando o utilizador pedir informação actual/externa que não está no DevOps nem no site MSE.",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -225,7 +225,7 @@ async def tool_search_website(query, top=10):
 
 
 async def tool_search_web(query: str, top: int = 5) -> dict:
-    """Pesquisa web via Bing Search API. Retorna snippets relevantes."""
+    """Pesquisa web via Brave Search API. Retorna snippets relevantes."""
     if not WEB_SEARCH_ENABLED or not WEB_SEARCH_API_KEY:
         return {"error": "Pesquisa web não está configurada. Contactar administrador."}
 
@@ -236,14 +236,22 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
     safe_max = max(1, int(WEB_SEARCH_MAX_RESULTS or 5))
     top = min(max(1, int(top or 5)), safe_max)
 
-    headers = {"Ocp-Apim-Subscription-Key": WEB_SEARCH_API_KEY}
+    headers = {
+        "X-Subscription-Token": WEB_SEARCH_API_KEY,
+        "Accept": "application/json",
+    }
+
+    market_parts = str(WEB_SEARCH_MARKET or "pt-PT").split("-")
+    search_lang = market_parts[0] if market_parts else "pt"
+    country = market_parts[1] if len(market_parts) > 1 else "PT"
+
     params = {
         "q": query,
         "count": top,
-        "mkt": WEB_SEARCH_MARKET,
-        "responseFilter": "Webpages",
-        "textDecorations": False,
-        "textFormat": "Raw",
+        "country": country,
+        "search_lang": search_lang,
+        "text_decorations": "false",
+        "result_filter": "web",
     }
 
     try:
@@ -253,29 +261,29 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
         return {"error": f"Pesquisa web falhou: {str(e)}"}
 
     if resp.status_code != 200:
-        return {"error": f"Bing API {resp.status_code}: {resp.text[:200]}"}
+        return {"error": f"Brave Search API {resp.status_code}: {resp.text[:200]}"}
 
     try:
         data = resp.json()
     except Exception:
-        return {"error": "Resposta inválida da Bing API."}
+        return {"error": "Resposta inválida da Brave Search API."}
 
-    pages = (data.get("webPages") or {}).get("value") or []
+    web_results = (data.get("web") or {}).get("results") or []
     results = []
-    for page in pages[:top]:
-        if not isinstance(page, dict):
+    for item in web_results[:top]:
+        if not isinstance(item, dict):
             continue
         results.append(
             {
-                "title": str(page.get("name", "") or ""),
-                "url": str(page.get("url", "") or ""),
-                "snippet": str(page.get("snippet", "") or "")[:500],
+                "title": str(item.get("title", "") or ""),
+                "url": str(item.get("url", "") or ""),
+                "snippet": str(item.get("description", "") or "")[:500],
             }
         )
 
     return {
         "query": query,
-        "total_estimated": (data.get("webPages") or {}).get("totalEstimatedMatches", 0),
+        "total_estimated": len(web_results),
         "results": results,
         "results_count": len(results),
     }
