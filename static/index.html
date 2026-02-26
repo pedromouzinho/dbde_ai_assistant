@@ -1961,22 +1961,103 @@ function App() {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
     }
 
-    const generalSuggestions = [
-        "Quantas user stories existem na área RevampFEE?",
-        "Quais bugs estão ativos no MDSE?",
-        "Como fazer uma transferência SPIN no MSE?",
-        "Quem criou mais user stories este mês?",
-    ];
-    const usSuggestions = [
-        "Gera 3 user stories sobre pagamento de serviços",
-        "Quero adicionar um campo de IBAN no formulário",
-        "Cria uma US para exportar PDF nas consultas",
-        "Gera user stories para abertura de conta online",
-    ];
+    const suggestionPools = {
+        general: {
+            rag: [
+                "Quantas user stories existem na área RevampFEE?",
+                "Quais bugs estão ativos no MDSE?",
+                "Mostra os work items criados esta semana",
+                "Lista as user stories em estado Active",
+                "Quais áreas têm mais bugs abertos?",
+            ],
+            knowledge: [
+                "Como fazer uma transferência SPIN no MSE?",
+                "O que é o processo de KYC no Millennium?",
+                "Explica o fluxo de abertura de conta digital",
+                "Quais são as regras de compliance para SEPA?",
+            ],
+            analytics: [
+                "Quem criou mais user stories este mês?",
+                "Mostra KPIs da equipa MDSE no último sprint",
+                "Qual a velocity média da área RevampFEE?",
+                "Gera um gráfico de bugs por prioridade",
+            ],
+            files: [
+                "Analisa o ficheiro Excel que vou anexar",
+                "Compara os dados dos 2 ficheiros CSV",
+                "Resume o conteúdo do PDF anexado",
+            ],
+        },
+        userstory: {
+            creation: [
+                "Gera 3 user stories sobre pagamento de serviços",
+                "Cria uma US para exportar PDF nas consultas",
+                "Gera user stories para abertura de conta online",
+                "Cria user stories para o módulo de notificações push",
+                "Gera uma US para autenticação biométrica",
+            ],
+            modification: [
+                "Quero adicionar um campo de IBAN no formulário",
+                "Preciso de uma US para alterar o layout do dashboard",
+                "Cria uma US para adicionar filtros na pesquisa",
+            ],
+            integration: [
+                "Gera US para integração com sistema de pagamentos",
+                "Cria user stories para a API de consulta de saldos",
+                "US para integrar notificações por email",
+            ],
+        },
+    };
+    function getDynamicSuggestions(mode, convList, filesList) {
+        const pool = suggestionPools[mode] || suggestionPools.general;
+        const allSuggestions = Object.values(pool).flat();
+
+        const recentMessages = convList
+            .flatMap(c => c.messages || [])
+            .filter(m => m.role === "user")
+            .slice(-20)
+            .map(m => (m.content || m.text || "").toLowerCase());
+
+        const usedCategories = new Set();
+        for (const msg of recentMessages) {
+            for (const [cat, items] of Object.entries(pool)) {
+                if (items.some(s => msg.includes(s.slice(0, 20).toLowerCase()))) {
+                    usedCategories.add(cat);
+                }
+            }
+        }
+
+        const hasFiles = filesList && filesList.length > 0;
+        const selected = [];
+        const categories = Object.keys(pool);
+
+        if (hasFiles && pool.files) {
+            const fileSugg = pool.files[Math.floor(Math.random() * pool.files.length)];
+            selected.push(fileSugg);
+        }
+
+        const shuffledCats = categories.sort(() => Math.random() - 0.5);
+        for (const cat of shuffledCats) {
+            if (selected.length >= 4) break;
+            if (hasFiles && cat === "files") continue;
+            const catItems = pool[cat].filter(s => !selected.includes(s));
+            if (catItems.length > 0) {
+                selected.push(catItems[Math.floor(Math.random() * catItems.length)]);
+            }
+        }
+
+        while (selected.length < 4 && allSuggestions.length > 0) {
+            const remaining = allSuggestions.filter(s => !selected.includes(s));
+            if (remaining.length === 0) break;
+            selected.push(remaining[Math.floor(Math.random() * remaining.length)]);
+        }
+
+        return selected.slice(0, 4);
+    }
     const tierLabels = { fast: "⚡ Fast", standard: "🧠 Thinking", pro: "🔬 Pro" };
     const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
     const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
-    const suggestions = agentMode === "userstory" ? usSuggestions : generalSuggestions;
+    const suggestions = getDynamicSuggestions(agentMode, conversations, activeUploadedFiles);
 
     // ─── Render ──────────────────────────────────────────────────────────
 
