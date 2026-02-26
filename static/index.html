@@ -116,7 +116,7 @@
         .send-btn:disabled { opacity: 0.5; cursor: not-allowed !important; }
         .send-btn:not(:disabled):hover { transform: scale(1.05); }
         .del-btn:hover { color: #DE3163 !important; }
-        .new-conv-btn:hover { background: #FFF0F3 !important; }
+        .new-conv-btn:hover { background: white !important; border-color: #DE3163 !important; color: #DE3163 !important; box-shadow: 0 2px 8px rgba(222,49,99,0.1) !important; }
         .user-menu-item { display: block; width: 100%; text-align: left; padding: 8px 14px; border: none; background: none; cursor: pointer; font-size: 12px; font-family: 'Montserrat', sans-serif; color: #444; border-radius: 6px; transition: background 0.15s; }
         .user-menu-item:hover { background: #f5f5f5; }
         .login-input {
@@ -2129,33 +2129,42 @@ function App() {
         // ─── Sidebar ─────────────────────────────────────────────────────
         React.createElement("div", {
             style: {
-                width: sidebarOpen ? 280 : 0, minWidth: sidebarOpen ? 280 : 0,
-                background: "white", borderRight: "1px solid #EBEBEB",
+                width: sidebarOpen ? 300 : 0, minWidth: sidebarOpen ? 300 : 0,
+                background: "#FAFAF8", borderRight: "1px solid rgba(0,0,0,0.06)",
                 display: "flex", flexDirection: "column",
-                transition: "all 0.25s ease", overflow: "hidden",
+                transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)", overflow: "hidden",
             }
         },
             // Sidebar header
-            React.createElement("div", { style: { padding: "20px 20px 16px", borderBottom: "1px solid #EBEBEB" } },
-                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 16 } },
+            React.createElement("div", { style: { padding: "24px 24px 20px", borderBottom: "1px solid rgba(0,0,0,0.06)" } },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 } },
                     React.createElement("img", {
                         src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
-                        style: { width: 36, height: 36, borderRadius: 10, flexShrink: 0 }
+                        style: { width: 38, height: 38, borderRadius: 10, flexShrink: 0 }
                     }),
                     React.createElement("div", null,
                         React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: "#1a1a1a", lineHeight: 1.2 } }, "Assistente AI"),
-                        React.createElement("div", { style: { fontSize: 11, color: "#999", fontWeight: 500 } }, "DBDE v7.3.0")
+                        React.createElement("div", { style: { fontSize: 10, color: "#aaa", fontWeight: 500, marginTop: 2, letterSpacing: "0.3px" } }, "DBDE v7.3.0")
                     )
                 ),
                 React.createElement("button", {
                     className: "new-conv-btn",
                     onClick: startNew,
-                    style: { width: "100%", padding: "10px 16px", borderRadius: 12, border: "1.5px dashed #DE3163", background: "white", color: "#DE3163", fontWeight: 600, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, transition: "all 0.15s ease", fontFamily: "'Montserrat', sans-serif" }
+                    style: {
+                        width: "100%", padding: "11px 16px", borderRadius: 12,
+                        border: "1.5px solid rgba(0,0,0,0.1)",
+                        background: "white", color: "#1a1a1a",
+                        fontWeight: 600, fontSize: 13, cursor: "pointer",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        gap: 8, transition: "all 0.2s ease",
+                        fontFamily: "'Montserrat', sans-serif",
+                        boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+                    }
                 }, "+ Nova Interação")
             ),
 
             // Conversation list
-            React.createElement("div", { style: { flex: 1, overflowY: "auto", padding: "8px 10px" } },
+            React.createElement("div", { style: { flex: 1, overflowY: "auto", padding: "10px 12px" } },
                 conversations.map((conv, i) =>
                     React.createElement("div", {
                         key: i,
@@ -2166,12 +2175,32 @@ function App() {
                             if (conv.savedOnServer && (!Array.isArray(conv.messages) || conv.messages.length === 0) && conv.id && userId) loadChatMessages(userId, conv.id, i);
                             inputRef.current && inputRef.current.focus();
                         },
-                        style: { padding: "10px 12px", borderRadius: 10, marginBottom: 3, cursor: "pointer", display: "flex", alignItems: "center", gap: 10, borderLeft: "3px solid transparent" }
+                        style: {
+                            padding: "12px 14px", borderRadius: 12, marginBottom: 4,
+                            cursor: "pointer", display: "flex", alignItems: "center", gap: 10,
+                            borderLeft: "3px solid transparent",
+                            background: i === activeIdx ? "rgba(222,49,99,0.06)" : "transparent",
+                        }
                     },
-                        React.createElement("span", { style: { fontSize: 14, flexShrink: 0 } }, "💬"),
+                        React.createElement("div", {
+                            style: {
+                                width: 32, height: 32, borderRadius: 8,
+                                background: i === activeIdx ? "rgba(222,49,99,0.1)" : "rgba(0,0,0,0.04)",
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                fontSize: 13, flexShrink: 0,
+                                color: i === activeIdx ? "#DE3163" : "#999",
+                                transition: "all 0.2s ease",
+                            }
+                        }, "💬"),
                         React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                            React.createElement("div", { style: { fontSize: 13, fontWeight: i === activeIdx ? 600 : 400, color: "#1a1a1a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, conv.title),
-                            React.createElement("div", { style: { fontSize: 11, color: "#999" } },
+                            React.createElement("div", {
+                                style: {
+                                    fontSize: 13, fontWeight: i === activeIdx ? 600 : 400,
+                                    color: i === activeIdx ? "#1a1a1a" : "#555",
+                                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                                }
+                            }, conv.title),
+                            React.createElement("div", { style: { fontSize: 11, color: "#bbb", marginTop: 1 } },
                                 (Array.isArray(conv.messages) && conv.messages.length > 0)
                                     ? conv.messages.length + " msgs"
                                     : (conv.message_count ? conv.message_count + " msgs" : "Vazia")
@@ -2180,16 +2209,32 @@ function App() {
                         conversations.length > 1 && React.createElement("button", {
                             className: "del-btn",
                             onClick: (e) => { e.stopPropagation(); deleteConv(i); },
-                            style: { background: "none", border: "none", cursor: "pointer", color: "#ccc", padding: 4, fontSize: 14, transition: "color 0.15s" }
+                            style: {
+                                background: "none", border: "none", cursor: "pointer",
+                                color: "transparent", padding: 4, fontSize: 14,
+                                transition: "all 0.2s ease", borderRadius: 6,
+                            },
+                            onMouseEnter: e => { e.currentTarget.style.color = "#DE3163"; },
+                            onMouseLeave: e => { e.currentTarget.style.color = "transparent"; },
                         }, "×")
                     )
                 )
             ),
 
             // Sidebar footer
-            React.createElement("div", { style: { padding: "12px 16px", borderTop: "1px solid #EBEBEB", display: "flex", alignItems: "center", justifyContent: "space-between" } },
-                React.createElement("span", { style: { fontSize: 11, color: "#bbb" } }, userId),
-                React.createElement("button", { onClick: handleLogout, style: { background: "none", border: "none", fontSize: 11, color: "#bbb", cursor: "pointer", fontFamily: "'Montserrat', sans-serif" } }, "Sair")
+            React.createElement("div", { style: { padding: "14px 20px", borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" } },
+                React.createElement("span", { style: { fontSize: 11, color: "#bbb", fontWeight: 500 } }, userId),
+                React.createElement("button", {
+                    onClick: handleLogout,
+                    style: {
+                        background: "none", border: "none", fontSize: 11,
+                        color: "#bbb", cursor: "pointer",
+                        fontFamily: "'Montserrat', sans-serif",
+                        transition: "color 0.2s",
+                    },
+                    onMouseEnter: e => { e.currentTarget.style.color = "#DE3163"; },
+                    onMouseLeave: e => { e.currentTarget.style.color = "#bbb"; },
+                }, "Sair")
             )
         ),
 
