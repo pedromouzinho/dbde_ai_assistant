@@ -25,7 +25,8 @@ TOOL_LATENCY_P95_THRESHOLD_MS = 5000
 ARENA_WIN_RATE_THRESHOLD = 0.6
 
 # LLM Judge config (usa o mesmo Azure OpenAI do projecto)
-JUDGE_MODEL_TIER = "standard"
+# NOTE: "standard" (GPT-5) pode rejeitar max_tokens neste runtime; usar fast para compatibilidade imediata.
+JUDGE_MODEL_TIER = "fast"
 JUDGE_TEMPERATURE = 0.1
 JUDGE_MAX_TOKENS = 500
 
