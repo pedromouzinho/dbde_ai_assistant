@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 
 
@@ -21,8 +24,8 @@ class TestExportTools:
         assert result.get("chart_generated") is True
         assert result.get("_chart", {}).get("data")
 
-    async def test_generate_file_csv_xlsx_pdf(self):
-        from tools_export import tool_generate_file
+    async def test_generate_file_csv_has_utf8_bom(self):
+        from tools_export import get_generated_file, tool_generate_file
 
         rows = [
             {"id": 1, "title": "São Paulo", "status": "Active"},
@@ -30,12 +33,77 @@ class TestExportTools:
         ]
         columns = ["id", "title", "status"]
 
-        for fmt in ("csv", "xlsx", "pdf"):
-            result = await tool_generate_file(format=fmt, title="Export Test", data=rows, columns=columns)
-            assert result.get("file_generated") is True, f"failed for {fmt}: {result}"
-            download = result.get("_file_download", {})
-            assert download.get("size_bytes", 0) > 0
-            assert download.get("format") == fmt
+        result = await tool_generate_file(format="csv", title="Export Test", data=rows, columns=columns)
+        assert result.get("file_generated") is True, result
+        download_id = result.get("_file_download", {}).get("download_id")
+        assert download_id
+
+        entry = await get_generated_file(download_id)
+        assert entry and entry.get("content")
+        assert entry["content"][:3] == b"\xef\xbb\xbf"
+
+    async def test_generate_file_xlsx_has_header_bold_and_zebra(self):
+        openpyxl = pytest.importorskip("openpyxl")
+        from tools_export import get_generated_file, tool_generate_file
+
+        rows = [
+            {"id": 1, "title": "US A", "status": "Active"},
+            {"id": 2, "title": "US B", "status": "New"},
+            {"id": 3, "title": "US C", "status": "Closed"},
+        ]
+        result = await tool_generate_file(format="xlsx", title="Export Test", data=rows, columns=["id", "title", "status"])
+        assert result.get("file_generated") is True, result
+        download_id = result.get("_file_download", {}).get("download_id")
+        assert download_id
+
+        entry = await get_generated_file(download_id)
+        wb = openpyxl.load_workbook(io.BytesIO(entry["content"]))
+        ws = wb.active
+        assert ws["A4"].font.bold is True
+        assert ws["A6"].fill.fill_type == "solid"
+
+    async def test_generate_file_pdf_uses_brand_color(self, monkeypatch):
+        import export_engine
+        from tools_export import tool_generate_file
+
+        seen: dict[str, str] = {}
+        original_hex_to_rgb = export_engine._hex_to_rgb
+
+        def _spy_hex_to_rgb(hex_color: str, fallback):
+            seen["hex"] = hex_color
+            return original_hex_to_rgb(hex_color, fallback)
+
+        monkeypatch.setattr(export_engine, "EXPORT_BRAND_COLOR", "#13579B", raising=False)
+        monkeypatch.setattr(export_engine, "_hex_to_rgb", _spy_hex_to_rgb)
+
+        result = await tool_generate_file(
+            format="pdf",
+            title="Export Test",
+            data=[{"id": 1, "title": "US", "status": "Active"}],
+            columns=["id", "title", "status"],
+        )
+        assert result.get("file_generated") is True, result
+        assert seen.get("hex") == "#13579B"
+
+    async def test_generate_file_docx_output(self):
+        from tools_export import get_generated_file, tool_generate_file
+
+        rows = [
+            {"id": 1, "title": "São Paulo", "status": "Active"},
+            {"id": 2, "title": "André ☕", "status": "New"},
+        ]
+        result = await tool_generate_file(format="docx", title="Export Test", data=rows, columns=["id", "title", "status"])
+        assert result.get("file_generated") is True, result
+        download = result.get("_file_download", {})
+        assert download.get("format") == "docx"
+        assert download.get("mime_type") == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+        download_id = download.get("download_id")
+        assert download_id
+        entry = await get_generated_file(download_id)
+        assert entry and entry.get("content")
+        with zipfile.ZipFile(io.BytesIO(entry["content"])) as zf:
+            assert "word/document.xml" in zf.namelist()
 
     async def test_generate_file_empty_data_handling(self):
         from tools_export import tool_generate_file
