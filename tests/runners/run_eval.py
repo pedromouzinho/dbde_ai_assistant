@@ -83,7 +83,7 @@ def _dry_run_validate_datasets() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="DBDE Eval Suite Runner")
     parser.add_argument("--dry-run", action="store_true", help="Só valida estrutura")
-    parser.add_argument("--camada", choices=["a", "b", "c", "all"], default="all")
+    parser.add_argument("--camada", choices=["a", "b", "c", "d", "all"], default="all")
     parser.add_argument("--output", default=None, help="Ficheiro de output (JSON)")
     args = parser.parse_args()
 
@@ -112,6 +112,10 @@ def main() -> None:
     if args.camada in ("c", "all"):
         print("\n=== CAMADA C: Arena ===")
         results["camadas"]["c"] = run_pytest(f"{test_root}/camada_c_arena/")
+
+    if args.camada in ("d", "all"):
+        print("\n=== CAMADA D: User Story Quality ===")
+        results["camadas"]["d"] = run_pytest(f"{test_root}/camada_d_userstory/")
 
     output_path = args.output or str(eval_config.RESULTS_DIR / f"eval_{timestamp}.json")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

@@ -24,6 +24,11 @@ TOOL_LATENCY_P95_THRESHOLD_MS = 5000
 # Thresholds de qualidade (Camada C - Arena)
 ARENA_WIN_RATE_THRESHOLD = 0.6
 
+# Thresholds de qualidade (Camada D - User Stories)
+US_STRUCTURE_THRESHOLD = 0.8
+US_FORMATTING_THRESHOLD = 0.9
+US_QUALITY_THRESHOLD = 0.7
+
 # LLM Judge config (usa o mesmo Azure OpenAI do projecto)
 # NOTE: "standard" (GPT-5) pode rejeitar max_tokens neste runtime; usar fast para compatibilidade imediata.
 JUDGE_MODEL_TIER = "fast"

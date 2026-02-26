@@ -29,7 +29,7 @@ def generate_report(results: dict, output_path: str) -> None:
 
     cards = []
     table_rows = []
-    for layer_name in ("a", "b", "c"):
+    for layer_name in ("a", "b", "c", "d"):
         layer = layers.get(layer_name, {}) if isinstance(layers, dict) else {}
         passed = bool(layer.get("passed", False))
         returncode = layer.get("returncode", "n/a")
