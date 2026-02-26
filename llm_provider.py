@@ -42,6 +42,11 @@ def _log(msg: str):
     logger.info("[LLM] %s", msg)
 
 
+def _is_gpt5_family(deployment: str) -> bool:
+    """Detect GPT-5 style Azure deployments."""
+    return "gpt-5" in (deployment or "").strip().lower()
+
+
 # =============================================================================
 # TOOL FORMAT TRANSLATION
 # =============================================================================
@@ -285,11 +290,13 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{self.deployment}"
             f"/chat/completions?api-version={API_VERSION_CHAT}"
         )
-        body = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        body = {"messages": messages}
+        if _is_gpt5_family(self.deployment):
+            # GPT-5 family rejects max_tokens and non-default temperature values.
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            body["max_tokens"] = max_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -333,12 +340,12 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{self.deployment}"
             f"/chat/completions?api-version={API_VERSION_CHAT}"
         )
-        body = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
+        body = {"messages": messages, "stream": True}
+        if _is_gpt5_family(self.deployment):
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            body["max_tokens"] = max_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
