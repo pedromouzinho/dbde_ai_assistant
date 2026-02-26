@@ -1,4 +1,4 @@
-"""Camada B — testes da tool search_web (Bing)."""
+"""Camada B — testes da tool search_web (Brave Search)."""
 
 from __future__ import annotations
 
@@ -41,16 +41,15 @@ class TestWebSearchTool:
 
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENABLED", True)
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_API_KEY", "k-test")
-        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://bing.test/search")
+        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://brave.test/search")
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_MAX_RESULTS", 5)
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_MARKET", "pt-PT")
 
         payload = {
-            "webPages": {
-                "totalEstimatedMatches": 123,
-                "value": [
-                    {"name": "DORA regulation", "url": "https://ex.com/dora", "snippet": "Resumo DORA"},
-                    {"name": "Azure DevOps", "url": "https://ex.com/ado", "snippet": "Novidades"},
+            "web": {
+                "results": [
+                    {"title": "DORA regulation", "url": "https://ex.com/dora", "description": "Resumo DORA"},
+                    {"title": "Azure DevOps", "url": "https://ex.com/ado", "description": "Novidades"},
                 ],
             }
         }
@@ -62,8 +61,9 @@ class TestWebSearchTool:
 
         result = await tools_knowledge.tool_search_web("dora", top=2)
         assert result["query"] == "dora"
-        assert result["total_estimated"] == 123
+        assert result["total_estimated"] == 2
         assert result["results_count"] == 2
+        assert result["results"][0]["title"] == "DORA regulation"
         assert result["results"][0]["url"] == "https://ex.com/dora"
 
     async def test_search_web_requires_configuration(self, monkeypatch):
@@ -87,7 +87,7 @@ class TestWebSearchTool:
 
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENABLED", True)
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_API_KEY", "k-test")
-        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://bing.test/search")
+        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://brave.test/search")
         monkeypatch.setattr(
             tools_knowledge.httpx,
             "AsyncClient",
@@ -103,7 +103,7 @@ class TestWebSearchTool:
 
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENABLED", True)
         monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_API_KEY", "k-test")
-        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://bing.test/search")
+        monkeypatch.setattr(tools_knowledge, "WEB_SEARCH_ENDPOINT", "https://brave.test/search")
         monkeypatch.setattr(
             tools_knowledge.httpx,
             "AsyncClient",
