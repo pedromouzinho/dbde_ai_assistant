@@ -40,8 +40,8 @@
         /* Scrollbar */
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #bbb; }
+        ::-webkit-scrollbar-thumb { background: #D4CCBF; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #B8AFA2; }
 
         /* Message content styling */
         .msg-content p { margin-bottom: 8px; }
@@ -61,7 +61,7 @@
             max-width: calc(100vw - 340px);
         }
         .msg-content code {
-            background: #F0F0F0; color: #DE3163; padding: 2px 7px; border-radius: 4px;
+            background: #EDE8E0; color: #DE3163; padding: 2px 7px; border-radius: 4px;
             font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace; font-size: 12.5px;
         }
         .msg-content pre code { background: none; color: inherit; padding: 0; }
@@ -2072,13 +2072,13 @@ function App() {
 
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
                     // Model tier selector
-                    React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
+                    React.createElement("div", { style: { display: "flex", background: "#E5DFD5", borderRadius: 8, padding: 2, gap: 2 } },
                         React.createElement("button", { className: "tier-btn" + (modelTier === "fast" ? " active" : ""), onClick: () => setModelTier("fast"), title: "GPT-5 mini — rápido e económico" }, "⚡ Fast"),
                         React.createElement("button", { className: "tier-btn" + (modelTier === "standard" ? " active" : ""), onClick: () => setModelTier("standard"), title: "GPT-5 chat — thinking (equilibrado)" }, "🧠 Thinking"),
                         React.createElement("button", { className: "tier-btn" + (modelTier === "pro" ? " active" : ""), onClick: () => setModelTier("pro"), title: "GPT-5.2 chat — máxima qualidade" }, "🔬 Pro")
                     ),
                     // Mode toggle
-                    React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
+                    React.createElement("div", { style: { display: "flex", background: "#E5DFD5", borderRadius: 8, padding: 2, gap: 2 } },
                         React.createElement("button", { className: "tier-btn" + (agentMode === "general" ? " active" : ""), onClick: () => switchMode("general") }, "General"),
                         React.createElement("button", { className: "tier-btn" + (agentMode === "userstory" ? " active" : ""), onClick: () => switchMode("userstory") }, "User Stories")
                     ),
