@@ -655,13 +655,19 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
         },
             React.createElement("div", null,
                 React.createElement("div", {
-                    style: { background: "#DE3163", color: "white", borderRadius: "16px 16px 4px 16px", padding: "12px 18px", maxWidth: 600, fontSize: 14, lineHeight: 1.6, wordBreak: "break-word" }
+                    style: {
+                        background: "#1A1A1A", color: "white",
+                        borderRadius: "18px 18px 4px 18px",
+                        padding: "14px 20px", maxWidth: 600,
+                        fontSize: 14, lineHeight: 1.6, wordBreak: "break-word",
+                        boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
+                    }
                 }, content),
                 // Show attached images
                 message.images && message.images.length > 0 && React.createElement("div", {
                     style: { display: "flex", gap: 6, marginTop: 6, justifyContent: "flex-end" }
                 }, message.images.map((img, i) =>
-                    React.createElement("img", { key: i, src: img.url || img.dataUrl, style: { width: 60, height: 60, borderRadius: 8, objectFit: "cover", border: "2px solid #DE3163" } })
+                    React.createElement("img", { key: i, src: img.url || img.dataUrl, style: { width: 60, height: 60, borderRadius: 10, objectFit: "cover", border: "2px solid rgba(255,255,255,0.3)" } })
                 ))
             )
         );
@@ -679,7 +685,14 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
             React.createElement(ToolBadges, { tools: message.tools_used, details: message.tool_details }),
             React.createElement("div", {
                 className: "msg-content",
-                style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", wordBreak: "break-word" },
+                style: {
+                    background: "white", borderRadius: "4px 18px 18px 18px",
+                    padding: "16px 22px",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.05)",
+                    fontSize: 14, lineHeight: 1.7, color: "#1a1a1a",
+                    wordBreak: "break-word",
+                    border: "1px solid rgba(0,0,0,0.04)",
+                },
                 dangerouslySetInnerHTML: { __html: renderMarkdown(content) },
             }),
             // Charts
@@ -699,7 +712,13 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
                         key: (fd.download_id || "file") + "-" + fi,
                         className: "export-btn",
                         onClick: () => onFileDownload(fd),
-                        style: { background: "#FFF0F3", border: "1px solid rgba(222,49,99,0.35)", borderRadius: 7, padding: "5px 12px", cursor: "pointer", fontSize: 11, color: "#B0103A", fontWeight: 700, fontFamily: "'Montserrat', sans-serif" },
+                        style: {
+                            background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)",
+                            borderRadius: 8, padding: "5px 12px", cursor: "pointer",
+                            fontSize: 11, color: "#666", fontWeight: 600,
+                            fontFamily: "'Montserrat', sans-serif",
+                            transition: "all 0.2s ease",
+                        },
                         title: fd.filename || "download",
                     }, "⬇ Download " + String(fd.format || "file").toUpperCase())
                 )
@@ -712,19 +731,31 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
                         key: fmt,
                         className: "export-btn",
                         onClick: () => onExport(fmt, message.tool_results, message.export_index, messageIndex),
-                        style: { background: "#f8f8f8", border: "1px solid #e0e0e0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#666", fontWeight: 500, fontFamily: "'Montserrat', sans-serif", transition: "all 0.15s" }
+                        style: {
+                            background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)",
+                            borderRadius: 8, padding: "5px 12px", cursor: "pointer",
+                            fontSize: 11, color: "#666", fontWeight: 600,
+                            fontFamily: "'Montserrat', sans-serif",
+                            transition: "all 0.2s ease",
+                        }
                     }, "⬇ " + fmt.toUpperCase())
                 ),
                 React.createElement("button", {
                     key: "bundle",
                     className: "export-btn",
                     onClick: () => onExportBundle(message.tool_results, message.export_index, messageIndex),
-                    style: { background: "#FFF0F3", border: "1px solid rgba(222,49,99,0.35)", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontSize: 11, color: "#B0103A", fontWeight: 700, fontFamily: "'Montserrat', sans-serif", transition: "all 0.15s" }
+                    style: {
+                        background: "rgba(0,0,0,0.03)", border: "1px solid rgba(0,0,0,0.08)",
+                        borderRadius: 8, padding: "5px 12px", cursor: "pointer",
+                        fontSize: 11, color: "#666", fontWeight: 600,
+                        fontFamily: "'Montserrat', sans-serif",
+                        transition: "all 0.2s ease",
+                    }
                 }, "⬇ Bundle ZIP")
             ),
             // Metadata line
             (message.total_time_ms || message.model_used) && React.createElement("div", {
-                style: { fontSize: 10, color: "#ccc", marginTop: 4, paddingLeft: 4 }
+                style: { fontSize: 10, color: "#ccc", marginTop: 6, paddingLeft: 2, fontWeight: 500 }
             },
                 message.model_used && React.createElement("span", null, message.model_used),
                 message.total_time_ms && React.createElement("span", null, ` · ${(message.total_time_ms / 1000).toFixed(1)}s`),
