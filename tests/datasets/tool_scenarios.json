@@ -489,6 +489,68 @@
       ],
       "should_succeed": false,
       "timeout_ms": 3000
+    },
+    {
+      "id": "TOOL-031",
+      "tool": "search_web",
+      "description": "Pesquisa web básica",
+      "input": {
+        "query": "DORA regulation",
+        "top": 3
+      },
+      "expected_behavior": "Retorna estrutura válida",
+      "expected_keys": [
+        "query",
+        "results",
+        "results_count"
+      ],
+      "should_succeed": true,
+      "timeout_ms": 6000
+    },
+    {
+      "id": "TOOL-032",
+      "tool": "search_web",
+      "description": "Pesquisa web sem query",
+      "input": {
+        "query": "",
+        "top": 3
+      },
+      "expected_behavior": "Retorna erro controlado",
+      "expected_keys": [
+        "error"
+      ],
+      "should_succeed": false,
+      "timeout_ms": 2000
+    },
+    {
+      "id": "TOOL-033",
+      "tool": "search_web",
+      "description": "Pesquisa web com top elevado",
+      "input": {
+        "query": "Azure DevOps 2026",
+        "top": 20
+      },
+      "expected_behavior": "Retorna estrutura válida",
+      "expected_keys": [
+        "results",
+        "results_count"
+      ],
+      "should_succeed": true,
+      "timeout_ms": 6000
+    },
+    {
+      "id": "TOOL-034",
+      "tool": "search_web",
+      "description": "Pesquisa web quando feature flag está desactivada",
+      "input": {
+        "query": "novidades agile"
+      },
+      "expected_behavior": "Retorna erro controlado",
+      "expected_keys": [
+        "error"
+      ],
+      "should_succeed": false,
+      "timeout_ms": 2000
     }
   ]
 }
