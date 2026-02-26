@@ -771,22 +771,41 @@ function LoginScreen({ onLogin }) {
     }
 
     return React.createElement("div", {
-        style: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: "linear-gradient(135deg, #EAE4DC 0%, #FFF0F3 100%)" }
+        style: {
+            display: "flex", alignItems: "center", justifyContent: "center",
+            minHeight: "100vh",
+            background: "#EAE4DC",
+        }
     },
         React.createElement("div", {
-            style: { width: 380, padding: 40, background: "white", borderRadius: 20, boxShadow: "0 8px 40px rgba(0,0,0,0.08)" }
+            style: {
+                width: 400, padding: "48px 44px", background: "white",
+                borderRadius: 24, boxShadow: "0 20px 60px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.04)",
+                border: "1px solid rgba(0,0,0,0.04)",
+            }
         },
             React.createElement("div", { style: { textAlign: "center", marginBottom: 32 } },
                 React.createElement("img", {
                     src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
-                    style: { width: 56, height: 56, borderRadius: 16, marginBottom: 16, boxShadow: "0 4px 16px rgba(26,26,26,0.15)" }
+                    style: { width: 52, height: 52, borderRadius: 14, marginBottom: 20 }
                 }),
-                React.createElement("div", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a1a" } }, "Assistente AI DBDE"),
-                React.createElement("div", { style: { fontSize: 13, color: "#888", marginTop: 4 } }, "Millennium BCP · v7.3.0")
+                React.createElement("div", {
+                    style: { fontSize: 22, fontWeight: 700, color: "#1a1a1a", letterSpacing: "-0.3px" }
+                }, "Assistente AI DBDE"),
+                React.createElement("div", {
+                    style: { fontSize: 12, color: "#aaa", marginTop: 6, fontWeight: 500, letterSpacing: "0.5px", textTransform: "uppercase" }
+                }, "Millennium BCP · v7.3.0")
             ),
-            error && React.createElement("div", { style: { background: "#FFF0F0", color: "#DE3163", padding: "10px 14px", borderRadius: 8, fontSize: 12, marginBottom: 16, textAlign: "center" } }, error),
-            React.createElement("input", { className: "login-input", placeholder: "Username", value: username, onChange: e => setUsername(e.target.value), onKeyDown: e => { if (e.key === "Enter") handleSubmit(); }, style: { marginBottom: 12 } }),
-            React.createElement("input", { className: "login-input", type: "password", placeholder: "Password", value: password, onChange: e => setPassword(e.target.value), onKeyDown: e => { if (e.key === "Enter") handleSubmit(); }, style: { marginBottom: 20 } }),
+            error && React.createElement("div", {
+                style: {
+                    background: "rgba(222,49,99,0.06)", color: "#B0103A",
+                    padding: "10px 16px", borderRadius: 10, fontSize: 12,
+                    marginBottom: 16, textAlign: "center", fontWeight: 500,
+                    border: "1px solid rgba(222,49,99,0.12)",
+                }
+            }, error),
+            React.createElement("input", { className: "login-input", placeholder: "Username", value: username, onChange: e => setUsername(e.target.value), onKeyDown: e => { if (e.key === "Enter") handleSubmit(); }, style: { marginBottom: 14 } }),
+            React.createElement("input", { className: "login-input", type: "password", placeholder: "Password", value: password, onChange: e => setPassword(e.target.value), onKeyDown: e => { if (e.key === "Enter") handleSubmit(); }, style: { marginBottom: 24 } }),
             React.createElement("button", { className: "login-btn", onClick: handleSubmit, disabled: loading || !username.trim() || !password }, loading ? "A autenticar..." : "Entrar")
         )
     );
