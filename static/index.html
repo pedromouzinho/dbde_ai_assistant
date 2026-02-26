@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Assistente AI DBDE v7.3.0</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23DE3163'/><text x='50' y='70' font-size='60' font-weight='bold' fill='white' text-anchor='middle' font-family='sans-serif'>M</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%231A1A1A'/><text x='50' y='72' font-size='64' font-weight='800' fill='%23DE3163' text-anchor='middle' font-family='sans-serif' letter-spacing='-2'>M</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -15,7 +15,7 @@
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: #F7F7F8;
+            background: #EAE4DC;
             overflow: hidden;
             -webkit-font-smoothing: antialiased;
         }
@@ -40,8 +40,8 @@
         /* Scrollbar */
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #bbb; }
+        ::-webkit-scrollbar-thumb { background: #D4CCBF; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #B8AFA2; }
 
         /* Message content styling */
         .msg-content p { margin-bottom: 8px; }
@@ -61,7 +61,7 @@
             max-width: calc(100vw - 340px);
         }
         .msg-content code {
-            background: #F0F0F0; color: #DE3163; padding: 2px 7px; border-radius: 4px;
+            background: #EDE8E0; color: #DE3163; padding: 2px 7px; border-radius: 4px;
             font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace; font-size: 12.5px;
         }
         .msg-content pre code { background: none; color: inherit; padding: 0; }
@@ -84,7 +84,7 @@
             padding: 8px 14px; border-bottom: 1px solid #f0f0f0;
             max-width: 300px; overflow: hidden; text-overflow: ellipsis;
         }
-        .msg-content tbody tr:nth-child(even) { background: #FAFAFA; }
+        .msg-content tbody tr:nth-child(even) { background: #F5F0EB; }
         .msg-content tbody tr:hover { background: #FFF5F7; }
 
         /* Sidebar hover */
@@ -107,11 +107,8 @@
         .login-btn:hover:not(:disabled) { background: #C4284F; transform: translateY(-1px); }
         .login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-        /* Tier selector */
-        .tier-btn { padding: 5px 12px; border-radius: 6px; border: none; cursor: pointer; font-size: 11px; font-weight: 600; font-family: 'Montserrat', sans-serif; transition: all 0.2s; }
-        .tier-btn.active { background: #DE3163; color: white; }
-        .tier-btn:not(.active) { background: transparent; color: #888; }
-        .tier-btn:not(.active):hover { color: #DE3163; background: rgba(222,49,99,0.06); }
+        /* Unified selector */
+        .selector-trigger:hover { border-color: #DE3163 !important; color: #DE3163 !important; }
 
         /* Streaming indicator */
         .streaming-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #DE3163; animation: pulse 1s infinite; margin-left: 4px; vertical-align: middle; }
@@ -131,6 +128,14 @@ const DEFAULT_MAX_BATCH_TOTAL_BYTES = 60 * 1024 * 1024;
 const UPLOAD_POLL_INTERVAL_MS = 1200;
 const UPLOAD_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 const DEVOPS_WORKITEM_BASE_URL = "https://dev.azure.com/ptbcp/IT.DIT/_workitems/edit/";
+// Logo oficial Millennium — "M" estilizado cerise sobre fundo escuro
+const MILLENNIUM_LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="16" fill="#1A1A1A"/>
+  <text x="50" y="72" font-size="64" font-weight="800" fill="#DE3163"
+        text-anchor="middle" font-family="'Montserrat', sans-serif"
+        letter-spacing="-2">M</text>
+</svg>`;
+const MILLENNIUM_LOGO_DATA_URI = "data:image/svg+xml," + encodeURIComponent(MILLENNIUM_LOGO_SVG);
 
 // ─── Markdown Renderer ──────────────────────────────────────────────────────
 function escapeHtml(text) {
@@ -536,9 +541,10 @@ function TypingIndicator({ text }) {
     return React.createElement("div", {
         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
     },
-        React.createElement("div", {
-            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-        }, "M"),
+        React.createElement("img", {
+            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+        }),
         React.createElement("div", {
             style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "12px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 13, color: "#888" }
         },
@@ -632,9 +638,10 @@ function MessageBubble({ message, isLastAssistant, conversationId, messageIndex,
     return React.createElement("div", {
         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
     },
-        React.createElement("div", {
-            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-        }, "M"),
+        React.createElement("img", {
+            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+        }),
         React.createElement("div", { style: { flex: 1, minWidth: 0, maxWidth: 900 } },
             React.createElement(ToolBadges, { tools: message.tools_used, details: message.tool_details }),
             React.createElement("div", {
@@ -731,15 +738,16 @@ function LoginScreen({ onLogin }) {
     }
 
     return React.createElement("div", {
-        style: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: "linear-gradient(135deg, #F7F7F8 0%, #FFF0F3 100%)" }
+        style: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", background: "linear-gradient(135deg, #EAE4DC 0%, #FFF0F3 100%)" }
     },
         React.createElement("div", {
             style: { width: 380, padding: 40, background: "white", borderRadius: 20, boxShadow: "0 8px 40px rgba(0,0,0,0.08)" }
         },
             React.createElement("div", { style: { textAlign: "center", marginBottom: 32 } },
-                React.createElement("div", {
-                    style: { width: 56, height: 56, borderRadius: 16, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "inline-flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 24, fontWeight: 700, marginBottom: 16, boxShadow: "0 4px 16px rgba(222,49,99,0.25)" }
-                }, "M"),
+                React.createElement("img", {
+                    src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                    style: { width: 56, height: 56, borderRadius: 16, marginBottom: 16, boxShadow: "0 4px 16px rgba(26,26,26,0.15)" }
+                }),
                 React.createElement("div", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a1a" } }, "Assistente AI DBDE"),
                 React.createElement("div", { style: { fontSize: 13, color: "#888", marginTop: 4 } }, "Millennium BCP · v7.3.0")
             ),
@@ -848,6 +856,8 @@ function App() {
     const [auth, setAuth] = useState(null);
     const [authInitializing, setAuthInitializing] = useState(true);
     const [showExportDropdown, setShowExportDropdown] = useState(false);
+    const [selectorOpen, setSelectorOpen] = useState(false);
+    const [suggestionSeed, setSuggestionSeed] = useState(0);
 
     const active = conversations[activeIdx];
     const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
@@ -858,8 +868,18 @@ function App() {
     const inputRef = useRef(null);
     const fileInputRef = useRef(null);
     const imageInputRef = useRef(null);
+    const selectorRef = useRef(null);
 
     useEffect(() => { chatEndRef.current && chatEndRef.current.scrollIntoView({ behavior: "smooth" }); }, [conversations, activeIdx, loading, streamingText]);
+    useEffect(() => {
+        function handleClickOutside(e) {
+            if (selectorRef.current && !selectorRef.current.contains(e.target)) {
+                setSelectorOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, []);
 
     function handleLogin(user) {
         const a = { user };
@@ -1939,24 +1959,111 @@ function App() {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
     }
 
-    const generalSuggestions = [
-        "Quantas user stories existem na área RevampFEE?",
-        "Quais bugs estão ativos no MDSE?",
-        "Como fazer uma transferência SPIN no MSE?",
-        "Quem criou mais user stories este mês?",
-    ];
-    const usSuggestions = [
-        "Gera 3 user stories sobre pagamento de serviços",
-        "Quero adicionar um campo de IBAN no formulário",
-        "Cria uma US para exportar PDF nas consultas",
-        "Gera user stories para abertura de conta online",
-    ];
-    const suggestions = agentMode === "userstory" ? usSuggestions : generalSuggestions;
+    const suggestionPools = {
+        general: {
+            rag: [
+                "Quantas user stories existem na área RevampFEE?",
+                "Quais bugs estão ativos no MDSE?",
+                "Mostra os work items criados esta semana",
+                "Lista as user stories em estado Active",
+                "Quais áreas têm mais bugs abertos?",
+            ],
+            knowledge: [
+                "Como fazer uma transferência SPIN no MSE?",
+                "O que é o processo de KYC no Millennium?",
+                "Explica o fluxo de abertura de conta digital",
+                "Quais são as regras de compliance para SEPA?",
+            ],
+            analytics: [
+                "Quem criou mais user stories este mês?",
+                "Mostra KPIs da equipa MDSE no último sprint",
+                "Qual a velocity média da área RevampFEE?",
+                "Gera um gráfico de bugs por prioridade",
+            ],
+            files: [
+                "Analisa o ficheiro Excel que vou anexar",
+                "Compara os dados dos 2 ficheiros CSV",
+                "Resume o conteúdo do PDF anexado",
+            ],
+        },
+        userstory: {
+            creation: [
+                "Gera 3 user stories sobre pagamento de serviços",
+                "Cria uma US para exportar PDF nas consultas",
+                "Gera user stories para abertura de conta online",
+                "Cria user stories para o módulo de notificações push",
+                "Gera uma US para autenticação biométrica",
+            ],
+            modification: [
+                "Quero adicionar um campo de IBAN no formulário",
+                "Preciso de uma US para alterar o layout do dashboard",
+                "Cria uma US para adicionar filtros na pesquisa",
+            ],
+            integration: [
+                "Gera US para integração com sistema de pagamentos",
+                "Cria user stories para a API de consulta de saldos",
+                "US para integrar notificações por email",
+            ],
+        },
+    };
+    function getDynamicSuggestions(mode, convList, filesList) {
+        const pool = suggestionPools[mode] || suggestionPools.general;
+        const allSuggestions = Object.values(pool).flat();
+
+        const recentMessages = convList
+            .flatMap(c => c.messages || [])
+            .filter(m => m.role === "user")
+            .slice(-20)
+            .map(m => (m.content || m.text || "").toLowerCase());
+
+        const usedCategories = new Set();
+        for (const msg of recentMessages) {
+            for (const [cat, items] of Object.entries(pool)) {
+                if (items.some(s => msg.includes(s.slice(0, 20).toLowerCase()))) {
+                    usedCategories.add(cat);
+                }
+            }
+        }
+
+        const hasFiles = filesList && filesList.length > 0;
+        const selected = [];
+        const categories = Object.keys(pool);
+
+        if (hasFiles && pool.files) {
+            const fileSugg = pool.files[Math.floor(Math.random() * pool.files.length)];
+            selected.push(fileSugg);
+        }
+
+        const shuffledCats = categories.sort(() => Math.random() - 0.5);
+        for (const cat of shuffledCats) {
+            if (selected.length >= 4) break;
+            if (hasFiles && cat === "files") continue;
+            const catItems = pool[cat].filter(s => !selected.includes(s));
+            if (catItems.length > 0) {
+                selected.push(catItems[Math.floor(Math.random() * catItems.length)]);
+            }
+        }
+
+        while (selected.length < 4 && allSuggestions.length > 0) {
+            const remaining = allSuggestions.filter(s => !selected.includes(s));
+            if (remaining.length === 0) break;
+            selected.push(remaining[Math.floor(Math.random() * remaining.length)]);
+        }
+
+        return selected.slice(0, 4);
+    }
+    const tierLabels = { fast: "⚡ Fast", standard: "🧠 Thinking", pro: "🔬 Pro" };
+    const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
+    const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
+    const suggestions = React.useMemo(
+        () => getDynamicSuggestions(agentMode, conversations, activeUploadedFiles),
+        [agentMode, suggestionSeed, activeIdx]
+    );
 
     // ─── Render ──────────────────────────────────────────────────────────
 
     return React.createElement("div", {
-        style: { display: "flex", height: "100vh", overflow: "hidden", background: "#F7F7F8" }
+        style: { display: "flex", height: "100vh", overflow: "hidden", background: "#EAE4DC" }
     },
 
         // ─── Sidebar ─────────────────────────────────────────────────────
@@ -1971,9 +2078,10 @@ function App() {
             // Sidebar header
             React.createElement("div", { style: { padding: "20px 20px 16px", borderBottom: "1px solid #EBEBEB" } },
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 16 } },
-                    React.createElement("div", {
-                        style: { width: 36, height: 36, borderRadius: 10, background: "linear-gradient(135deg, #DE3163 0%, #8B0022 100%)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 16, fontWeight: 700, flexShrink: 0 }
-                    }, "M"),
+                    React.createElement("img", {
+                        src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                        style: { width: 36, height: 36, borderRadius: 10, flexShrink: 0 }
+                    }),
                     React.createElement("div", null,
                         React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: "#1a1a1a", lineHeight: 1.2 } }, "Assistente AI"),
                         React.createElement("div", { style: { fontSize: 11, color: "#999", fontWeight: 500 } }, "DBDE v7.3.0")
@@ -2059,16 +2167,87 @@ function App() {
                 ),
 
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-                    // Model tier selector
-                    React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "fast" ? " active" : ""), onClick: () => setModelTier("fast"), title: "GPT-5 mini — rápido e económico" }, "⚡ Fast"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "standard" ? " active" : ""), onClick: () => setModelTier("standard"), title: "GPT-5 chat — thinking (equilibrado)" }, "🧠 Thinking"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "pro" ? " active" : ""), onClick: () => setModelTier("pro"), title: "GPT-5.2 chat — máxima qualidade" }, "🔬 Pro")
-                    ),
-                    // Mode toggle
-                    React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
-                        React.createElement("button", { className: "tier-btn" + (agentMode === "general" ? " active" : ""), onClick: () => switchMode("general") }, "General"),
-                        React.createElement("button", { className: "tier-btn" + (agentMode === "userstory" ? " active" : ""), onClick: () => switchMode("userstory") }, "User Stories")
+                    React.createElement("div", {
+                        ref: selectorRef,
+                        style: { position: "relative" }
+                    },
+                        React.createElement("button", {
+                            className: "selector-trigger",
+                            onClick: () => setSelectorOpen(!selectorOpen),
+                            style: {
+                                display: "flex", alignItems: "center", gap: 6,
+                                padding: "6px 14px", borderRadius: 10,
+                                border: "1.5px solid #E0E0E0", background: "white",
+                                cursor: "pointer", fontSize: 12, fontWeight: 600,
+                                fontFamily: "'Montserrat', sans-serif", color: "#444",
+                                transition: "all 0.15s",
+                                ...(selectorOpen ? { borderColor: "#DE3163", color: "#DE3163" } : {})
+                            }
+                        },
+                            React.createElement("span", null, selectorLabel),
+                            React.createElement("span", {
+                                style: { fontSize: 10, marginLeft: 2, transition: "transform 0.2s", transform: selectorOpen ? "rotate(180deg)" : "rotate(0)" }
+                            }, "▾")
+                        ),
+                        selectorOpen && React.createElement("div", {
+                            style: {
+                                position: "absolute", right: 0, top: "calc(100% + 6px)",
+                                background: "white", borderRadius: 12,
+                                boxShadow: "0 8px 32px rgba(0,0,0,0.12)",
+                                padding: 12, minWidth: 200, zIndex: 1000,
+                                border: "1px solid #eee", animation: "fadeUp 0.2s ease"
+                            }
+                        },
+                            React.createElement("div", {
+                                style: { fontSize: 10, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6, padding: "0 4px" }
+                            }, "Modelo"),
+                            ["fast", "standard", "pro"].map(t =>
+                                React.createElement("button", {
+                                    key: t,
+                                    onClick: () => { setModelTier(t); },
+                                    style: {
+                                        display: "flex", alignItems: "center", gap: 8,
+                                        width: "100%", padding: "8px 10px", border: "none",
+                                        borderRadius: 8, cursor: "pointer", fontSize: 12,
+                                        fontFamily: "'Montserrat', sans-serif",
+                                        fontWeight: modelTier === t ? 700 : 400,
+                                        background: modelTier === t ? "#FFF0F3" : "transparent",
+                                        color: modelTier === t ? "#DE3163" : "#444",
+                                        transition: "all 0.15s"
+                                    },
+                                    onMouseEnter: e => { if (modelTier !== t) e.currentTarget.style.background = "#f5f5f5"; },
+                                    onMouseLeave: e => { if (modelTier !== t) e.currentTarget.style.background = "transparent"; },
+                                },
+                                    React.createElement("span", null, tierLabels[t]),
+                                    modelTier === t && React.createElement("span", { style: { marginLeft: "auto", fontSize: 11 } }, "✓")
+                                )
+                            ),
+                            React.createElement("div", { style: { borderTop: "1px solid #f0f0f0", margin: "8px 0" } }),
+                            React.createElement("div", {
+                                style: { fontSize: 10, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6, padding: "0 4px" }
+                            }, "Modo"),
+                            ["general", "userstory"].map(m =>
+                                React.createElement("button", {
+                                    key: m,
+                                    onClick: () => { switchMode(m); setSelectorOpen(false); },
+                                    style: {
+                                        display: "flex", alignItems: "center", gap: 8,
+                                        width: "100%", padding: "8px 10px", border: "none",
+                                        borderRadius: 8, cursor: "pointer", fontSize: 12,
+                                        fontFamily: "'Montserrat', sans-serif",
+                                        fontWeight: agentMode === m ? 700 : 400,
+                                        background: agentMode === m ? "#FFF0F3" : "transparent",
+                                        color: agentMode === m ? "#DE3163" : "#444",
+                                        transition: "all 0.15s"
+                                    },
+                                    onMouseEnter: e => { if (agentMode !== m) e.currentTarget.style.background = "#f5f5f5"; },
+                                    onMouseLeave: e => { if (agentMode !== m) e.currentTarget.style.background = "transparent"; },
+                                },
+                                    React.createElement("span", null, modeLabels[m]),
+                                    agentMode === m && React.createElement("span", { style: { marginLeft: "auto", fontSize: 11 } }, "✓")
+                                )
+                            )
+                        )
                     ),
                     React.createElement("div", { style: { position: "relative" } },
                         React.createElement("button", {
@@ -2097,16 +2276,17 @@ function App() {
 
             // ─── Chat area ────────────────────────────────────────────────
             React.createElement("div", {
-                style: { flex: 1, overflowY: "auto", padding: "24px 24px 8px", background: "#F7F7F8" }
+                style: { flex: 1, overflowY: "auto", padding: "24px 24px 8px", background: "#EAE4DC" }
             },
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto" } },
 
                     // Welcome screen
                     (!active || active.messages.length === 0) && !loading &&
                     React.createElement("div", { style: { textAlign: "center", paddingTop: "12vh", animation: "fadeUp 0.5s ease" } },
-                        React.createElement("div", {
-                            style: { width: 64, height: 64, borderRadius: 18, background: "linear-gradient(135deg, #DE3163 0%, #8B0022 100%)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", color: "white", fontSize: 28, fontWeight: 700, boxShadow: "0 8px 32px rgba(222,49,99,0.2)" }
-                        }, "M"),
+                        React.createElement("img", {
+                            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                            style: { width: 64, height: 64, borderRadius: 18, margin: "0 auto 20px", boxShadow: "0 8px 32px rgba(26,26,26,0.15)" }
+                        }),
                         React.createElement("div", { style: { fontSize: 22, fontWeight: 700, color: "#1a1a1a", marginBottom: 8 } },
                             agentMode === "userstory" ? "User Story Writer" : "Assistente AI DBDE"
                         ),
@@ -2121,7 +2301,18 @@ function App() {
                                     style: { background: "white", border: "1px solid #e8e8e8", borderRadius: 12, padding: "10px 16px", fontSize: 13, color: "#555", cursor: "pointer", textAlign: "left", maxWidth: 280, transition: "all 0.15s ease", lineHeight: 1.4, fontFamily: "'Montserrat', sans-serif" }
                                 }, q)
                             )
-                        )
+                        ),
+                        React.createElement("button", {
+                            onClick: () => setSuggestionSeed(s => s + 1),
+                            style: {
+                                marginTop: 12, background: "none", border: "none",
+                                cursor: "pointer", fontSize: 12, color: "#999",
+                                fontFamily: "'Montserrat', sans-serif",
+                                transition: "color 0.15s"
+                            },
+                            onMouseEnter: e => e.currentTarget.style.color = "#DE3163",
+                            onMouseLeave: e => e.currentTarget.style.color = "#999",
+                        }, "↻ Outras sugestões")
                     ),
 
                     // Messages
@@ -2141,9 +2332,10 @@ function App() {
                     loading && (streamingText || streamingRenderedBlocks.length > 0 || streamingActiveBlock) && React.createElement("div", {
                         style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 16, animation: "fadeUp 0.3s ease" }
                     },
-                        React.createElement("div", {
-                            style: { width: 32, height: 32, borderRadius: 10, background: "linear-gradient(135deg, #DE3163, #8B0022)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 14, fontWeight: 700, flexShrink: 0 }
-                        }, "M"),
+                        React.createElement("img", {
+                            src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
+                            style: { width: 32, height: 32, borderRadius: 10, flexShrink: 0 }
+                        }),
                         React.createElement("div", {
                             className: "msg-content",
                             style: { background: "white", borderRadius: "4px 16px 16px 16px", padding: "14px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.7, color: "#1a1a1a", maxWidth: "min(900px, 100%)" }
@@ -2238,7 +2430,7 @@ function App() {
                             ? `Pergunta sobre os ${activeUploadedFiles.length} ficheiros anexados...`
                             : agentMode === "userstory" ? "Descreve a funcionalidade para gerar User Stories..." : "Faz uma pergunta sobre DevOps, KPIs, User Stories...",
                         rows: 1,
-                        style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#FAFAFA", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
+                        style: { flex: 1, resize: "none", border: "1.5px solid #E0E0E0", borderRadius: 14, padding: "12px 18px", fontSize: 14, fontFamily: "'Montserrat', sans-serif", lineHeight: 1.5, background: "#F5F0EB", color: "#1a1a1a", transition: "all 0.2s ease", minHeight: 46, maxHeight: 120, outline: "none" },
                         onFocus: e => e.target.style.borderColor = "#DE3163",
                         onBlur: e => e.target.style.borderColor = "#E0E0E0",
                         onInput: e => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px"; }
