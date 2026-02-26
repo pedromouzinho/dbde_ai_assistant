@@ -128,22 +128,22 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
         return cached
 
     if fk:
-        file_meta = await _figma_get(f"/files/{quote(fk, safe='')}")
-        if "error" in file_meta:
-            return file_meta
-
-        file_name = file_meta.get("name", "")
-        thumbnail_url = file_meta.get("thumbnailUrl", "")
-        last_modified = file_meta.get("lastModified", "")
+        file_name = ""
+        thumbnail_url = ""
+        last_modified = ""
         items = []
 
         if nid:
+            # Fast path: fetch only the requested node and avoid loading full file payload.
             nodes = await _figma_get(
                 f"/files/{quote(fk, safe='')}/nodes",
                 params={"ids": nid},
             )
             if "error" in nodes:
                 return nodes
+            file_name = nodes.get("name", "")
+            thumbnail_url = nodes.get("thumbnailUrl", "")
+            last_modified = nodes.get("lastModified", "")
             raw_nodes = nodes.get("nodes", {})
             for node_key, node_val in raw_nodes.items():
                 document = (node_val or {}).get("document", {})
@@ -162,6 +162,17 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
                         }
                     )
         else:
+            # Use bounded depth to prevent very large responses on large design files.
+            file_meta = await _figma_get(
+                f"/files/{quote(fk, safe='')}",
+                params={"depth": 2},
+            )
+            if "error" in file_meta:
+                return file_meta
+
+            file_name = file_meta.get("name", "")
+            thumbnail_url = file_meta.get("thumbnailUrl", "")
+            last_modified = file_meta.get("lastModified", "")
             doc = file_meta.get("document", {})
             for page in doc.get("children", [])[:50]:
                 page_name = page.get("name", "")
