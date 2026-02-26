@@ -141,6 +141,64 @@ def _clean_html_for_example(html_text: str) -> str:
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
 
+
+def _validate_us_output(raw_output: str) -> dict:
+    """Valida e pontua o output de geração de US contra o formato MSE."""
+    issues = []
+    score = 1.0
+    cleaned = str(raw_output or "")
+
+    titles = re.findall(r"\*\*Título\*\*:\s*(.+)", cleaned)
+    if not titles:
+        titles = re.findall(r"Título:\s*(.+)", cleaned)
+    for title in titles:
+        title_txt = str(title or "").strip()
+        if not title_txt.startswith("MSE"):
+            issues.append(f"Título não começa com 'MSE': {title_txt[:60]}")
+            score -= 0.15
+        pipe_count = title_txt.count("|")
+        if pipe_count < 3:
+            issues.append(f"Título com poucos separadores ({pipe_count}): {title_txt[:60]}")
+            score -= 0.1
+
+    if "Eu como <b>" not in cleaned and "Eu como" not in cleaned:
+        issues.append("Descrição não segue formato 'Eu como <b>[Persona]</b>'")
+        score -= 0.15
+
+    required_sections = ["Objetivo", "Âmbito", "Composição", "Layout", "Comportamento", "Regras"]
+    found_sections = sum(1 for section in required_sections if section.lower() in cleaned.lower())
+    if found_sections < 3:
+        issues.append(f"ACs com poucas secções obrigatórias ({found_sections}/{len(required_sections)})")
+        score -= 0.2
+
+    dirty_tags = re.findall(
+        r"<(?:font|span\s+style|table|td|tr|th|p\s+style|h[1-6]\s+style)[^>]*>",
+        cleaned,
+    )
+    if dirty_tags:
+        issues.append(f"HTML sujo detectado: {dirty_tags[:3]}")
+        score -= 0.2
+        cleaned = re.sub(r"</?(?:font|span|table|tr|td|th|p)(?:\s[^>]*)?>", "", cleaned)
+        cleaned = re.sub(r'\s*style="[^"]*"', "", cleaned)
+        cleaned = cleaned.replace("&nbsp;", " ")
+
+    en_terms = ["Description", "Acceptance Criteria", "As a ", "I want to", "So that"]
+    en_found = [term for term in en_terms if term in cleaned]
+    if en_found:
+        issues.append(f"Termos em inglês detectados: {en_found}")
+        score -= 0.1
+
+    mse_vocab = ["CTA", "Toast", "Modal", "Enable", "Disable", "Dropdown", "Input", "Stepper", "FEE"]
+    vocab_found = sum(1 for term in mse_vocab if term.lower() in cleaned.lower())
+
+    return {
+        "valid": len(issues) == 0,
+        "score": max(0.0, score),
+        "issues": issues,
+        "cleaned_output": cleaned,
+        "vocab_mse_count": vocab_found,
+    }
+
 def _extract_json_object(text: str):
     if not isinstance(text, str):
         return None
@@ -628,6 +686,10 @@ REGRAS ABSOLUTAS:
     except Exception as e:
         logging.error("[Tools] tool_generate_user_stories failed: %s", e)
         gen = f"Erro: {e}"
+    validation = _validate_us_output(gen)
+    if validation.get("cleaned_output") and validation["cleaned_output"] != gen:
+        logging.info("[Tools] US output auto-cleaned: %d issues", len(validation.get("issues", [])))
+        gen = validation["cleaned_output"]
     return {
         "generated_user_stories": gen,
         "based_on_examples": raw.get("samples_returned", 0) if raw else 0,
@@ -635,6 +697,8 @@ REGRAS ABSOLUTAS:
         "used_writer_profile": bool(style_profile),
         "topic": topic,
         "num_requested": num_stories,
+        "quality_score": validation.get("score", 0.0),
+        "quality_issues": validation.get("issues", []),
     }
 
 async def tool_query_hierarchy(
