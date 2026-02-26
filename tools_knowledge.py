@@ -27,6 +27,9 @@ from http_helpers import search_request_with_retry
 
 _http_client: Optional[httpx.AsyncClient] = None
 
+if RERANK_ENABLED:
+    logging.info("[RAG] Reranking enabled: model=%s, top_n=%s", RERANK_MODEL, RERANK_TOP_N)
+
 
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client

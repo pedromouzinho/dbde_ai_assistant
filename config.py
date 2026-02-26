@@ -105,11 +105,11 @@ TOP_K = int(_get_env("TOP_K", "10"))
 # =============================================================================
 # POST-RETRIEVAL RERANK
 # =============================================================================
-RERANK_ENABLED = _get_env("RERANK_ENABLED", "false").lower() == "true"
+RERANK_ENABLED = _get_env("RERANK_ENABLED", "true").lower() == "true"
 RERANK_ENDPOINT = _get_env("RERANK_ENDPOINT", "")
 RERANK_API_KEY = _get_env("RERANK_API_KEY", "")
 RERANK_MODEL = _get_env("RERANK_MODEL", "cohere-rerank-v4.0-fast")
-RERANK_TOP_N = int(_get_env("RERANK_TOP_N", "30"))
+RERANK_TOP_N = int(_get_env("RERANK_TOP_N", "15"))
 RERANK_TIMEOUT_SECONDS = float(_get_env("RERANK_TIMEOUT_SECONDS", "15"))
 RERANK_AUTH_MODE = _get_env("RERANK_AUTH_MODE", "api-key").lower()
 
