@@ -118,11 +118,11 @@ RERANK_TIMEOUT_SECONDS = float(_get_env("RERANK_TIMEOUT_SECONDS", "15"))
 RERANK_AUTH_MODE = _get_env("RERANK_AUTH_MODE", "api-key").lower()
 
 # =============================================================================
-# WEB SEARCH (Bing Search API v7)
+# WEB SEARCH (Brave Search API)
 # =============================================================================
 WEB_SEARCH_ENABLED = _get_env("WEB_SEARCH_ENABLED", "false").lower() == "true"
 WEB_SEARCH_API_KEY = _get_env("WEB_SEARCH_API_KEY", "")
-WEB_SEARCH_ENDPOINT = _get_env("WEB_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
+WEB_SEARCH_ENDPOINT = _get_env("WEB_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search")
 WEB_SEARCH_MAX_RESULTS = int(_get_env("WEB_SEARCH_MAX_RESULTS", "5"))
 WEB_SEARCH_MARKET = _get_env("WEB_SEARCH_MARKET", "pt-PT")
 
