@@ -117,6 +117,30 @@ def _sanitize_wiql_where(wiql_where: str) -> str:
         raise ValueError("wiql_where com aspas simples não balanceadas")
     return where
 
+
+def _clean_html_for_example(html_text: str) -> str:
+    """Remove HTML sujo dos exemplos, mantendo apenas tags limpas."""
+    text = str(html_text or "")
+    if not text:
+        return ""
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", text)
+
+    allowed_tags = {"b", "ul", "li", "br", "div"}
+
+    def _normalize_tag(match):
+        closing = bool(match.group(1))
+        tag = str(match.group(2) or "").lower()
+        if tag not in allowed_tags:
+            return ""
+        if tag == "br":
+            return "<br>"
+        return f"</{tag}>" if closing else f"<{tag}>"
+
+    text = re.sub(r"<\s*(/?)\s*([a-zA-Z0-9]+)([^>]*)>", _normalize_tag, text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
 def _extract_json_object(text: str):
     if not isinstance(text, str):
         return None
@@ -399,7 +423,7 @@ async def tool_analyze_patterns(created_by=None, topic=None, work_item_type="Use
             if "error" not in r:
                 for it in r.get("value",[]):
                     f=it.get("fields",{}); cb=f.get("System.CreatedBy",{})
-                    samples.append({"id":it["id"],"title":f.get("System.Title","").replace(" | "," — "),"created_by":cb.get("displayName","") if isinstance(cb,dict) else str(cb),"description":(f.get("System.Description","") or "")[:1000],"acceptance_criteria":(f.get("Microsoft.VSTS.Common.AcceptanceCriteria","") or "")[:1000],"tags":f.get("System.Tags","")})
+                    samples.append({"id":it["id"],"title":f.get("System.Title","").replace(" | "," — "),"created_by":cb.get("displayName","") if isinstance(cb,dict) else str(cb),"description":(f.get("System.Description","") or "")[:2000],"acceptance_criteria":(f.get("Microsoft.VSTS.Common.AcceptanceCriteria","") or "")[:3000],"tags":f.get("System.Tags","")})
         except Exception as e:
             logging.error("[Tools] tool_analyze_patterns LLM block failed: %s", e)
     if not samples: samples = [{"id":it.get("id"),"title":it.get("title","")} for it in result.get("items",[])]
@@ -473,10 +497,14 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             )
             if raw2.get("samples_returned", 0) > raw.get("samples_returned", 0):
                 raw = raw2
-        for i, s in enumerate(raw.get("analysis_data", [])[:12], 1):
+        for i, s in enumerate(raw.get("analysis_data", [])[:8], 1):
             ex += f"\n{'='*50}\nEXEMPLO {i} (ID:{s.get('id','?')})\n{'='*50}\nTÍTULO: {s.get('title','')}\nCRIADOR: {s.get('created_by','')}\n"
-            if s.get("description"): ex += f"DESC:\n{s['description'][:800]}\n"
-            if s.get("acceptance_criteria"): ex += f"AC:\n{s['acceptance_criteria'][:800]}\n"
+            if s.get("description"):
+                clean_desc = _clean_html_for_example(s["description"][:1500])
+                ex += f"DESC:\n{clean_desc}\n"
+            if s.get("acceptance_criteria"):
+                clean_ac = _clean_html_for_example(s["acceptance_criteria"][:2000])
+                ex += f"AC:\n{clean_ac}\n"
         if not ex:
             ex = "(Sem exemplos — usa boas práticas)"
         reference_ids = [s.get("id") for s in raw.get("analysis_data", [])]
