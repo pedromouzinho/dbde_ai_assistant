@@ -860,6 +860,7 @@ function App() {
     const [authInitializing, setAuthInitializing] = useState(true);
     const [showExportDropdown, setShowExportDropdown] = useState(false);
     const [selectorOpen, setSelectorOpen] = useState(false);
+    const [suggestionSeed, setSuggestionSeed] = useState(0);
 
     const active = conversations[activeIdx];
     const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
@@ -2057,7 +2058,10 @@ function App() {
     const tierLabels = { fast: "⚡ Fast", standard: "🧠 Thinking", pro: "🔬 Pro" };
     const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
     const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
-    const suggestions = getDynamicSuggestions(agentMode, conversations, activeUploadedFiles);
+    const suggestions = React.useMemo(
+        () => getDynamicSuggestions(agentMode, conversations, activeUploadedFiles),
+        [agentMode, suggestionSeed, activeIdx]
+    );
 
     // ─── Render ──────────────────────────────────────────────────────────
 
@@ -2299,7 +2303,18 @@ function App() {
                                     style: { background: "white", border: "1px solid #e8e8e8", borderRadius: 12, padding: "10px 16px", fontSize: 13, color: "#555", cursor: "pointer", textAlign: "left", maxWidth: 280, transition: "all 0.15s ease", lineHeight: 1.4, fontFamily: "'Montserrat', sans-serif" }
                                 }, q)
                             )
-                        )
+                        ),
+                        React.createElement("button", {
+                            onClick: () => setSuggestionSeed(s => s + 1),
+                            style: {
+                                marginTop: 12, background: "none", border: "none",
+                                cursor: "pointer", fontSize: 12, color: "#999",
+                                fontFamily: "'Montserrat', sans-serif",
+                                transition: "color 0.15s"
+                            },
+                            onMouseEnter: e => e.currentTarget.style.color = "#DE3163",
+                            onMouseLeave: e => e.currentTarget.style.color = "#999",
+                        }, "↻ Outras sugestões")
                     ),
 
                     // Messages
