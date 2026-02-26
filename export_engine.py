@@ -12,6 +12,7 @@ import logging
 import html as html_lib
 import os
 import re
+import zipfile
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from urllib.parse import urlparse
@@ -331,6 +332,114 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     return buf
 
 
+def _fallback_docx_from_lines(lines: List[str]) -> io.BytesIO:
+    """Gera DOCX mínimo sem dependências externas (fallback)."""
+    def _xml_escape(value: str) -> str:
+        return html_lib.escape(str(value or ""), quote=False)
+
+    body_xml = "".join(
+        f"<w:p><w:r><w:t>{_xml_escape(line)}</w:t></w:r></w:p>"
+        for line in lines
+    )
+    if not body_xml:
+        body_xml = "<w:p><w:r><w:t>Sem dados para exportar.</w:t></w:r></w:p>"
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
+        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+        'xmlns:o="urn:schemas-microsoft-com:office:office" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
+        'xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
+        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
+        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
+        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+        'mc:Ignorable="w14 wp14">'
+        f"<w:body>{body_xml}<w:sectPr/></w:body></w:document>"
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        '</Relationships>'
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+    )
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/_rels/document.xml.rels", doc_rels)
+    out.seek(0)
+    return out
+
+
+def to_docx(tool_result: dict, title: str = "Export", filename: str = "export.docx") -> io.BytesIO:
+    """Gera DOCX com branding e tabela simples."""
+    headers, rows = extract_table_data(tool_result)
+    generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
+    total = tool_result.get("total_count", len(rows))
+
+    try:
+        from docx import Document
+
+        doc = Document()
+        doc.add_heading(f"{EXPORT_AGENT_NAME} — {title}", level=1)
+        doc.add_paragraph(f"Gerado em {generated_at} | Total: {total} registos")
+
+        if headers:
+            table = doc.add_table(rows=1, cols=len(headers))
+            table.style = "Table Grid"
+            hdr_cells = table.rows[0].cells
+            for idx, header in enumerate(headers):
+                run = hdr_cells[idx].paragraphs[0].add_run(_clean_header(header))
+                run.bold = True
+            for row in rows:
+                row_cells = table.add_row().cells
+                for idx, val in enumerate(row):
+                    row_cells[idx].text = str(val)
+        else:
+            doc.add_paragraph("Sem dados para exportar.")
+
+        doc.add_paragraph(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}")
+        out = io.BytesIO()
+        doc.save(out)
+        out.seek(0)
+        return out
+    except Exception as e:
+        logging.warning("[ExportEngine] to_docx fallback ativo: %s", e)
+        lines = [f"{EXPORT_AGENT_NAME} — {title}", f"Gerado em {generated_at} | Total: {total} registos"]
+        if headers and rows:
+            lines.append(" | ".join(_clean_header(h) for h in headers))
+            lines.extend(" | ".join(str(v) for v in row) for row in rows)
+        else:
+            lines.append("Sem dados para exportar.")
+        lines.append(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}")
+        return _fallback_docx_from_lines(lines)
+
+
 # =============================================================================
 # PDF EXPORT (fpdf2)
 # =============================================================================
@@ -353,7 +462,7 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         pdf.add_page('L')  # Landscape for tables
         pdf.set_auto_page_break(auto=True, margin=15)
         font_family = _configure_pdf_font(pdf)
-        cerise_rgb = _hex_to_rgb("#DE3163", (222, 49, 99))
+        cerise_rgb = _hex_to_rgb(str(EXPORT_BRAND_COLOR or "#DE3163"), (222, 49, 99))
 
         # Title
         pdf.set_font(font_family, 'B', 16)

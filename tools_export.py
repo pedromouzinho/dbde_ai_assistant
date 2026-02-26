@@ -15,7 +15,7 @@ from config import (
     EXPORT_ASYNC_THRESHOLD_ROWS,
     GENERATED_FILES_BLOB_CONTAINER,
 )
-from export_engine import to_csv, to_xlsx, to_pdf
+from export_engine import to_csv, to_xlsx, to_pdf, to_docx
 from storage import (
     blob_upload_bytes,
     blob_upload_json,
@@ -308,10 +308,10 @@ async def tool_generate_file(
     data: list = None,
     columns: list = None,
 ):
-    """Gera ficheiro em memória (CSV/XLSX/PDF) e devolve metadados de download."""
+    """Gera ficheiro em memória (CSV/XLSX/PDF/DOCX) e devolve metadados de download."""
     fmt = (format or "csv").strip().lower()
-    if fmt not in ("csv", "xlsx", "pdf"):
-        return {"error": "Formato inválido. Usa: csv, xlsx ou pdf"}
+    if fmt not in ("csv", "xlsx", "pdf", "docx"):
+        return {"error": "Formato inválido. Usa: csv, xlsx, pdf ou docx"}
 
     if not isinstance(data, list) or len(data) == 0:
         return {"error": "Campo 'data' deve ser array com pelo menos uma linha"}
@@ -355,9 +355,12 @@ async def tool_generate_file(
         elif fmt == "xlsx":
             mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             buf = to_xlsx(payload, safe_title)
-        else:
+        elif fmt == "pdf":
             mime_type = "application/pdf"
             buf = to_pdf(payload, safe_title)
+        else:
+            mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            buf = to_docx(payload, safe_title)
     except Exception as e:
         logging.error("[Tools] tool_generate_file failed (%s): %s", fmt, e)
         return {"error": f"Erro ao gerar ficheiro {fmt}: {str(e)}"}
@@ -402,4 +405,3 @@ def truncate_tool_result(result_str):
     except Exception as e:
         logging.warning("[Tools] truncate_tool_result fallback: %s", e)
     return result_str[:AGENT_TOOL_RESULT_MAX_SIZE] + "\n...(truncado)"
-
