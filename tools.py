@@ -246,6 +246,7 @@ TOOLS = get_all_tool_definitions()
 # =============================================================================
 # SYSTEM PROMPTS
 # =============================================================================
+# v7.2.8 (Fase G): Melhorias no routing, qualidade de resposta e sintese RAG
 def get_agent_system_prompt():
     figma_enabled = has_tool("search_figma")
     miro_enabled = has_tool("search_miro")
