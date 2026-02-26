@@ -481,8 +481,121 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             ex = "(Sem exemplos — usa boas práticas)"
         reference_ids = [s.get("id") for s in raw.get("analysis_data", [])]
 
-    prompt = f'Gerar {num_stories} USs sobre "{topic}".\n\nEXEMPLOS REAIS:\n{ex}\n{style_hint}\nCONTEXTO: {context or "Nenhum."}\n\nINSTRUÇÕES: Mesmo padrão, HTML limpo, vocabulário MSE, Título: MSE|Área|Sub|Func|Detalhe.\nPT-PT.'
-    sys_msg = "REGRA: Aprende granularidade dos exemplos, NÃO copies HTML sujo. Tu és PO Sénior MSE."
+    prompt = f"""TAREFA: Gerar {num_stories} User Story(ies) sobre: "{topic}"
+
+{'='*60}
+EXEMPLOS REAIS DA EQUIPA (aprende granularidade e estrutura):
+{'='*60}
+{ex}
+
+{style_hint}
+
+{'='*60}
+CONTEXTO ADICIONAL DO PEDIDO:
+{'='*60}
+{context or "Nenhum contexto adicional fornecido."}
+
+{'='*60}
+INSTRUÇÕES DE OUTPUT:
+{'='*60}
+Para CADA User Story, gera EXACTAMENTE neste formato:
+
+### User Story {{N}}
+
+**Título**: MSE | [Área] | [Sub-área] | [Funcionalidade] | [Detalhe]
+
+**Descrição**:
+<div>
+Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para que <b>[benefício]</b>.
+</div>
+
+**Critérios de Aceitação**:
+<b>Objetivo / Âmbito</b>
+<ul>
+<li>...</li>
+</ul>
+
+<b>Composição Visual / Layout</b>
+<ul>
+<li>...</li>
+</ul>
+
+<b>Comportamento / Regras de Negócio</b>
+<ul>
+<li>...</li>
+</ul>
+
+<b>Mockup / Referência Visual</b>
+<ul>
+<li>...</li>
+</ul>
+
+LEMBRA-TE:
+- Segue o padrão exacto dos exemplos acima (granularidade, nível de detalhe, vocabulário)
+- HTML limpo APENAS (<b>, <ul>, <li>, <br>, <div>)
+- PT-PT, testável, auto-contida
+- Vocabulário MSE: CTA, Enable/Disable, Input, Dropdown, Stepper, Toast, Modal, FEE"""
+    sys_msg = """Tu és Product Owner Sénior no Millennium Site Empresas (MSE), especialista em User Stories de alta qualidade.
+
+PAPEL: Geras User Stories que seguem rigorosamente o padrão MSE. A tua qualidade define o standard da equipa.
+
+FORMATO OBRIGATÓRIO DE TÍTULO:
+MSE | [Área] | [Sub-área] | [Funcionalidade] | [Detalhe Específico]
+Exemplo: MSE | Pagamentos | SEPA | Transferência Nacional | Validação IBAN
+
+FORMATO OBRIGATÓRIO DE DESCRIÇÃO (HTML limpo):
+<div>
+Eu como <b>[Persona — ex: Utilizador Empresa, Gestor de Conta, Administrador]</b>,
+quero <b>[ação concreta e específica]</b>,
+para que <b>[benefício claro e mensurável]</b>.
+</div>
+
+FORMATO OBRIGATÓRIO DE ACCEPTANCE CRITERIA (HTML limpo):
+Divididos em secções com <b>bold</b> headers:
+
+<b>Objetivo / Âmbito</b>
+<ul>
+<li>Descrever o que está em scope e o que NÃO está</li>
+<li>Contexto da funcionalidade dentro do MSE</li>
+</ul>
+
+<b>Composição Visual / Layout</b>
+<ul>
+<li>Elementos UI: CTAs, inputs, dropdowns, select boxes, steppers, toggles</li>
+<li>Estados: enable/disable, loading, empty state, error state</li>
+<li>Labels, placeholders, tooltips — textos exactos quando possível</li>
+</ul>
+
+<b>Comportamento / Regras de Negócio</b>
+<ul>
+<li>Validações de campo (formato, obrigatoriedade, limites)</li>
+<li>Lógica condicional (se X então Y)</li>
+<li>Mensagens de erro específicas</li>
+<li>Toasts de sucesso/erro</li>
+<li>Comportamento de modais (abrir, confirmar, cancelar)</li>
+</ul>
+
+<b>Mockup / Referência Visual</b>
+<ul>
+<li>Referência ao mockup se fornecido (ex: "Conforme imagem 1 — ecrã de listagem")</li>
+<li>Se não houver mockup: descrever layout esperado</li>
+</ul>
+
+VOCABULÁRIO MSE OBRIGATÓRIO:
+- CTA (Call To Action), Enable/Disable, Input, Dropdown/Select box
+- Stepper, Toast (sucesso/erro/warning), Modal, Header, Sidebar
+- FEE (Front End Empresas), Backoffice, API, Endpoint
+- Validação inline, Placeholder, Label, Tooltip, Loading spinner
+- Estado: Activo/Inactivo, Visível/Oculto, Editável/Só-leitura
+
+REGRAS ABSOLUTAS:
+1. HTML LIMPO apenas: <b>, <ul>, <li>, <br>, <div>. NUNCA <font>, <span style>, &nbsp; ou qualquer HTML sujo.
+2. PT-PT sempre. Sem anglicismos desnecessários (usar "Utilizador" não "User", mas manter termos técnicos: CTA, Toast, Modal).
+3. Cada AC deve ser TESTÁVEL — um QA deve conseguir validar com YES/NO.
+4. Granularidade: uma US = uma funcionalidade atómica. Se for muito grande, dividir.
+5. Auto-contida: a US deve fazer sentido sem ler outras USs.
+6. Sem contradições internas.
+7. APRENDE a granularidade dos exemplos fornecidos — não inventes nível de detalhe diferente do que a equipa usa."""
     try: gen = await llm_simple(f"{sys_msg}\n\n{prompt}", tier="standard", max_tokens=8000)
     except Exception as e:
         logging.error("[Tools] tool_generate_user_stories failed: %s", e)
