@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -13,8 +14,19 @@ from .. import eval_config
 from .report_generator import generate_report
 
 
+def _runner_timeout_seconds() -> int:
+    raw = os.getenv("EVAL_RUNNER_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(60, int(raw))
+        except ValueError:
+            pass
+    return 300 if eval_config.MOCK_LLM else 1200
+
+
 def run_pytest(test_path: str, extra_args: list | None = None) -> dict:
     """Corre pytest num path e captura resultados."""
+    timeout_seconds = _runner_timeout_seconds()
     cmd = [
         sys.executable,
         "-m",
@@ -28,7 +40,7 @@ def run_pytest(test_path: str, extra_args: list | None = None) -> dict:
         cmd.extend(extra_args)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
         # fallback se plugin pytest-json-report não estiver instalado
         if "unrecognized arguments: --json-report" in (result.stderr or ""):
             fallback_cmd = [
@@ -41,7 +53,7 @@ def run_pytest(test_path: str, extra_args: list | None = None) -> dict:
             ]
             if extra_args:
                 fallback_cmd.extend(extra_args)
-            result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except Exception as exc:
         return {
             "returncode": 1,
