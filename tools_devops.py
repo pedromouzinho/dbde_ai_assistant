@@ -502,6 +502,43 @@ async def tool_analyze_patterns_with_llm(created_by=None, topic=None, work_item_
         logging.error("[Tools] tool_analyze_patterns_with_llm failed: %s", e)
         analysis = f"Erro: {e}"
     profile_saved = False
+    preferred_vocabulary = ""
+    title_pattern = ""
+    ac_structure = ""
+
+    vocab_set = set()
+    title_patterns = []
+    ac_section_hits = []
+    for sample in raw.get("analysis_data", [])[:15]:
+        combined = f"{sample.get('description', '')} {sample.get('acceptance_criteria', '')}".lower()
+        for term in ["CTA", "Toast", "Modal", "Input", "Dropdown", "Stepper", "Enable", "Disable", "FEE"]:
+            if term.lower() in combined:
+                vocab_set.add(term)
+        title = str(sample.get("title", "") or "")
+        if "|" in title:
+            parts = [part.strip() for part in title.split("|") if part.strip()]
+            if len(parts) >= 3:
+                title_patterns.append("|".join(parts[:3]) + "|...")
+        ac_text = str(sample.get("acceptance_criteria", "") or "")
+        for section in ("Objetivo", "Âmbito", "Composição", "Layout", "Comportamento", "Regras", "Mockup"):
+            if section.lower() in ac_text.lower():
+                ac_section_hits.append(section)
+
+    if vocab_set:
+        preferred_vocabulary = ", ".join(sorted(vocab_set))[:2000]
+    if title_patterns:
+        counts = {}
+        for item in title_patterns:
+            counts[item] = counts.get(item, 0) + 1
+        title_pattern = max(counts, key=counts.get)[:500]
+    if ac_section_hits:
+        ordered_sections = []
+        for section in ("Objetivo", "Âmbito", "Composição", "Layout", "Comportamento", "Regras", "Mockup"):
+            if section in ac_section_hits:
+                ordered_sections.append(section)
+        if ordered_sections:
+            ac_structure = " > ".join(ordered_sections)[:1000]
+
     if analysis_type == "author_style" and created_by and isinstance(analysis, str) and not analysis.startswith("Erro:"):
         profile_saved = await _save_writer_profile(
             author_name=created_by,
@@ -510,6 +547,9 @@ async def tool_analyze_patterns_with_llm(created_by=None, topic=None, work_item_
             sample_count=raw.get("samples_returned", 0),
             topic=topic or "",
             work_item_type=work_item_type,
+            preferred_vocabulary=preferred_vocabulary,
+            title_pattern=title_pattern,
+            ac_structure=ac_structure,
         )
 
     return {
@@ -538,6 +578,15 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             f"\nPERFIL DE ESCRITA CACHEADO ({style_profile.get('author_name', reference_author)}):\n"
             f"{style_profile.get('style_analysis', '')[:3000]}\n"
         )
+        vocab = style_profile.get("preferred_vocabulary", "")
+        if vocab:
+            style_hint += f"\nVOCABULÁRIO PREFERIDO DO AUTOR: {vocab}\n"
+        title_pattern_hint = style_profile.get("title_pattern", "")
+        if title_pattern_hint:
+            style_hint += f"TÍTULO PADRÃO DO AUTOR: {title_pattern_hint}\n"
+        ac_structure_hint = style_profile.get("ac_structure", "")
+        if ac_structure_hint:
+            style_hint += f"ESTRUTURA DE AC PREFERIDA: {ac_structure_hint}\n"
         ex = "(Perfil de autor carregado de WriterProfiles; não foi necessário reanalisar padrões.)"
     else:
         search_topic = reference_topic or topic

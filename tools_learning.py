@@ -34,6 +34,9 @@ async def _save_writer_profile(
     sample_count: int = 0,
     topic: str = "",
     work_item_type: str = "User Story",
+    preferred_vocabulary: str = "",
+    title_pattern: str = "",
+    ac_structure: str = "",
 ) -> bool:
     row_key = _writer_profile_row_key(author_name)
     if not row_key or not analysis:
@@ -50,6 +53,9 @@ async def _save_writer_profile(
         "SampleIdsJson": json.dumps((sample_ids or [])[:100], ensure_ascii=False),
         "Topic": (topic or "")[:200],
         "WorkItemType": (work_item_type or "User Story")[:80],
+        "PreferredVocabulary": (preferred_vocabulary or "")[:2000],
+        "TitlePattern": (title_pattern or "")[:500],
+        "ACStructure": (ac_structure or "")[:1000],
         "UpdatedAt": now_iso,
     }
 
@@ -99,9 +105,11 @@ async def _load_writer_profile(author_name: str):
             "sample_ids": sample_ids if isinstance(sample_ids, list) else [],
             "topic": row.get("Topic", ""),
             "work_item_type": row.get("WorkItemType", "User Story"),
+            "preferred_vocabulary": row.get("PreferredVocabulary", ""),
+            "title_pattern": row.get("TitlePattern", ""),
+            "ac_structure": row.get("ACStructure", ""),
             "updated_at": row.get("UpdatedAt", ""),
         }
     except Exception as e:
         logging.error("[Tools] _load_writer_profile failed: %s", e)
         return None
-
