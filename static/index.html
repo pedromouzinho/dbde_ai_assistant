@@ -859,6 +859,7 @@ function App() {
     const [auth, setAuth] = useState(null);
     const [authInitializing, setAuthInitializing] = useState(true);
     const [showExportDropdown, setShowExportDropdown] = useState(false);
+    const [selectorOpen, setSelectorOpen] = useState(false);
 
     const active = conversations[activeIdx];
     const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
@@ -869,8 +870,18 @@ function App() {
     const inputRef = useRef(null);
     const fileInputRef = useRef(null);
     const imageInputRef = useRef(null);
+    const selectorRef = useRef(null);
 
     useEffect(() => { chatEndRef.current && chatEndRef.current.scrollIntoView({ behavior: "smooth" }); }, [conversations, activeIdx, loading, streamingText]);
+    useEffect(() => {
+        function handleClickOutside(e) {
+            if (selectorRef.current && !selectorRef.current.contains(e.target)) {
+                setSelectorOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, []);
 
     function handleLogin(user) {
         const a = { user };
@@ -1962,6 +1973,9 @@ function App() {
         "Cria uma US para exportar PDF nas consultas",
         "Gera user stories para abertura de conta online",
     ];
+    const tierLabels = { fast: "⚡ Fast", standard: "🧠 Thinking", pro: "🔬 Pro" };
+    const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
+    const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
     const suggestions = agentMode === "userstory" ? usSuggestions : generalSuggestions;
 
     // ─── Render ──────────────────────────────────────────────────────────
@@ -2071,16 +2085,86 @@ function App() {
                 ),
 
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-                    // Model tier selector
-                    React.createElement("div", { style: { display: "flex", background: "#E5DFD5", borderRadius: 8, padding: 2, gap: 2 } },
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "fast" ? " active" : ""), onClick: () => setModelTier("fast"), title: "GPT-5 mini — rápido e económico" }, "⚡ Fast"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "standard" ? " active" : ""), onClick: () => setModelTier("standard"), title: "GPT-5 chat — thinking (equilibrado)" }, "🧠 Thinking"),
-                        React.createElement("button", { className: "tier-btn" + (modelTier === "pro" ? " active" : ""), onClick: () => setModelTier("pro"), title: "GPT-5.2 chat — máxima qualidade" }, "🔬 Pro")
-                    ),
-                    // Mode toggle
-                    React.createElement("div", { style: { display: "flex", background: "#E5DFD5", borderRadius: 8, padding: 2, gap: 2 } },
-                        React.createElement("button", { className: "tier-btn" + (agentMode === "general" ? " active" : ""), onClick: () => switchMode("general") }, "General"),
-                        React.createElement("button", { className: "tier-btn" + (agentMode === "userstory" ? " active" : ""), onClick: () => switchMode("userstory") }, "User Stories")
+                    React.createElement("div", {
+                        ref: selectorRef,
+                        style: { position: "relative" }
+                    },
+                        React.createElement("button", {
+                            onClick: () => setSelectorOpen(!selectorOpen),
+                            style: {
+                                display: "flex", alignItems: "center", gap: 6,
+                                padding: "6px 14px", borderRadius: 10,
+                                border: "1.5px solid #E0E0E0", background: "white",
+                                cursor: "pointer", fontSize: 12, fontWeight: 600,
+                                fontFamily: "'Montserrat', sans-serif", color: "#444",
+                                transition: "all 0.15s",
+                                ...(selectorOpen ? { borderColor: "#DE3163", color: "#DE3163" } : {})
+                            }
+                        },
+                            React.createElement("span", null, selectorLabel),
+                            React.createElement("span", {
+                                style: { fontSize: 10, marginLeft: 2, transition: "transform 0.2s", transform: selectorOpen ? "rotate(180deg)" : "rotate(0)" }
+                            }, "▾")
+                        ),
+                        selectorOpen && React.createElement("div", {
+                            style: {
+                                position: "absolute", right: 0, top: "calc(100% + 6px)",
+                                background: "white", borderRadius: 12,
+                                boxShadow: "0 8px 32px rgba(0,0,0,0.12)",
+                                padding: 12, minWidth: 200, zIndex: 1000,
+                                border: "1px solid #eee", animation: "fadeUp 0.2s ease"
+                            }
+                        },
+                            React.createElement("div", {
+                                style: { fontSize: 10, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6, padding: "0 4px" }
+                            }, "Modelo"),
+                            ["fast", "standard", "pro"].map(t =>
+                                React.createElement("button", {
+                                    key: t,
+                                    onClick: () => { setModelTier(t); },
+                                    style: {
+                                        display: "flex", alignItems: "center", gap: 8,
+                                        width: "100%", padding: "8px 10px", border: "none",
+                                        borderRadius: 8, cursor: "pointer", fontSize: 12,
+                                        fontFamily: "'Montserrat', sans-serif",
+                                        fontWeight: modelTier === t ? 700 : 400,
+                                        background: modelTier === t ? "#FFF0F3" : "transparent",
+                                        color: modelTier === t ? "#DE3163" : "#444",
+                                        transition: "all 0.15s"
+                                    },
+                                    onMouseEnter: e => { if (modelTier !== t) e.currentTarget.style.background = "#f5f5f5"; },
+                                    onMouseLeave: e => { if (modelTier !== t) e.currentTarget.style.background = "transparent"; },
+                                },
+                                    React.createElement("span", null, tierLabels[t]),
+                                    modelTier === t && React.createElement("span", { style: { marginLeft: "auto", fontSize: 11 } }, "✓")
+                                )
+                            ),
+                            React.createElement("div", { style: { borderTop: "1px solid #f0f0f0", margin: "8px 0" } }),
+                            React.createElement("div", {
+                                style: { fontSize: 10, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6, padding: "0 4px" }
+                            }, "Modo"),
+                            ["general", "userstory"].map(m =>
+                                React.createElement("button", {
+                                    key: m,
+                                    onClick: () => { switchMode(m); setSelectorOpen(false); },
+                                    style: {
+                                        display: "flex", alignItems: "center", gap: 8,
+                                        width: "100%", padding: "8px 10px", border: "none",
+                                        borderRadius: 8, cursor: "pointer", fontSize: 12,
+                                        fontFamily: "'Montserrat', sans-serif",
+                                        fontWeight: agentMode === m ? 700 : 400,
+                                        background: agentMode === m ? "#FFF0F3" : "transparent",
+                                        color: agentMode === m ? "#DE3163" : "#444",
+                                        transition: "all 0.15s"
+                                    },
+                                    onMouseEnter: e => { if (agentMode !== m) e.currentTarget.style.background = "#f5f5f5"; },
+                                    onMouseLeave: e => { if (agentMode !== m) e.currentTarget.style.background = "transparent"; },
+                                },
+                                    React.createElement("span", null, modeLabels[m]),
+                                    agentMode === m && React.createElement("span", { style: { marginLeft: "auto", fontSize: 11 } }, "✓")
+                                )
+                            )
+                        )
                     ),
                     React.createElement("div", { style: { position: "relative" } },
                         React.createElement("button", {
