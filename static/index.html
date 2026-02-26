@@ -2280,19 +2280,31 @@ function App() {
 
         // ─── Main Area ──────────────────────────────────────────────────
         React.createElement("div", {
-            style: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" },
+            style: {
+                flex: 1, display: "flex", flexDirection: "column",
+                minWidth: 0, position: "relative",
+                background: "#EAE4DC",
+            },
             onDragOver: e => { e.preventDefault(); setDragOver(true); },
             onDragLeave: e => { if (e.currentTarget === e.target || !e.currentTarget.contains(e.relatedTarget)) setDragOver(false); },
             onDrop: handleDrop,
         },
             // Drag overlay
             dragOver && React.createElement("div", {
-                style: { position: "absolute", inset: 0, zIndex: 100, background: "rgba(222,49,99,0.08)", border: "3px dashed #DE3163", borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }
+                style: {
+                    position: "absolute", inset: 0, zIndex: 100,
+                    background: "rgba(222,49,99,0.06)",
+                    border: "3px dashed rgba(222,49,99,0.3)",
+                    borderRadius: 20,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    pointerEvents: "none",
+                    backdropFilter: "blur(4px)",
+                }
             },
-                React.createElement("div", { style: { background: "white", borderRadius: 16, padding: "24px 40px", boxShadow: "0 8px 32px rgba(0,0,0,0.12)", textAlign: "center" } },
+                React.createElement("div", { style: { background: "white", borderRadius: 20, padding: "32px 48px", boxShadow: "0 12px 40px rgba(0,0,0,0.1)", textAlign: "center", border: "1px solid rgba(0,0,0,0.06)" } },
                     React.createElement("div", { style: { fontSize: 40, marginBottom: 8 } }, "📎"),
-                    React.createElement("div", { style: { fontSize: 16, fontWeight: 600, color: "#DE3163" } }, "Larga aqui para anexar"),
-                    React.createElement("div", { style: { fontSize: 12, color: "#888", marginTop: 4 } }, "Imagens, Excel, CSV, PDF")
+                    React.createElement("div", { style: { fontSize: 16, fontWeight: 600, color: "#1a1a1a" } }, "Larga aqui para anexar"),
+                    React.createElement("div", { style: { fontSize: 12, color: "#999", marginTop: 6 } }, "Imagens, Excel, CSV, PDF")
                 )
             ),
 
@@ -2413,7 +2425,16 @@ function App() {
                             className: "export-btn",
                             onClick: () => setShowExportDropdown(!showExportDropdown),
                             title: "Exportar conversa",
-                            style: { background: "white", border: "1px solid #d1d5db", borderRadius: 8, padding: "8px 10px", cursor: "pointer", fontSize: 12, fontWeight: 600 }
+                            style: {
+                                background: "none",
+                                border: "1.5px solid rgba(0,0,0,0.08)",
+                                borderRadius: 12, padding: "8px 16px",
+                                cursor: "pointer", fontSize: 12, fontWeight: 600,
+                                color: "#666", fontFamily: "'Montserrat', sans-serif",
+                                display: "flex", alignItems: "center", gap: 6,
+                                transition: "all 0.2s ease",
+                                boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+                            }
                         }, "⬇ Exportar"),
                         showExportDropdown && React.createElement("div", {
                             style: { position: "absolute", right: 0, top: 36, background: "white", border: "1px solid #e5e7eb", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 60, minWidth: 180, overflow: "hidden" }
