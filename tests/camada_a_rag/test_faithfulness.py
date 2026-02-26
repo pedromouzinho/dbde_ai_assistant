@@ -11,10 +11,14 @@ Método: LLM-as-judge
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
 from .. import eval_config
+
+
+logger = logging.getLogger(__name__)
 
 
 class FaithfulnessJudge:
@@ -36,14 +40,27 @@ Responde APENAS com: "supported" ou "unsupported"."""
 
     async def _call_real_llm(self, prompt: str) -> str:
         """Modo real opcional usando llm_provider da app."""
-        from llm_provider import llm_simple
+        from llm_provider import llm_simple, llm_with_fallback
 
-        response = await llm_simple(
-            prompt,
-            tier=eval_config.JUDGE_MODEL_TIER,
-            max_tokens=eval_config.JUDGE_MAX_TOKENS,
-        )
-        return str(response or "")
+        try:
+            response = await llm_simple(
+                prompt,
+                tier=eval_config.JUDGE_MODEL_TIER,
+                max_tokens=eval_config.JUDGE_MAX_TOKENS,
+            )
+            return str(response or "")
+        except Exception as exc:
+            logger.warning("FaithfulnessJudge llm_simple failed, trying fallback: %s", exc)
+            try:
+                fallback = await llm_with_fallback(
+                    messages=[{"role": "user", "content": prompt}],
+                    tier=eval_config.JUDGE_MODEL_TIER,
+                    max_tokens=eval_config.JUDGE_MAX_TOKENS,
+                )
+                return str(fallback.content or "")
+            except Exception as fallback_exc:
+                logger.warning("FaithfulnessJudge fallback failed: %s", fallback_exc)
+                return ""
 
     async def extract_claims(self, answer: str) -> list[str]:
         """Extrai claims factuais da resposta. Em modo mock, faz parsing simples."""

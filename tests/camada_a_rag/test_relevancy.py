@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
@@ -9,24 +10,42 @@ import pytest
 from .. import eval_config
 
 
+logger = logging.getLogger(__name__)
+
+
 class RelevancyJudge:
     """Judge para relevância pergunta-resposta."""
 
     async def _call_real_llm(self, question: str, answer: str) -> tuple[float, str]:
-        from llm_provider import llm_simple
+        from llm_provider import llm_simple, llm_with_fallback
 
         prompt = (
             "Avalia de 0.0 a 1.0 quão relevante é a resposta para a pergunta. "
             "Responde em formato: <score>|<justificação_curta>.\n"
             f"Pergunta: {question}\nResposta: {answer}"
         )
-        raw = str(
-            await llm_simple(
-                prompt,
-                tier=eval_config.JUDGE_MODEL_TIER,
-                max_tokens=eval_config.JUDGE_MAX_TOKENS,
+
+        try:
+            raw = str(
+                await llm_simple(
+                    prompt,
+                    tier=eval_config.JUDGE_MODEL_TIER,
+                    max_tokens=eval_config.JUDGE_MAX_TOKENS,
+                )
             )
-        )
+        except Exception as exc:
+            logger.warning("RelevancyJudge llm_simple failed, trying fallback: %s", exc)
+            try:
+                fallback = await llm_with_fallback(
+                    messages=[{"role": "user", "content": prompt}],
+                    tier=eval_config.JUDGE_MODEL_TIER,
+                    max_tokens=eval_config.JUDGE_MAX_TOKENS,
+                )
+                raw = str(fallback.content or "")
+            except Exception as fallback_exc:
+                logger.warning("RelevancyJudge fallback failed: %s", fallback_exc)
+                return 0.5, f"llm_error: {type(fallback_exc).__name__}"
+
         if "|" in raw:
             left, right = raw.split("|", 1)
             try:

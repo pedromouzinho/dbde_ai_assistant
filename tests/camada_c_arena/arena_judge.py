@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 from .. import eval_config
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,7 +55,7 @@ Avalia cada critério de 1-5 para cada resposta. Responde em JSON:
                 "reasoning": "mock heuristic",
             }
 
-        from llm_provider import llm_simple
+        from llm_provider import llm_simple, llm_with_fallback
         import json as _json
 
         criteria_text = "\n".join(f"- {c}" for c in criteria) if criteria else "- Qualidade geral"
@@ -62,11 +66,29 @@ Avalia cada critério de 1-5 para cada resposta. Responde em JSON:
             response_b=response_b,
         )
 
-        raw = await llm_simple(
-            prompt,
-            tier=eval_config.JUDGE_MODEL_TIER,
-            max_tokens=eval_config.JUDGE_MAX_TOKENS,
-        )
+        try:
+            raw = await llm_simple(
+                prompt,
+                tier=eval_config.JUDGE_MODEL_TIER,
+                max_tokens=eval_config.JUDGE_MAX_TOKENS,
+            )
+        except Exception as exc:
+            logger.warning("ArenaJudge llm_simple failed, trying fallback: %s", exc)
+            try:
+                fallback = await llm_with_fallback(
+                    messages=[{"role": "user", "content": prompt}],
+                    tier=eval_config.JUDGE_MODEL_TIER,
+                    max_tokens=eval_config.JUDGE_MAX_TOKENS,
+                )
+                raw = str(fallback.content or "")
+            except Exception as fallback_exc:
+                logger.warning("ArenaJudge fallback failed: %s", fallback_exc)
+                return {
+                    "winner": "tie",
+                    "score_a": 3.0,
+                    "score_b": 3.0,
+                    "reasoning": f"llm_error: {type(fallback_exc).__name__}",
+                }
 
         try:
             parsed = _json.loads(raw)
