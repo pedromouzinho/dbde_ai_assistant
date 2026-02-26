@@ -128,6 +128,7 @@ const DEFAULT_MAX_BATCH_TOTAL_BYTES = 60 * 1024 * 1024;
 const UPLOAD_POLL_INTERVAL_MS = 1200;
 const UPLOAD_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 const DEVOPS_WORKITEM_BASE_URL = "https://dev.azure.com/ptbcp/IT.DIT/_workitems/edit/";
+const EMPTY_CONVERSATION = { id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] };
 // Logo oficial Millennium — "M" estilizado cerise sobre fundo escuro
 const MILLENNIUM_LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
   <rect width="100" height="100" rx="16" fill="#1A1A1A"/>
@@ -833,7 +834,7 @@ function UserMenu({ user, onLogout }) {
 // APP COMPONENT
 // =============================================================================
 function App() {
-    const [conversations, setConversations] = useState([{ id: null, title: "Nova conversa", messages: [], mode: "general", uploadedFiles: [] }]);
+    const [conversations, setConversations] = useState([{ ...EMPTY_CONVERSATION }]);
     const [activeIdx, setActiveIdx] = useState(0);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
@@ -859,8 +860,9 @@ function App() {
     const [selectorOpen, setSelectorOpen] = useState(false);
     const [suggestionSeed, setSuggestionSeed] = useState(0);
 
-    const active = conversations[activeIdx];
-    const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
+    const active = conversations[activeIdx] || { ...EMPTY_CONVERSATION };
+    const activeMessages = Array.isArray(active.messages) ? active.messages : [];
+    const activeUploadedFiles = Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
     const authUser = auth ? auth.user : {};
     const userId = authUser.username || "";
 
@@ -871,6 +873,16 @@ function App() {
     const selectorRef = useRef(null);
 
     useEffect(() => { chatEndRef.current && chatEndRef.current.scrollIntoView({ behavior: "smooth" }); }, [conversations, activeIdx, loading, streamingText]);
+    useEffect(() => {
+        if (!Array.isArray(conversations) || conversations.length === 0) {
+            setConversations([{ ...EMPTY_CONVERSATION }]);
+            if (activeIdx !== 0) setActiveIdx(0);
+            return;
+        }
+        if (activeIdx < 0 || activeIdx >= conversations.length) {
+            setActiveIdx(0);
+        }
+    }, [conversations, activeIdx]);
     useEffect(() => {
         function handleClickOutside(e) {
             if (selectorRef.current && !selectorRef.current.contains(e.target)) {
@@ -2103,7 +2115,7 @@ function App() {
                         onClick: () => {
                             setActiveIdx(i);
                             setUploadedFiles(Array.isArray(conv.uploadedFiles) ? conv.uploadedFiles : []);
-                            if (conv.savedOnServer && conv.messages.length === 0 && conv.id && userId) loadChatMessages(userId, conv.id, i);
+                            if (conv.savedOnServer && (!Array.isArray(conv.messages) || conv.messages.length === 0) && conv.id && userId) loadChatMessages(userId, conv.id, i);
                             inputRef.current && inputRef.current.focus();
                         },
                         style: { padding: "10px 12px", borderRadius: 10, marginBottom: 3, cursor: "pointer", display: "flex", alignItems: "center", gap: 10, borderLeft: "3px solid transparent" }
@@ -2112,7 +2124,9 @@ function App() {
                         React.createElement("div", { style: { flex: 1, minWidth: 0 } },
                             React.createElement("div", { style: { fontSize: 13, fontWeight: i === activeIdx ? 600 : 400, color: "#1a1a1a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, conv.title),
                             React.createElement("div", { style: { fontSize: 11, color: "#999" } },
-                                conv.messages.length > 0 ? conv.messages.length + " msgs" : (conv.message_count ? conv.message_count + " msgs" : "Vazia")
+                                (Array.isArray(conv.messages) && conv.messages.length > 0)
+                                    ? conv.messages.length + " msgs"
+                                    : (conv.message_count ? conv.message_count + " msgs" : "Vazia")
                             )
                         ),
                         conversations.length > 1 && React.createElement("button", {
@@ -2161,7 +2175,7 @@ function App() {
                     React.createElement("div", null,
                         React.createElement("div", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a1a" } }, active ? active.title : "Assistente AI DBDE"),
                         React.createElement("div", { style: { fontSize: 11, color: "#999" } },
-                            (agentMode === "userstory" ? "📋 User Stories" : "💬 Geral") + " · " + active.messages.length + " msgs"
+                            (agentMode === "userstory" ? "📋 User Stories" : "💬 Geral") + " · " + activeMessages.length + " msgs"
                         )
                     )
                 ),
@@ -2281,7 +2295,7 @@ function App() {
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto" } },
 
                     // Welcome screen
-                    (!active || active.messages.length === 0) && !loading &&
+                    (!active || activeMessages.length === 0) && !loading &&
                     React.createElement("div", { style: { textAlign: "center", paddingTop: "12vh", animation: "fadeUp 0.5s ease" } },
                         React.createElement("img", {
                             src: MILLENNIUM_LOGO_DATA_URI, alt: "Millennium",
@@ -2316,10 +2330,10 @@ function App() {
                     ),
 
                     // Messages
-                    active && active.messages.map((msg, i) =>
+                    active && activeMessages.map((msg, i) =>
                         React.createElement(MessageBubble, {
                             key: i, message: msg,
-                            isLastAssistant: msg.role === "assistant" && i === active.messages.length - 1 && !loading,
+                            isLastAssistant: msg.role === "assistant" && i === activeMessages.length - 1 && !loading,
                             conversationId: active.id, messageIndex: i,
                             onFeedback: submitFeedback,
                             onExport: exportMessageData,
