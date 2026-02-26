@@ -107,11 +107,8 @@
         .login-btn:hover:not(:disabled) { background: #C4284F; transform: translateY(-1px); }
         .login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-        /* Tier selector */
-        .tier-btn { padding: 5px 12px; border-radius: 6px; border: none; cursor: pointer; font-size: 11px; font-weight: 600; font-family: 'Montserrat', sans-serif; transition: all 0.2s; }
-        .tier-btn.active { background: #DE3163; color: white; }
-        .tier-btn:not(.active) { background: transparent; color: #888; }
-        .tier-btn:not(.active):hover { color: #DE3163; background: rgba(222,49,99,0.06); }
+        /* Unified selector */
+        .selector-trigger:hover { border-color: #DE3163 !important; color: #DE3163 !important; }
 
         /* Streaming indicator */
         .streaming-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #DE3163; animation: pulse 1s infinite; margin-left: 4px; vertical-align: middle; }
@@ -2175,6 +2172,7 @@ function App() {
                         style: { position: "relative" }
                     },
                         React.createElement("button", {
+                            className: "selector-trigger",
                             onClick: () => setSelectorOpen(!selectorOpen),
                             style: {
                                 display: "flex", alignItems: "center", gap: 6,
