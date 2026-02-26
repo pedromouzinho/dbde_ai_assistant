@@ -847,7 +847,16 @@ function UserMenu({ user, onLogout }) {
     return React.createElement("div", { ref: menuRef, style: { position: "relative" } },
         React.createElement("button", {
             onClick: () => setOpen(!open),
-            style: { background: "none", border: "1px solid #e0e0e0", borderRadius: 8, padding: "6px 14px", cursor: "pointer", fontSize: 13, fontWeight: 500, color: "#444", fontFamily: "'Montserrat', sans-serif", display: "flex", alignItems: "center", gap: 6 }
+            style: {
+                background: "none",
+                border: "1.5px solid rgba(0,0,0,0.08)",
+                borderRadius: 12, padding: "8px 16px",
+                cursor: "pointer", fontSize: 13, fontWeight: 500,
+                color: "#444", fontFamily: "'Montserrat', sans-serif",
+                display: "flex", alignItems: "center", gap: 8,
+                transition: "all 0.2s ease",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+            }
         }, user.display_name || user.username, React.createElement("span", { style: { fontSize: 10 } }, "▼")),
 
         open && React.createElement("div", {
@@ -2258,16 +2267,26 @@ function App() {
 
             // ─── Header ──────────────────────────────────────────────────
             React.createElement("div", {
-                style: { background: "white", borderBottom: "1px solid #EBEBEB", padding: "10px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }
+                style: {
+                    background: "white", borderBottom: "1px solid rgba(0,0,0,0.06)",
+                    padding: "14px 28px",
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                }
             },
                 React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
                     React.createElement("button", {
                         onClick: () => setSidebarOpen(!sidebarOpen),
-                        style: { background: "none", border: "none", cursor: "pointer", color: "#666", fontSize: 20, padding: "2px 6px" }
+                        style: {
+                            background: "none", border: "none", cursor: "pointer",
+                            color: "#999", fontSize: 18, padding: "4px 8px",
+                            borderRadius: 8, transition: "all 0.2s",
+                        },
+                        onMouseEnter: e => { e.currentTarget.style.background = "rgba(0,0,0,0.04)"; e.currentTarget.style.color = "#666"; },
+                        onMouseLeave: e => { e.currentTarget.style.background = "none"; e.currentTarget.style.color = "#999"; },
                     }, sidebarOpen ? "◀" : "☰"),
-                    React.createElement("div", null,
-                        React.createElement("div", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a1a" } }, active ? active.title : "Assistente AI DBDE"),
-                        React.createElement("div", { style: { fontSize: 11, color: "#999" } },
+                    React.createElement("div", { style: { marginLeft: 4 } },
+                        React.createElement("div", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a1a", letterSpacing: "-0.2px" } }, active ? active.title : "Assistente AI DBDE"),
+                        React.createElement("div", { style: { fontSize: 11, color: "#bbb", marginTop: 1, fontWeight: 500 } },
                             (agentMode === "userstory" ? "📋 User Stories" : "💬 Geral") + " · " + activeMessages.length + " msgs"
                         )
                     )
@@ -2282,13 +2301,14 @@ function App() {
                             className: "selector-trigger",
                             onClick: () => setSelectorOpen(!selectorOpen),
                             style: {
-                                display: "flex", alignItems: "center", gap: 6,
-                                padding: "6px 14px", borderRadius: 10,
-                                border: "1.5px solid #E0E0E0", background: "white",
+                                display: "flex", alignItems: "center", gap: 8,
+                                padding: "8px 16px", borderRadius: 12,
+                                border: "1.5px solid rgba(0,0,0,0.08)", background: "white",
                                 cursor: "pointer", fontSize: 12, fontWeight: 600,
                                 fontFamily: "'Montserrat', sans-serif", color: "#444",
-                                transition: "all 0.15s",
-                                ...(selectorOpen ? { borderColor: "#DE3163", color: "#DE3163" } : {})
+                                transition: "all 0.2s ease",
+                                boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+                                ...(selectorOpen ? { borderColor: "#DE3163", color: "#DE3163", boxShadow: "0 1px 3px rgba(222,49,99,0.1)" } : {})
                             }
                         },
                             React.createElement("span", null, selectorLabel),
@@ -2298,11 +2318,12 @@ function App() {
                         ),
                         selectorOpen && React.createElement("div", {
                             style: {
-                                position: "absolute", right: 0, top: "calc(100% + 6px)",
-                                background: "white", borderRadius: 12,
-                                boxShadow: "0 8px 32px rgba(0,0,0,0.12)",
-                                padding: 12, minWidth: 200, zIndex: 1000,
-                                border: "1px solid #eee", animation: "fadeUp 0.2s ease"
+                                position: "absolute", right: 0, top: "calc(100% + 8px)",
+                                background: "white", borderRadius: 16,
+                                boxShadow: "0 12px 40px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.06)",
+                                padding: 14, minWidth: 220, zIndex: 1000,
+                                border: "1px solid rgba(0,0,0,0.06)",
+                                animation: "fadeUp 0.15s ease",
                             }
                         },
                             React.createElement("div", {
