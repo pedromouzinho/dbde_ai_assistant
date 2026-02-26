@@ -847,6 +847,7 @@ function App() {
     const [dragOver, setDragOver] = useState(false);
     const [auth, setAuth] = useState(null);
     const [authInitializing, setAuthInitializing] = useState(true);
+    const [showExportDropdown, setShowExportDropdown] = useState(false);
 
     const active = conversations[activeIdx];
     const activeUploadedFiles = active && Array.isArray(active.uploadedFiles) ? active.uploadedFiles : uploadedFiles;
@@ -1726,6 +1727,50 @@ function App() {
     }
 
     // ─── Data export ─────────────────────────────────────────────────────
+    function getAllChatMessages() {
+        if (!active || !Array.isArray(active.messages)) return [];
+        return active.messages
+            .filter(m => m && (m.role === "user" || m.role === "assistant"))
+            .map(m => ({
+                role: m.role,
+                content: (typeof m.content === "string" || Array.isArray(m.content)) ? m.content : (m.text || ""),
+                timestamp: m.timestamp || m.created_at || "",
+            }));
+    }
+
+    async function exportChat(format = "html") {
+        if (!active) return;
+        try {
+            const messages = getAllChatMessages();
+            if (!messages.length) {
+                alert("Sem mensagens para exportar.");
+                return;
+            }
+            const res = await authFetch(API_URL + "/api/export-chat", {
+                method: "POST",
+                headers: authHeaders(),
+                body: JSON.stringify({
+                    messages,
+                    format,
+                    title: active.title || "Chat Export",
+                }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || data.error || "Erro export chat");
+            if (data.url) {
+                const target = String(data.url || "");
+                window.open(target.startsWith("http") ? target : (API_URL + target), "_blank");
+            }
+            if (data.note) {
+                alert(data.note);
+            }
+        } catch (e) {
+            alert("Erro ao exportar conversa: " + e.message);
+        } finally {
+            setShowExportDropdown(false);
+        }
+    }
+
     function _messageTextContent(msg) {
         if (!msg) return "";
         if (typeof msg.content === "string") return msg.content;
@@ -2024,6 +2069,26 @@ function App() {
                     React.createElement("div", { style: { display: "flex", background: "#f5f5f5", borderRadius: 8, padding: 2, gap: 2 } },
                         React.createElement("button", { className: "tier-btn" + (agentMode === "general" ? " active" : ""), onClick: () => switchMode("general") }, "General"),
                         React.createElement("button", { className: "tier-btn" + (agentMode === "userstory" ? " active" : ""), onClick: () => switchMode("userstory") }, "User Stories")
+                    ),
+                    React.createElement("div", { style: { position: "relative" } },
+                        React.createElement("button", {
+                            className: "export-btn",
+                            onClick: () => setShowExportDropdown(!showExportDropdown),
+                            title: "Exportar conversa",
+                            style: { background: "white", border: "1px solid #d1d5db", borderRadius: 8, padding: "8px 10px", cursor: "pointer", fontSize: 12, fontWeight: 600 }
+                        }, "⬇ Exportar"),
+                        showExportDropdown && React.createElement("div", {
+                            style: { position: "absolute", right: 0, top: 36, background: "white", border: "1px solid #e5e7eb", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 60, minWidth: 180, overflow: "hidden" }
+                        },
+                            React.createElement("button", {
+                                onClick: () => exportChat("html"),
+                                style: { width: "100%", border: "none", background: "white", padding: "10px 12px", textAlign: "left", cursor: "pointer", fontSize: 12 }
+                            }, "Exportar como HTML"),
+                            React.createElement("button", {
+                                onClick: () => exportChat("pdf"),
+                                style: { width: "100%", border: "none", borderTop: "1px solid #f1f5f9", background: "white", padding: "10px 12px", textAlign: "left", cursor: "pointer", fontSize: 12 }
+                            }, "Exportar como PDF")
+                        )
                     ),
                     // User menu
                     React.createElement(UserMenu, { user: authUser, onLogout: handleLogout })
