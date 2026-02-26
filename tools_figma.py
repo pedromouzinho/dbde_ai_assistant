@@ -3,8 +3,10 @@
 # =============================================================================
 
 import asyncio
+import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -97,6 +99,347 @@ def _figma_file_url(file_key: str, node_id: str = "") -> str:
     if not node_id:
         return f"https://www.figma.com/file/{safe_key}"
     return f"https://www.figma.com/file/{safe_key}?node-id={quote(str(node_id).strip(), safe='')}"
+
+
+def _normalize_node_ids(node_ids) -> list[str]:
+    if isinstance(node_ids, list):
+        return [str(x).strip() for x in node_ids if str(x).strip()]
+
+    raw = str(node_ids or "").strip()
+    if not raw:
+        return []
+
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _extract_transition_targets(document: dict) -> list[str]:
+    if not isinstance(document, dict):
+        return []
+
+    targets = []
+    direct = document.get("transitionNodeID")
+    if direct:
+        targets.append(str(direct))
+
+    interactions = document.get("interactions") or []
+    if isinstance(interactions, list):
+        for interaction in interactions:
+            if not isinstance(interaction, dict):
+                continue
+            actions = interaction.get("actions") or []
+            if isinstance(actions, list):
+                for action in actions:
+                    if not isinstance(action, dict):
+                        continue
+                    destination = action.get("destinationId") or action.get("nodeId")
+                    if destination:
+                        targets.append(str(destination))
+
+    deduped = []
+    seen = set()
+    for node_id in targets:
+        key = str(node_id).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+def _collect_ui_components(document: dict) -> list[str]:
+    children = document.get("children") or []
+    if not isinstance(children, list):
+        return []
+
+    keywords = (
+        "button", "btn", "cta", "continuar", "confirmar", "cancelar",
+        "input", "campo", "iban", "email", "password", "dropdown",
+        "select", "modal", "toast", "card", "header", "tab", "stepper",
+        "toggle", "checkbox", "radio", "erro", "error",
+    )
+    items = []
+    for child in children[:120]:
+        if not isinstance(child, dict):
+            continue
+        name = str(child.get("name", "") or "").strip()
+        ctype = str(child.get("type", "") or "NODE").strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if any(k in lowered for k in keywords) or ctype.upper() in {
+            "COMPONENT", "COMPONENT_SET", "INSTANCE", "TEXT", "FRAME",
+        }:
+            items.append(f"{ctype.title()}: {name}")
+
+    deduped = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped[:25]
+
+
+def _infer_step_action(node_name: str, ui_components: list[str]) -> str:
+    n = str(node_name or "").lower()
+    comps = " ".join(ui_components or []).lower()
+    text = f"{n} {comps}"
+    if any(k in text for k in ("erro", "error", "inválid", "inval")):
+        return "Tratamento de erro e validação de feedback ao utilizador"
+    if any(k in text for k in ("confirmar", "submeter", "finalizar")):
+        return "Confirmação da ação principal do fluxo"
+    if any(k in text for k in ("continuar", "próximo", "proximo", "next", "avançar", "avancar")):
+        return "Avanço no fluxo para o step seguinte"
+    if any(k in text for k in ("input", "campo", "iban", "email", "password", "preench")):
+        return "Preenchimento e validação de dados de entrada"
+    if any(k in text for k in ("cancelar", "cancel", "fechar", "close")):
+        return "Cancelamento/saída controlada do fluxo"
+    return "Interação funcional no step atual"
+
+
+def _branch_type_from_name(node_name: str) -> str:
+    lowered = str(node_name or "").lower()
+    if "erro" in lowered or "error" in lowered:
+        return "error"
+    if "fallback" in lowered or "timeout" in lowered:
+        return "fallback"
+    if "cancel" in lowered or "cancelar" in lowered:
+        return "cancel"
+    return "other"
+
+
+def _layout_sort_key(node: dict):
+    document = (node or {}).get("document") or {}
+    bounds = document.get("absoluteBoundingBox") or {}
+    x = bounds.get("x", 0)
+    y = bounds.get("y", 0)
+    name = str(document.get("name", "") or "")
+    return (str(name).lower(), y, x)
+
+
+async def tool_analyze_figma_flow(
+    file_key: str,
+    node_ids: str = "",
+    start_node_id: str = "",
+    include_branches: bool = True,
+    max_steps: int = 15,
+) -> dict:
+    fk = str(file_key or "").strip()
+    if not fk:
+        return {"error": "file_key é obrigatório para analisar fluxo Figma."}
+
+    assumptions = []
+    truncated = False
+    try:
+        safe_max_steps = max(1, int(max_steps or 15))
+    except Exception:
+        safe_max_steps = 15
+    safe_max_steps = min(safe_max_steps, 50)
+
+    normalized_node_ids = _normalize_node_ids(node_ids)
+    start_node = str(start_node_id or "").strip()
+    if not normalized_node_ids and not start_node:
+        return {
+            "source": "figma",
+            "file_key": fk,
+            "ordering_mode": "manual",
+            "total_steps": 0,
+            "steps": [],
+            "branches": [],
+            "truncated": False,
+            "assumptions": ["Fornece node_ids (CSV/lista) ou start_node_id para decompor o fluxo."],
+            "warning": "Sem frames para análise. Indica node_ids ou start_node_id.",
+        }
+
+    nodes_by_id = {}
+
+    async def _fetch_node(nid: str):
+        response = await _figma_get(
+            f"/files/{quote(fk, safe='')}/nodes",
+            params={"ids": nid},
+        )
+        if "error" in response:
+            return {"error": response["error"]}
+        raw_nodes = response.get("nodes", {})
+        if not isinstance(raw_nodes, dict) or not raw_nodes:
+            return {"error": "Node não encontrado no ficheiro Figma."}
+        node_payload = raw_nodes.get(nid)
+        if not node_payload:
+            node_payload = next(iter(raw_nodes.values()), None)
+        if not isinstance(node_payload, dict):
+            return {"error": "Resposta inválida da API Figma para o node pedido."}
+        return {"data": node_payload}
+
+    discovered_from_start = []
+    if not normalized_node_ids and start_node:
+        ordering_mode = "prototype_links"
+        current = start_node
+        visited = set()
+        while current and current not in visited and len(discovered_from_start) < safe_max_steps:
+            visited.add(current)
+            fetched = await _fetch_node(current)
+            if "error" in fetched:
+                if not discovered_from_start:
+                    return {"error": f"Falha ao ler start_node_id '{current}': {fetched['error']}"}
+                assumptions.append(f"Paragem na cadeia de protótipo em '{current}': {fetched['error']}")
+                break
+            node_payload = fetched["data"]
+            nodes_by_id[current] = node_payload
+            discovered_from_start.append(current)
+            doc = node_payload.get("document") or {}
+            transitions = _extract_transition_targets(doc)
+            next_node = ""
+            for candidate in transitions:
+                if candidate not in visited:
+                    next_node = candidate
+                    break
+            current = next_node
+        if current and current not in visited:
+            truncated = True
+            assumptions.append(f"Fluxo truncado ao limite max_steps={safe_max_steps}.")
+        normalized_node_ids = discovered_from_start[:]
+    else:
+        ordering_mode = "manual"
+
+    for nid in normalized_node_ids:
+        if nid in nodes_by_id:
+            continue
+        fetched = await _fetch_node(nid)
+        if "error" in fetched:
+            assumptions.append(f"Node '{nid}' ignorado: {fetched['error']}")
+            continue
+        nodes_by_id[nid] = fetched["data"]
+
+    if not nodes_by_id:
+        return {"error": "Não foi possível carregar nenhum frame do fluxo Figma."}
+
+    ordered_ids = [nid for nid in normalized_node_ids if nid in nodes_by_id]
+    if ordering_mode != "manual":
+        graph = {}
+        incoming = {}
+        for nid, payload in nodes_by_id.items():
+            transitions = _extract_transition_targets((payload or {}).get("document") or {})
+            graph[nid] = [t for t in transitions if t in nodes_by_id]
+            incoming.setdefault(nid, 0)
+            for t in graph[nid]:
+                incoming[t] = incoming.get(t, 0) + 1
+
+        if graph and any(graph.values()):
+            roots = [nid for nid, cnt in incoming.items() if cnt == 0]
+            if start_node and start_node in nodes_by_id:
+                roots = [start_node] + [r for r in roots if r != start_node]
+            chain = []
+            seen = set()
+            queue = roots[:] if roots else [next(iter(nodes_by_id.keys()))]
+            while queue:
+                cur = queue.pop(0)
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                chain.append(cur)
+                for nxt in graph.get(cur, []):
+                    if nxt not in seen and nxt not in queue:
+                        queue.append(nxt)
+            for nid in nodes_by_id.keys():
+                if nid not in seen:
+                    chain.append(nid)
+            ordered_ids = chain
+            ordering_mode = "prototype_links"
+        else:
+            ordered_ids = sorted(nodes_by_id.keys(), key=lambda nid: _layout_sort_key(nodes_by_id.get(nid)))
+            ordering_mode = "name_layout_fallback"
+
+    if len(ordered_ids) > safe_max_steps:
+        ordered_ids = ordered_ids[:safe_max_steps]
+        truncated = True
+        assumptions.append(f"Aplicado limite max_steps={safe_max_steps}.")
+
+    steps = []
+    secondary_branch_targets = {}
+    for idx, nid in enumerate(ordered_ids, 1):
+        payload = nodes_by_id.get(nid) or {}
+        document = payload.get("document") or {}
+        name = str(document.get("name", "") or nid)
+        transitions = _extract_transition_targets(document)
+        primary_transition = transitions[0] if transitions else ""
+        secondary_transitions = transitions[1:] if len(transitions) > 1 else []
+        if secondary_transitions:
+            secondary_branch_targets[idx] = secondary_transitions
+
+        ui_components = _collect_ui_components(document)
+        steps.append(
+            {
+                "step_index": idx,
+                "node_id": nid,
+                "node_name": name,
+                "ui_components": ui_components,
+                "inferred_action": _infer_step_action(name, ui_components),
+                "transitions_to": primary_transition,
+            }
+        )
+
+    branches = []
+    if include_branches:
+        branch_candidates = {}
+        for step in steps:
+            node_name = str(step.get("node_name", "") or "")
+            nid = str(step.get("node_id", "") or "")
+            if re.search(r"(erro|error|fallback|cancel|timeout)", node_name, flags=re.IGNORECASE):
+                branch_candidates[nid] = {
+                    "node_id": nid,
+                    "node_name": node_name,
+                    "triggered_from_step": step["step_index"],
+                }
+
+        for step_idx, branch_ids in secondary_branch_targets.items():
+            for bid in branch_ids:
+                if bid in branch_candidates:
+                    continue
+                payload = nodes_by_id.get(bid)
+                if not payload:
+                    fetched = await _fetch_node(bid)
+                    if "error" not in fetched:
+                        payload = fetched["data"]
+                        nodes_by_id[bid] = payload
+                if payload:
+                    bname = str((payload.get("document") or {}).get("name", "") or bid)
+                else:
+                    bname = bid
+                branch_candidates[bid] = {
+                    "node_id": bid,
+                    "node_name": bname,
+                    "triggered_from_step": step_idx,
+                }
+
+        for bid, data in branch_candidates.items():
+            branches.append(
+                {
+                    "node_id": bid,
+                    "node_name": data.get("node_name", bid),
+                    "branch_type": _branch_type_from_name(data.get("node_name", "")),
+                    "triggered_from_step": data.get("triggered_from_step"),
+                }
+            )
+
+    return {
+        "source": "figma",
+        "file_key": fk,
+        "ordering_mode": ordering_mode,
+        "total_steps": len(steps),
+        "steps": steps,
+        "branches": branches,
+        "truncated": truncated,
+        "assumptions": assumptions,
+    }
 
 
 async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = ""):
@@ -235,6 +578,26 @@ _SEARCH_FIGMA_DEFINITION = {
 }
 
 
+_ANALYZE_FIGMA_FLOW_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "analyze_figma_flow",
+        "description": "Analisa um fluxo Figma e decompõe em steps ordenados para geração de User Stories. Usa quando o utilizador fornecer um fluxo/protótipo Figma com múltiplos ecrãs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_key": {"type": "string", "description": "Figma file key."},
+                "node_ids": {"type": "string", "description": "IDs de frames em CSV (ex: 1:2,1:3) ou JSON list string."},
+                "start_node_id": {"type": "string", "description": "Node inicial opcional para seguir ligações de protótipo."},
+                "include_branches": {"type": "boolean", "description": "Incluir branches de erro/fallback/cancel. Default true."},
+                "max_steps": {"type": "integer", "description": "Máximo de steps a processar. Default 15."},
+            },
+            "required": ["file_key"],
+        },
+    },
+}
+
+
 def _register_figma_tool() -> None:
     register_tool(
         "search_figma",
@@ -245,10 +608,21 @@ def _register_figma_tool() -> None:
         ),
         definition=_SEARCH_FIGMA_DEFINITION,
     )
+    register_tool(
+        "analyze_figma_flow",
+        lambda args: tool_analyze_figma_flow(
+            file_key=args.get("file_key", ""),
+            node_ids=args.get("node_ids", ""),
+            start_node_id=args.get("start_node_id", ""),
+            include_branches=args.get("include_branches", True),
+            max_steps=args.get("max_steps", 15),
+        ),
+        definition=_ANALYZE_FIGMA_FLOW_DEFINITION,
+    )
     if _get_figma_token():
-        logging.info("[Figma] search_figma registada")
+        logging.info("[Figma] search_figma e analyze_figma_flow registadas")
     else:
-        logging.warning("[Figma] search_figma registada sem token (vai devolver erro controlado)")
+        logging.warning("[Figma] search_figma e analyze_figma_flow registadas sem token (erro controlado)")
 
 
 _register_figma_tool()

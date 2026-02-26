@@ -1446,6 +1446,27 @@ def _resolve_detail_policy(context, topic):
     return {"policy": "habitual", "user_template": None}
 
 
+def _extract_flow_context_json(context):
+    marker = "FLOW_CONTEXT_JSON:"
+    raw = str(context or "")
+    idx = raw.find(marker)
+    if idx < 0:
+        return None
+    payload = raw[idx + len(marker):].strip()
+    if not payload:
+        return None
+
+    parsed = None
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        parsed = _extract_json_object(payload)
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("steps"), list):
+        return parsed
+    return None
+
+
 # =============================================================================
 # TOOL 5: generate_user_stories
 # =============================================================================
@@ -1494,11 +1515,16 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
     detail_policy = _resolve_detail_policy(context, topic)
     policy = detail_policy.get("policy", "habitual")
     user_template = detail_policy.get("user_template")
+    flow_context = _extract_flow_context_json(context)
+    flow_mode = isinstance(flow_context, dict)
+    flow_steps = flow_context.get("steps", []) if flow_mode else []
+    flow_branches = flow_context.get("branches", []) if flow_mode else []
 
     try:
         requested_num_stories = max(1, int(num_stories))
     except Exception:
         requested_num_stories = 1
+    effective_num_stories = requested_num_stories
 
     preferred_vocab = ", ".join(US_PREFERRED_VOCAB)
     canonical_template = (
@@ -1541,13 +1567,96 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             f"{canonical_template}\n"
         )
 
+    flow_context_block = ""
+    flow_story_map = []
+    flow_steps_detected = 0
+    context_clean = str(context or "")
+    if flow_mode:
+        flow_steps_clean = []
+        for raw_step in flow_steps:
+            if not isinstance(raw_step, dict):
+                continue
+            try:
+                step_idx = int(raw_step.get("step_index") or (len(flow_steps_clean) + 1))
+            except Exception:
+                step_idx = len(flow_steps_clean) + 1
+            flow_steps_clean.append(
+                {
+                    "step_index": step_idx,
+                    "node_id": str(raw_step.get("node_id", "") or "").strip(),
+                    "node_name": str(raw_step.get("node_name", "") or "").strip(),
+                    "ui_components": raw_step.get("ui_components", []) if isinstance(raw_step.get("ui_components", []), list) else [],
+                    "inferred_action": str(raw_step.get("inferred_action", "") or "").strip(),
+                }
+            )
+
+        flow_branches_clean = []
+        for raw_branch in flow_branches:
+            if not isinstance(raw_branch, dict):
+                continue
+            try:
+                triggered_from = int(raw_branch.get("triggered_from_step") or 0)
+            except Exception:
+                triggered_from = 0
+            flow_branches_clean.append(
+                {
+                    "node_id": str(raw_branch.get("node_id", "") or "").strip(),
+                    "node_name": str(raw_branch.get("node_name", "") or "").strip(),
+                    "branch_type": str(raw_branch.get("branch_type", "other") or "other").strip(),
+                    "triggered_from_step": triggered_from,
+                }
+            )
+
+        flow_steps_detected = len(flow_steps_clean)
+        effective_num_stories = max(1, flow_steps_detected + len(flow_branches_clean))
+        flow_story_map = [
+            {"step_index": step.get("step_index", idx + 1), "story_index": idx}
+            for idx, step in enumerate(flow_steps_clean)
+        ]
+
+        step_lines = []
+        for idx, step in enumerate(flow_steps_clean):
+            prev_label = "Início do fluxo"
+            if idx > 0:
+                prev = flow_steps_clean[idx - 1]
+                prev_label = f"Step {prev.get('step_index', idx)} - {prev.get('node_name', '')}"
+            comps = ", ".join(step.get("ui_components", [])[:8]) or "Sem componentes explícitos"
+            step_lines.append(
+                f"- Step {step.get('step_index')}: node_id={step.get('node_id')}, nome='{step.get('node_name')}', "
+                f"ação='{step.get('inferred_action') or 'n/a'}', componentes=[{comps}], proveniência_base='{prev_label}'"
+            )
+
+        branch_lines = []
+        for branch in flow_branches_clean:
+            branch_lines.append(
+                f"- Branch node_id={branch.get('node_id')}, nome='{branch.get('node_name')}', "
+                f"tipo={branch.get('branch_type')}, triggered_from_step={branch.get('triggered_from_step') or 'n/a'}"
+            )
+
+        flow_context_block = (
+            "MODO FLOW FIGMA ACTIVO:\n"
+            f"- Gerar exatamente {effective_num_stories} US(s): 1 por step e 1 por branch relevante.\n"
+            "- Para cada US de step: na secção Proveniência referir o step anterior.\n"
+            "- Para cada US (step/branch): na secção Mockup referir node_id Figma.\n"
+            "- Para branches: tratar como US separadas de exceção/fallback.\n"
+            "STEPS DETECTADOS:\n"
+            f"{chr(10).join(step_lines) if step_lines else '- Sem steps válidos'}\n"
+        )
+        if branch_lines:
+            flow_context_block += "BRANCHES DETECTADOS:\n" + "\n".join(branch_lines) + "\n"
+
+        marker_idx = context_clean.find("FLOW_CONTEXT_JSON:")
+        if marker_idx >= 0:
+            context_clean = context_clean[:marker_idx].strip()
+
     prompt = (
-        f"Gerar {requested_num_stories} User Story(s) sobre: \"{topic}\"\n\n"
+        f"Gerar {effective_num_stories} User Story(s) sobre: \"{topic}\"\n\n"
         f"{policy_block}\n"
         f"{common_rules}\n"
+        f"{flow_context_block}\n"
         f"EXEMPLOS REAIS (few-shot):\n{ex}\n"
         f"{style_hint}\n"
-        f"CONTEXTO ADICIONAL:\n{context or 'Nenhum.'}\n\n"
+        f"CONTEXTO ADICIONAL:\n{context_clean or 'Nenhum.'}\n\n"
         "OUTPUT:\n"
         "- Seguir o formato aplicável.\n"
         "- Entregar conteúdo pronto para uso em DevOps.\n"
@@ -1570,7 +1679,7 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
         stories = _split_generated_stories(gen_clean)
         if not stories:
             stories = [gen_clean]
-        if requested_num_stories > 1:
+        if effective_num_stories > 1:
             for idx, story in enumerate(stories, 1):
                 title, ac_html = _extract_story_title_and_ac(story)
                 story_flags = _collect_quality_flags(title, ac_html)
@@ -1579,7 +1688,7 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             title, ac_html = _extract_story_title_and_ac(stories[0])
             quality_flags = _collect_quality_flags(title, ac_html)
 
-    return {
+    result = {
         "generated_user_stories": gen_clean,
         "based_on_examples": raw.get("samples_returned", 0) if raw else 0,
         "reference_ids": reference_ids,
@@ -1589,7 +1698,12 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
         "template_version": US_TEMPLATE_VERSION,
         "quality_flags": quality_flags,
         "detail_policy_applied": policy,
+        "flow_mode": flow_mode,
+        "flow_steps_detected": flow_steps_detected,
     }
+    if flow_mode:
+        result["flow_story_map"] = flow_story_map
+    return result
 
 # =============================================================================
 # TOOL 6: query_hierarchy
@@ -1982,6 +2096,7 @@ Objetivo:
 - Se a US original não seguir o template oficial, NÃO reformatar; aplicar apenas o refinamento pedido.
 - NÃO forçar prefixo "MSE |" no título durante refino; manter título original salvo pedido explícito para mudar.
 - Em change_summary, indicar as secções alteradas.
+- Se o pedido referir Step/fluxo Figma, preservar referência ao Step na secção Proveniência e ao node_id na secção Mockup.
 
 Responde APENAS em JSON válido neste formato:
 {{
@@ -2327,6 +2442,25 @@ _SEARCH_FIGMA_PROXY_DEFINITION = {
     },
 }
 
+_ANALYZE_FIGMA_FLOW_PROXY_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "analyze_figma_flow",
+        "description": "Analisa um fluxo Figma e decompõe em steps ordenados para geração de User Stories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_key": {"type": "string", "description": "Figma file key."},
+                "node_ids": {"type": "string", "description": "IDs de frames em CSV ou lista JSON serializada."},
+                "start_node_id": {"type": "string", "description": "Node inicial opcional para seguir fluxo de protótipo."},
+                "include_branches": {"type": "boolean", "description": "Incluir branches de erro/fallback/cancel."},
+                "max_steps": {"type": "integer", "description": "Máximo de steps a processar."},
+            },
+            "required": ["file_key"],
+        },
+    },
+}
+
 _SEARCH_MIRO_PROXY_DEFINITION = {
     "type": "function",
     "function": {
@@ -2357,6 +2491,22 @@ async def _search_figma_proxy(arguments):
         return {"error": "Integração Figma indisponível neste runtime"}
 
 
+async def _analyze_figma_flow_proxy(arguments):
+    try:
+        from tools_figma import tool_analyze_figma_flow
+
+        return await tool_analyze_figma_flow(
+            file_key=(arguments or {}).get("file_key", ""),
+            node_ids=(arguments or {}).get("node_ids", ""),
+            start_node_id=(arguments or {}).get("start_node_id", ""),
+            include_branches=(arguments or {}).get("include_branches", True),
+            max_steps=(arguments or {}).get("max_steps", 15),
+        )
+    except Exception as e:
+        logging.error("[Tools] analyze_figma_flow proxy failed: %s", e, exc_info=True)
+        return {"error": "Integração Figma indisponível neste runtime"}
+
+
 async def _search_miro_proxy(arguments):
     try:
         from tools_miro import tool_search_miro
@@ -2379,6 +2529,13 @@ def _ensure_optional_tool_proxies() -> None:
             definition=_SEARCH_FIGMA_PROXY_DEFINITION,
         )
         logging.warning("[Tools] search_figma registada via proxy fallback")
+    if not has_tool("analyze_figma_flow"):
+        register_tool(
+            "analyze_figma_flow",
+            lambda args: _analyze_figma_flow_proxy(args),
+            definition=_ANALYZE_FIGMA_FLOW_PROXY_DEFINITION,
+        )
+        logging.warning("[Tools] analyze_figma_flow registada via proxy fallback")
 
     if not has_tool("search_miro"):
         register_tool(
@@ -2619,6 +2776,12 @@ EXEMPLOS DE WIQL:
 - Para "quem criou mais", query SEM filtro de criador, top=500, conta por created_by"""
 
 def get_userstory_system_prompt():
+    figma_flow_instruction = ""
+    if has_tool("analyze_figma_flow"):
+        figma_flow_instruction = (
+            "- Se o utilizador fornecer um fluxo Figma com múltiplos ecrãs/frames, usa analyze_figma_flow "
+            "para decompor em steps antes de gerar US.\n"
+        )
     return f"""Tu és PO Sénior especialista no MSE (Millennium Site Empresas).
 Objetivo: transformar pedidos em User Stories rigorosas, refinadas iterativamente.
 DATA: {datetime.now().strftime('%Y-%m-%d')}
@@ -2637,6 +2800,7 @@ FERRAMENTA OBRIGATÓRIA:
 - Usa SEMPRE generate_user_stories para gerar/refinar USs.
 - Quando o utilizador pedir "como o [autor] escreve", passa reference_author para aproveitar WriterProfiles.
 - Se o utilizador referir uma US existente por ID e pedir alteração, usa refine_workitem para criar o draft de revisão antes do final.
+{figma_flow_instruction}
 
 PARSING DE INPUT (PRIORIDADE):
 - Texto: extrair objetivo, regras e restrições.
