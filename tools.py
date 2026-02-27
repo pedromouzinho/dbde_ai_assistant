@@ -31,7 +31,7 @@ from tools_export import (
     tool_generate_chart,
     tool_generate_file,
 )
-from tools_upload import tool_search_uploaded_document
+from tools_upload import tool_search_uploaded_document, tool_analyze_uploaded_table
 from tools_learning import (
     _save_writer_profile,
     _load_writer_profile,
@@ -55,6 +55,7 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"search_workitems","description":"Pesquisa semântica em work items indexados. Retorna AMOSTRA dos mais relevantes.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferências SPIN'"},"top":{"type":"integer","description":"Nº resultados. Default: 30."},"filter":{"type":"string","description":"Filtro OData."}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_website","description":"Pesquisa no site MSE. Usa para navegação, funcionalidades, operações.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferência SEPA'"},"top":{"type":"integer","description":"Default: 10"}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_uploaded_document","description":"Pesquisa semântica no documento carregado pelo utilizador. Usar quando o utilizador perguntar sobre conteúdos específicos de um documento que fez upload e o documento é grande.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto a pesquisar semanticamente no documento carregado."},"conv_id":{"type":"string","description":"ID da conversa. Opcional; se vazio, tenta inferir automaticamente."}},"required":["query"]}}},
+    {"type":"function","function":{"name":"analyze_uploaded_table","description":"Analisa CSV/Excel carregado no servidor usando o ficheiro completo (RawBlobRef). Usa para min/max/média e agregações por ano/mês sem depender da amostra truncada.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Pedido em linguagem natural. Ex: 'volume médio de TLT por ano'."},"conv_id":{"type":"string","description":"ID da conversa com o ficheiro carregado."},"filename":{"type":"string","description":"Nome (ou parte do nome) do ficheiro a analisar, opcional."},"value_column":{"type":"string","description":"Coluna numérica alvo. Ex: 'TLT_Volume'."},"date_column":{"type":"string","description":"Coluna temporal. Ex: 'Time'."},"group_by":{"type":"string","enum":["none","year","month"],"description":"Agrupamento temporal."},"agg":{"type":"string","enum":["mean","sum","min","max","count"],"description":"Agregação numérica."},"top":{"type":"integer","description":"Máximo de grupos retornados. Default: 200."}},"required":["query"]}}},
     {"type":"function","function":{"name":"analyze_patterns","description":"Analisa padrões de escrita de work items com LLM. Templates, estilo de autor.","parameters":{"type":"object","properties":{"created_by":{"type":"string"},"topic":{"type":"string"},"work_item_type":{"type":"string","description":"Default: 'User Story'"},"area_path":{"type":"string"},"sample_size":{"type":"integer","description":"Default: 50"},"analysis_type":{"type":"string","description":"'template','author_style','general'"}}}}},
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
     {"type":"function","function":{"name":"query_hierarchy","description":"Query hierárquica parent/child. OBRIGATÓRIO para 'Epic', 'dentro de', 'filhos de'.","parameters":{"type":"object","properties":{"parent_id":{"type":"integer","description":"ID do pai."},"parent_type":{"type":"string","description":"Default: 'Epic'."},"child_type":{"type":"string","description":"Default: 'User Story'."},"area_path":{"type":"string"},"title_contains":{"type":"string","description":"Filtro opcional por título (contains, case/accent-insensitive). Ex: 'Créditos Consultar Carteira'"},"parent_title_hint":{"type":"string","description":"(Interno) dica de título do parent para resolução quando parent_id não for fornecido."}}}}},
@@ -100,6 +101,17 @@ def _tool_dispatch() -> dict:
             arguments.get("query", ""),
             arguments.get("conv_id", ""),
             arguments.get("user_sub", ""),
+        ),
+        "analyze_uploaded_table": lambda arguments: tool_analyze_uploaded_table(
+            arguments.get("query", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
+            arguments.get("value_column", ""),
+            arguments.get("date_column", ""),
+            arguments.get("group_by", ""),
+            arguments.get("agg", ""),
+            arguments.get("top", 200),
         ),
         "analyze_patterns": lambda arguments: tool_analyze_patterns_with_llm(arguments.get("created_by"), arguments.get("topic"), arguments.get("work_item_type","User Story"), arguments.get("area_path"), arguments.get("sample_size",50), arguments.get("analysis_type","template")),
         "generate_user_stories": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("context",""), arguments.get("num_stories",3), arguments.get("reference_area"), arguments.get("reference_author"), arguments.get("reference_topic")),
@@ -321,6 +333,7 @@ def get_agent_system_prompt():
     figma_enabled = has_tool("search_figma")
     miro_enabled = has_tool("search_miro")
     uploaded_doc_enabled = has_tool("search_uploaded_document")
+    uploaded_table_enabled = has_tool("analyze_uploaded_table")
 
     def _join_with_ou(parts):
         if not parts:
@@ -334,6 +347,8 @@ def get_agent_system_prompt():
         data_sources.append("web externa")
     if uploaded_doc_enabled:
         data_sources.append("documento carregado")
+    if uploaded_table_enabled:
+        data_sources.append("ficheiro tabular carregado")
     if figma_enabled:
         data_sources.append("Figma")
     if miro_enabled:
@@ -344,6 +359,10 @@ def get_agent_system_prompt():
     if uploaded_doc_enabled:
         gate_priority_hints.append(
             "- Se o utilizador perguntar sobre secções específicas de documento carregado (especialmente PDF grande), usa search_uploaded_document."
+        )
+    if uploaded_table_enabled:
+        gate_priority_hints.append(
+            "- Se o utilizador pedir estatísticas, médias por ano/mês ou agregações sobre CSV/Excel carregado, usa analyze_uploaded_table (não uses query_workitems)."
         )
     if figma_enabled:
         gate_priority_hints.append(
@@ -357,6 +376,8 @@ def get_agent_system_prompt():
     exception_targets = []
     if uploaded_doc_enabled:
         exception_targets.append("documento carregado")
+    if uploaded_table_enabled:
+        exception_targets.append("ficheiro tabular carregado")
     if figma_enabled:
         exception_targets.append("Figma")
     if miro_enabled:
@@ -412,6 +433,13 @@ def get_agent_system_prompt():
             "   REGRA: Usa pesquisa semântica nos chunks do documento, em vez de depender só do texto truncado."
         )
         next_rule += 1
+    if uploaded_table_enabled:
+        routing_rules.append(
+            f"{next_rule}. Para ANÁLISE DE CSV/EXCEL CARREGADO (média por ano, min/max, agregações) -> usa analyze_uploaded_table (OBRIGATÓRIO)\n"
+            "   Exemplos: \"volume médio de TLT por ano\", \"min e max de Close\", \"soma mensal por coluna X\"\n"
+            "   REGRA: NÃO usar query_workitems para dados de ficheiros carregados. Primeiro chama analyze_uploaded_table e só depois generate_chart."
+        )
+        next_rule += 1
     if figma_enabled:
         routing_rules.append(
             f"{next_rule}. Para DESIGN, MOCKUPS, ECRAS UI e PROTOTIPOS FIGMA -> usa search_figma (OBRIGATORIO)\n"
@@ -452,6 +480,13 @@ def get_agent_system_prompt():
             [
                 "- \"O que diz o capítulo 3 do PDF?\" -> search_uploaded_document",
                 "- \"Procura no documento onde fala de validação\" -> search_uploaded_document",
+            ]
+        )
+    if uploaded_table_enabled:
+        usage_examples.extend(
+            [
+                "- \"Resumo estatístico da coluna Close no CSV carregado\" -> analyze_uploaded_table",
+                "- \"Faz bar chart com volume médio por ano\" -> analyze_uploaded_table DEPOIS generate_chart com chart_ready",
             ]
         )
     if figma_enabled:

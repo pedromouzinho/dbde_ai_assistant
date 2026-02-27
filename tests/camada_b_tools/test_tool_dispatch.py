@@ -17,6 +17,7 @@ EXPECTED_TOOLS = [
     "search_workitems",
     "search_website",
     "search_uploaded_document",
+    "analyze_uploaded_table",
     "analyze_patterns",
     "generate_user_stories",
     "query_hierarchy",

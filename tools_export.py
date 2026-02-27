@@ -238,6 +238,83 @@ async def tool_generate_chart(
     if chart_type not in supported:
         chart_type = "bar"
 
+    def _as_list(value):
+        return value if isinstance(value, list) else []
+
+    clean_x = _as_list(x_values)
+    clean_y = _as_list(y_values)
+    clean_labels = _as_list(labels)
+    clean_values = _as_list(values)
+    clean_series = _as_list(series)
+
+    if chart_type == "pie":
+        pie_labels = clean_labels or clean_x
+        pie_values = clean_values or clean_y
+        if not pie_labels or not pie_values:
+            return {
+                "error": "Dados insuficientes para pie chart. Envia labels/values não vazios.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+        if len(pie_labels) != len(pie_values):
+            return {
+                "error": "labels e values têm tamanhos diferentes no pie chart.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+    elif chart_type == "histogram":
+        hist_source = clean_x or clean_y
+        if not hist_source:
+            return {
+                "error": "Dados insuficientes para histogram. Envia x_values ou y_values não vazios.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+    elif clean_series:
+        has_any_trace = False
+        for s in clean_series:
+            if not isinstance(s, dict):
+                continue
+            stype = str(s.get("type", chart_type) or chart_type).lower()
+            sx = _as_list(s.get("x"))
+            sy = _as_list(s.get("y"))
+            sl = _as_list(s.get("labels"))
+            sv = _as_list(s.get("values"))
+            if stype == "pie":
+                if sl and sv and len(sl) == len(sv):
+                    has_any_trace = True
+            elif stype == "histogram":
+                if sx or sy:
+                    has_any_trace = True
+            else:
+                if sx and sy and len(sx) == len(sy):
+                    has_any_trace = True
+        if not has_any_trace:
+            return {
+                "error": "Dados insuficientes nas séries para gerar gráfico.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+    else:
+        if not clean_x or not clean_y:
+            return {
+                "error": "Dados insuficientes para gráfico. Envia x_values e y_values não vazios.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+        if len(clean_x) != len(clean_y):
+            return {
+                "error": "x_values e y_values têm tamanhos diferentes.",
+                "chart_generated": False,
+                "chart_type": chart_type,
+                "title": title,
+            }
+
     data = []
     layout = {
         "title": {"text": title, "font": {"size": 16}},
@@ -245,8 +322,8 @@ async def tool_generate_chart(
     }
 
     # Multi-series via 'series' param
-    if series and isinstance(series, list):
-        for s in series:
+    if clean_series:
+        for s in clean_series:
             trace = {"type": s.get("type", chart_type), "name": s.get("name", "")}
             if s.get("x"): trace["x"] = s["x"]
             if s.get("y"): trace["y"] = s["y"]
@@ -258,16 +335,16 @@ async def tool_generate_chart(
     elif chart_type == "pie":
         data.append({
             "type": "pie",
-            "labels": labels or x_values or [],
-            "values": values or y_values or [],
+            "labels": clean_labels or clean_x or [],
+            "values": clean_values or clean_y or [],
             "textinfo": "label+percent",
             "hole": 0.3,
         })
     elif chart_type == "hbar":
         data.append({
             "type": "bar",
-            "y": x_values or [],
-            "x": y_values or [],
+            "y": clean_x or [],
+            "x": clean_y or [],
             "orientation": "h",
             "name": title,
         })
@@ -276,7 +353,7 @@ async def tool_generate_chart(
     elif chart_type == "histogram":
         data.append({
             "type": "histogram",
-            "x": x_values or y_values or [],
+            "x": clean_x or clean_y or [],
             "name": title,
         })
         layout["xaxis"] = {"title": x_label}
@@ -285,8 +362,8 @@ async def tool_generate_chart(
         # bar, line, scatter
         data.append({
             "type": chart_type if chart_type != "bar" else "bar",
-            "x": x_values or [],
-            "y": y_values or [],
+            "x": clean_x or [],
+            "y": clean_y or [],
             "name": title,
         })
         if x_label: layout["xaxis"] = {"title": x_label}
@@ -298,7 +375,7 @@ async def tool_generate_chart(
         "chart_generated": True,
         "chart_type": chart_type,
         "title": title,
-        "data_points": len(x_values or labels or []),
+        "data_points": len(clean_x or clean_labels or []),
         "_chart": chart_spec,
     }
 

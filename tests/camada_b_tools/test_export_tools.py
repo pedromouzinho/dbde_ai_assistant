@@ -115,5 +115,5 @@ class TestExportTools:
         from tools_export import tool_generate_chart
 
         result = await tool_generate_chart(chart_type="bar", title="Vazio", x_values=[], y_values=[])
-        assert result.get("chart_generated") is True
-        assert result.get("data_points") == 0
+        assert result.get("chart_generated") is False
+        assert "error" in result

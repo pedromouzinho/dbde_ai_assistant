@@ -929,6 +929,10 @@ async def _execute_tool_calls(
             args["conv_id"] = conv_id
         if tc.name == "search_uploaded_document" and user_sub and not args.get("user_sub"):
             args["user_sub"] = user_sub
+        if tc.name == "analyze_uploaded_table" and not args.get("conv_id"):
+            args["conv_id"] = conv_id
+        if tc.name == "analyze_uploaded_table" and user_sub and not args.get("user_sub"):
+            args["user_sub"] = user_sub
         if tc.name == "query_hierarchy":
             has_parent_id = bool(args.get("parent_id"))
             parent_type = str(args.get("parent_type", "") or "").strip().lower()
