@@ -2,7 +2,7 @@
 # tools.py — Tool definitions, implementations e system prompts v7.2
 # =============================================================================
 
-import json, base64, asyncio, logging, uuid, re, math, unicodedata
+import json, base64, asyncio, logging, uuid, re, math, unicodedata, io, csv
 from datetime import datetime, timezone
 from collections import deque
 from urllib.parse import quote
@@ -1114,6 +1114,446 @@ def _resolve_uploaded_files_memory(conv_id: str = "", user_sub: str = ""):
     return None, []
 
 
+def _normalize_lookup_key(value: str) -> str:
+    txt = unicodedata.normalize("NFKD", str(value or ""))
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    return txt.lower().strip()
+
+
+def _parse_numeric_value(raw_val):
+    txt = str(raw_val or "").strip()
+    if not txt:
+        return None
+    txt = txt.replace("\u00A0", "").replace(" ", "")
+    if "," in txt and "." in txt:
+        if txt.rfind(",") > txt.rfind("."):
+            txt = txt.replace(".", "").replace(",", ".")
+        else:
+            txt = txt.replace(",", "")
+    else:
+        txt = txt.replace(",", ".")
+    try:
+        return float(txt)
+    except Exception:
+        return None
+
+
+def _parse_datetime_value(raw_val):
+    txt = str(raw_val or "").strip()
+    if not txt:
+        return None
+    # Normalizações comuns (ISO com Z e espaço entre data/hora).
+    iso_txt = txt.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso_txt)
+    except Exception:
+        pass
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(txt, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _infer_group_by_mode(query: str, group_by: str) -> str:
+    raw = _normalize_lookup_key(group_by or "")
+    if raw in ("year", "ano", "anual"):
+        return "year"
+    if raw in ("month", "mes", "mês", "mensal"):
+        return "month"
+    if raw in ("none", "raw", "sem"):
+        return "none"
+    q = _normalize_lookup_key(query or "")
+    if re.search(r"\b(ano|anual|year|yearly)\b", q):
+        return "year"
+    if re.search(r"\b(mes|mensal|month|monthly)\b", q):
+        return "month"
+    return "none"
+
+
+def _infer_agg_mode(query: str, agg: str) -> str:
+    raw = _normalize_lookup_key(agg or "")
+    if raw in ("mean", "avg", "average", "media", "média"):
+        return "mean"
+    if raw in ("sum", "soma", "total"):
+        return "sum"
+    if raw in ("min", "minimum", "minimo", "mínimo"):
+        return "min"
+    if raw in ("max", "maximum", "maximo", "máximo"):
+        return "max"
+    if raw in ("count", "contagem", "numero", "número", "quantidade"):
+        return "count"
+    q = _normalize_lookup_key(query or "")
+    if re.search(r"\b(m[eé]dia|m[eé]dio|average|mean)\b", q):
+        return "mean"
+    if re.search(r"\b(soma|sum|total)\b", q):
+        return "sum"
+    if re.search(r"\b(min|minimo|mínimo|minimum|menor)\b", q):
+        return "min"
+    if re.search(r"\b(max|maximo|máximo|maximum|maior)\b", q):
+        return "max"
+    if re.search(r"\b(count|quantidade|numero|número|contagem)\b", q):
+        return "count"
+    return "mean"
+
+
+def _match_column_name(requested: str, columns):
+    if not requested:
+        return ""
+    wanted = _normalize_lookup_key(requested)
+    if not wanted:
+        return ""
+    direct = { _normalize_lookup_key(c): c for c in (columns or []) }
+    if wanted in direct:
+        return direct[wanted]
+    for c in columns or []:
+        n = _normalize_lookup_key(c)
+        if wanted in n or n in wanted:
+            return c
+    return ""
+
+
+def _infer_date_column(query: str, columns, records):
+    q = _normalize_lookup_key(query or "")
+    date_hints = ["time", "date", "data", "datetime", "timestamp", "hora"]
+    for c in columns:
+        n = _normalize_lookup_key(c)
+        if any(h in n for h in date_hints):
+            return c
+    # Fallback por detectabilidade de datetime nos primeiros registos.
+    sample = records[:200]
+    best = ("", 0)
+    for c in columns:
+        ok = 0
+        for r in sample:
+            if _parse_datetime_value(r.get(c, "")) is not None:
+                ok += 1
+        if ok > best[1]:
+            best = (c, ok)
+    if best[0] and best[1] > 0:
+        return best[0]
+    if re.search(r"\b(ano|mes|m[eê]s|dia|data|tempo|time)\b", q):
+        return columns[0] if columns else ""
+    return ""
+
+
+def _infer_value_column(query: str, columns, records, date_column: str = ""):
+    q = _normalize_lookup_key(query or "")
+    explicit_match = ""
+    # Heurística de score por tokens da query.
+    best = ("", -1)
+    for c in columns:
+        if c == date_column:
+            continue
+        n = _normalize_lookup_key(c)
+        score = 0
+        if n and n in q:
+            score += 10
+        tokens = [t for t in re.split(r"[^a-z0-9]+", n) if len(t) >= 3]
+        score += sum(1 for t in tokens if t in q)
+        if score > best[1]:
+            best = (c, score)
+    if best[1] > 0:
+        explicit_match = best[0]
+    if explicit_match:
+        return explicit_match
+
+    # Fallback: primeira coluna maioritariamente numérica.
+    sample = records[:300]
+    best_numeric = ("", -1.0)
+    for c in columns:
+        if c == date_column:
+            continue
+        vals = [r.get(c, "") for r in sample]
+        non_empty = [v for v in vals if str(v).strip()]
+        if not non_empty:
+            continue
+        numeric = sum(1 for v in non_empty if _parse_numeric_value(v) is not None)
+        ratio = numeric / max(1, len(non_empty))
+        if ratio > best_numeric[1]:
+            best_numeric = (c, ratio)
+    if best_numeric[0] and best_numeric[1] >= 0.5:
+        return best_numeric[0]
+    return ""
+
+
+async def tool_analyze_uploaded_table(
+    query: str = "",
+    conv_id: str = "",
+    user_sub: str = "",
+    filename: str = "",
+    value_column: str = "",
+    date_column: str = "",
+    group_by: str = "",
+    agg: str = "mean",
+    top: int = 500,
+):
+    q = str(query or "").strip()
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    if not safe_conv:
+        return {"error": "conv_id é obrigatório para analisar ficheiros carregados."}
+
+    odata_conv = safe_conv.replace("'", "''")
+    try:
+        rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
+    except Exception as e:
+        return {"error": f"Falha a carregar UploadIndex: {str(e)}"}
+    if not rows:
+        return {"error": "Não foram encontrados ficheiros carregados nesta conversa."}
+
+    wanted_filename = _normalize_lookup_key(filename)
+    selected = None
+    tabular_rows = []
+    for row in rows:
+        owner_sub = str(row.get("UserSub", "") or "")
+        if safe_user and owner_sub and owner_sub != safe_user:
+            continue
+        fname = str(row.get("Filename", "") or "")
+        fname_lower = fname.lower()
+        if not fname_lower.endswith((".csv", ".xlsx", ".xls")):
+            continue
+        if not str(row.get("RawBlobRef", "") or ""):
+            continue
+        tabular_rows.append(row)
+    if not tabular_rows:
+        return {"error": "Não há ficheiros CSV/Excel com raw blob disponível nesta conversa."}
+
+    tabular_rows.sort(key=lambda r: str(r.get("UploadedAt", "")), reverse=True)
+    if wanted_filename:
+        for row in tabular_rows:
+            fname = str(row.get("Filename", "") or "")
+            norm = _normalize_lookup_key(fname)
+            if norm == wanted_filename or wanted_filename in norm:
+                selected = row
+                break
+        if selected is None:
+            return {"error": f"Ficheiro '{filename}' não encontrado nesta conversa."}
+    else:
+        selected = tabular_rows[0]
+
+    selected_filename = str(selected.get("Filename", "") or "")
+    raw_blob_ref = str(selected.get("RawBlobRef", "") or "")
+    container, blob_name = parse_blob_ref(raw_blob_ref)
+    if not container or not blob_name:
+        return {"error": "RawBlobRef inválido para o ficheiro selecionado."}
+
+    try:
+        raw_bytes = await blob_download_bytes(container, blob_name)
+    except Exception as e:
+        return {"error": f"Falha ao descarregar raw blob: {str(e)}"}
+    if not raw_bytes:
+        return {"error": "Raw blob vazio para o ficheiro selecionado."}
+
+    records = []
+    columns = []
+    max_rows = 500000
+    fname_lower = selected_filename.lower()
+    if fname_lower.endswith(".csv"):
+        text = raw_bytes.decode("utf-8", errors="replace")
+        if not text.strip():
+            return {"error": "CSV vazio."}
+        sample = "\n".join(text.splitlines()[:20])
+        delimiter = ","
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            delimiter = dialect.delimiter
+        except Exception:
+            delimiter = ";" if ";" in sample and sample.count(";") >= sample.count(",") else ","
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        if not reader.fieldnames:
+            return {"error": "CSV sem header válido."}
+        columns = [str(c).strip() for c in reader.fieldnames]
+        for i, row in enumerate(reader):
+            if i >= max_rows:
+                break
+            records.append({c: row.get(c, "") for c in columns})
+    else:
+        try:
+            import openpyxl
+        except Exception:
+            return {"error": "openpyxl indisponível no servidor para analisar Excel."}
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        ws = wb.active
+        row_iter = ws.iter_rows(values_only=True)
+        header = next(row_iter, None)
+        if not header:
+            wb.close()
+            return {"error": "Excel vazio."}
+        columns = [str(c).strip() if c is not None and str(c).strip() else f"Col{idx+1}" for idx, c in enumerate(header)]
+        for i, vals in enumerate(row_iter):
+            if i >= max_rows:
+                break
+            item = {}
+            for ci, c in enumerate(columns):
+                item[c] = "" if ci >= len(vals) or vals[ci] is None else str(vals[ci])
+            records.append(item)
+        wb.close()
+
+    if not records:
+        return {"error": "Ficheiro sem linhas de dados."}
+
+    matched_date_col = _match_column_name(date_column, columns) if date_column else ""
+    matched_value_col = _match_column_name(value_column, columns) if value_column else ""
+    group_mode = _infer_group_by_mode(q, group_by)
+    agg_mode = _infer_agg_mode(q, agg)
+
+    if not matched_date_col and group_mode in ("year", "month"):
+        matched_date_col = _infer_date_column(q, columns, records)
+    if not matched_value_col and agg_mode != "count":
+        matched_value_col = _infer_value_column(q, columns, records, date_column=matched_date_col)
+
+    if group_mode in ("year", "month") and not matched_date_col:
+        return {
+            "error": "Não consegui inferir a coluna de data. Indica date_column explicitamente.",
+            "columns": columns,
+            "filename": selected_filename,
+        }
+    if agg_mode != "count" and not matched_value_col:
+        return {
+            "error": "Não consegui inferir a coluna numérica para agregação. Indica value_column explicitamente.",
+            "columns": columns,
+            "filename": selected_filename,
+        }
+
+    top_n = max(1, min(int(top or 500), 5000))
+    groups = []
+
+    if group_mode in ("year", "month"):
+        buckets = {}
+        for row in records:
+            dt = _parse_datetime_value(row.get(matched_date_col, ""))
+            if dt is None:
+                continue
+            if group_mode == "year":
+                key = f"{dt.year:04d}"
+            else:
+                key = f"{dt.year:04d}-{dt.month:02d}"
+            bucket = buckets.setdefault(key, {"key": key, "values": [], "count": 0})
+            if agg_mode == "count":
+                bucket["count"] += 1
+                continue
+            num = _parse_numeric_value(row.get(matched_value_col, ""))
+            if num is None:
+                continue
+            bucket["values"].append(num)
+            bucket["count"] += 1
+
+        for key in sorted(buckets.keys()):
+            bucket = buckets[key]
+            if agg_mode == "count":
+                value = float(bucket["count"])
+            else:
+                vals = bucket["values"]
+                if not vals:
+                    continue
+                if agg_mode == "mean":
+                    value = sum(vals) / len(vals)
+                elif agg_mode == "sum":
+                    value = sum(vals)
+                elif agg_mode == "min":
+                    value = min(vals)
+                elif agg_mode == "max":
+                    value = max(vals)
+                else:
+                    value = sum(vals) / len(vals)
+            groups.append({"group": key, "value": round(value, 6), "count": int(bucket["count"])})
+    else:
+        # Modo "none": se houver data+valor, devolve série temporal determinística.
+        if matched_date_col and matched_value_col:
+            series = []
+            for row in records:
+                dt = _parse_datetime_value(row.get(matched_date_col, ""))
+                num = _parse_numeric_value(row.get(matched_value_col, ""))
+                if dt is None or num is None:
+                    continue
+                series.append((dt, num))
+            series.sort(key=lambda x: x[0])
+            if not series:
+                return {"error": "Sem dados numéricos/datas válidos para gerar série temporal.", "filename": selected_filename}
+            if len(series) > top_n:
+                step = max(1, len(series) // top_n)
+                sampled = [series[i] for i in range(0, len(series), step)][:top_n]
+            else:
+                sampled = series
+            groups = [
+                {"group": dt.isoformat(), "value": round(val, 6), "count": 1}
+                for dt, val in sampled
+            ]
+        elif matched_value_col:
+            nums = []
+            for row in records:
+                val = _parse_numeric_value(row.get(matched_value_col, ""))
+                if val is not None:
+                    nums.append(val)
+            if not nums:
+                return {"error": "Sem dados numéricos válidos na coluna indicada.", "filename": selected_filename}
+            if agg_mode == "sum":
+                overall = sum(nums)
+            elif agg_mode == "min":
+                overall = min(nums)
+            elif agg_mode == "max":
+                overall = max(nums)
+            elif agg_mode == "count":
+                overall = float(len(nums))
+            else:
+                overall = sum(nums) / len(nums)
+            groups = [{"group": "overall", "value": round(overall, 6), "count": len(nums)}]
+        else:
+            return {"error": "Indica value_column para análise sem agrupamento.", "columns": columns, "filename": selected_filename}
+
+    if not groups:
+        return {"error": "Não foi possível produzir agregações com os filtros atuais.", "filename": selected_filename}
+
+    x_values = [g.get("group", "") for g in groups]
+    y_values = [g.get("value", 0) for g in groups]
+    chart_type = "bar" if group_mode in ("year", "month") else "line"
+    x_label = "Ano" if group_mode == "year" else ("Ano-Mês" if group_mode == "month" else (matched_date_col or "Grupo"))
+    metric_label = "count" if agg_mode == "count" else f"{agg_mode}({matched_value_col})"
+    chart_title = f"{metric_label} por {x_label.lower()}" if group_mode in ("year", "month") else f"{metric_label} - {selected_filename}"
+
+    return {
+        "source": "uploaded_table_raw_blob",
+        "conversation_id": safe_conv,
+        "filename": selected_filename,
+        "row_count": len(records),
+        "columns": columns,
+        "group_by": group_mode,
+        "agg": agg_mode,
+        "date_column": matched_date_col,
+        "value_column": matched_value_col,
+        "groups": groups,
+        "summary": (
+            f"Análise completa de '{selected_filename}' ({len(records)} linhas). "
+            f"Agrupamento={group_mode}, agregação={agg_mode}, "
+            f"date_column={matched_date_col or '-'}, value_column={matched_value_col or '-'}."
+        ),
+        "chart_ready": {
+            "chart_type": chart_type,
+            "title": chart_title,
+            "x_values": x_values,
+            "y_values": y_values,
+            "x_label": x_label,
+            "y_label": metric_label,
+        },
+    }
+
+
 async def tool_search_uploaded_document(query: str = "", conv_id: str = "", user_sub: str = ""):
     q = (query or "").strip()
     if not q:
@@ -2159,6 +2599,16 @@ async def tool_generate_chart(
     if chart_type not in supported:
         chart_type = "bar"
 
+    def _normalize_list(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return []
+
+    def _is_non_empty_list(value):
+        return isinstance(value, list) and len(value) > 0
+
     data = []
     layout = {
         "title": {"text": title, "font": {"size": 16}},
@@ -2167,47 +2617,100 @@ async def tool_generate_chart(
 
     # Multi-series via 'series' param
     if series and isinstance(series, list):
+        valid_series = []
         for s in series:
+            if not isinstance(s, dict):
+                continue
             trace = {"type": s.get("type", chart_type), "name": s.get("name", "")}
-            if s.get("x"): trace["x"] = s["x"]
-            if s.get("y"): trace["y"] = s["y"]
-            if s.get("labels"): trace["labels"] = s["labels"]
-            if s.get("values"): trace["values"] = s["values"]
-            if trace["type"] == "pie":
-                trace.pop("x", None); trace.pop("y", None)
-            data.append(trace)
+            sx = _normalize_list(s.get("x"))
+            sy = _normalize_list(s.get("y"))
+            sl = _normalize_list(s.get("labels"))
+            sv = _normalize_list(s.get("values"))
+            stype = (trace.get("type") or chart_type).lower().strip()
+            if stype == "pie":
+                if not _is_non_empty_list(sl) or not _is_non_empty_list(sv) or len(sl) != len(sv):
+                    continue
+                trace["type"] = "pie"
+                trace["labels"] = sl
+                trace["values"] = sv
+            elif stype == "histogram":
+                src = sx or sy
+                if not _is_non_empty_list(src):
+                    continue
+                trace["type"] = "histogram"
+                trace["x"] = src
+            else:
+                if not _is_non_empty_list(sx) or not _is_non_empty_list(sy) or len(sx) != len(sy):
+                    continue
+                trace["type"] = stype if stype in supported else chart_type
+                trace["x"] = sx
+                trace["y"] = sy
+            valid_series.append(trace)
+        data.extend(valid_series)
+        if not data:
+            return {
+                "error": "generate_chart: input inválido. Fornece séries com dados válidos (x/y ou labels/values).",
+                "chart_generated": False,
+            }
     elif chart_type == "pie":
+        pie_labels = _normalize_list(labels or x_values)
+        pie_values = _normalize_list(values or y_values)
+        if not _is_non_empty_list(pie_labels) or not _is_non_empty_list(pie_values) or len(pie_labels) != len(pie_values):
+            return {
+                "error": "generate_chart: pie requer labels e values não vazios e com o mesmo tamanho.",
+                "chart_generated": False,
+            }
         data.append({
             "type": "pie",
-            "labels": labels or x_values or [],
-            "values": values or y_values or [],
+            "labels": pie_labels,
+            "values": pie_values,
             "textinfo": "label+percent",
             "hole": 0.3,
         })
     elif chart_type == "hbar":
+        hx = _normalize_list(x_values)
+        hy = _normalize_list(y_values)
+        if not _is_non_empty_list(hx) or not _is_non_empty_list(hy) or len(hx) != len(hy):
+            return {
+                "error": "generate_chart: hbar requer x_values e y_values não vazios e com o mesmo tamanho.",
+                "chart_generated": False,
+            }
         data.append({
             "type": "bar",
-            "y": x_values or [],
-            "x": y_values or [],
+            "y": hx,
+            "x": hy,
             "orientation": "h",
             "name": title,
         })
         layout["yaxis"] = {"title": x_label, "automargin": True}
         layout["xaxis"] = {"title": y_label}
     elif chart_type == "histogram":
+        hist_values = _normalize_list(x_values or y_values)
+        if not _is_non_empty_list(hist_values):
+            return {
+                "error": "generate_chart: histogram requer x_values (ou y_values) com dados.",
+                "chart_generated": False,
+            }
         data.append({
             "type": "histogram",
-            "x": x_values or y_values or [],
+            "x": hist_values,
             "name": title,
         })
         layout["xaxis"] = {"title": x_label}
         layout["yaxis"] = {"title": y_label or "Frequência"}
     else:
         # bar, line, scatter
+        x_clean = _normalize_list(x_values)
+        y_clean = _normalize_list(y_values)
+        if not _is_non_empty_list(x_clean) or not _is_non_empty_list(y_clean) or len(x_clean) != len(y_clean):
+            return {
+                "error": "generate_chart: chart requer x_values e y_values não vazios e com o mesmo tamanho.",
+                "chart_generated": False,
+            }
         data.append({
             "type": chart_type if chart_type != "bar" else "bar",
-            "x": x_values or [],
-            "y": y_values or [],
+            "x": x_clean,
+            "y": y_clean,
             "name": title,
         })
         if x_label: layout["xaxis"] = {"title": x_label}
@@ -2219,7 +2722,7 @@ async def tool_generate_chart(
         "chart_generated": True,
         "chart_type": chart_type,
         "title": title,
-        "data_points": len(x_values or labels or []),
+        "data_points": len((x_values or labels or values or [])),
         "_chart": chart_spec,
     }
 
@@ -2336,6 +2839,7 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"search_workitems","description":"Pesquisa semântica em work items indexados. Retorna AMOSTRA dos mais relevantes.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferências SPIN'"},"top":{"type":"integer","description":"Nº resultados. Default: 30."},"filter":{"type":"string","description":"Filtro OData."}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_website","description":"Pesquisa no site MSE. Usa para navegação, funcionalidades, operações.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferência SEPA'"},"top":{"type":"integer","description":"Default: 10"}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_uploaded_document","description":"Pesquisa semântica no documento carregado pelo utilizador. Usar quando o utilizador perguntar sobre conteúdos específicos de um documento que fez upload e o documento é grande.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto a pesquisar semanticamente no documento carregado."},"conv_id":{"type":"string","description":"ID da conversa. Opcional; se vazio, tenta inferir automaticamente."}},"required":["query"]}}},
+    {"type":"function","function":{"name":"analyze_uploaded_table","description":"Analisa ficheiro CSV/Excel carregado (ficheiro completo via RawBlobRef), com agregações determinísticas (year/month, mean/sum/min/max/count) e output pronto para generate_chart.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Pedido do utilizador (ex: 'volume médio por ano')."},"conv_id":{"type":"string","description":"ID da conversa (autopreenchido pelo agente)."},"filename":{"type":"string","description":"Nome do ficheiro (opcional; por omissão usa o mais recente tabular)."},"value_column":{"type":"string","description":"Coluna numérica para agregação (opcional se inferível)."},"date_column":{"type":"string","description":"Coluna de data/hora para agrupamento (opcional se inferível)."},"group_by":{"type":"string","description":"Agrupamento: 'year','month','none'."},"agg":{"type":"string","description":"Agregação: 'mean','sum','min','max','count'."},"top":{"type":"integer","description":"Máximo de pontos para saída/chart (default 500)."}},"required":["query"]}}},
     {"type":"function","function":{"name":"analyze_patterns","description":"Analisa padrões de escrita de work items com LLM. Templates, estilo de autor.","parameters":{"type":"object","properties":{"created_by":{"type":"string"},"topic":{"type":"string"},"work_item_type":{"type":"string","description":"Default: 'User Story'"},"area_path":{"type":"string"},"sample_size":{"type":"integer","description":"Default: 50"},"analysis_type":{"type":"string","description":"'template','author_style','general'"}}}}},
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
     {"type":"function","function":{"name":"query_hierarchy","description":"Query hierárquica parent/child. OBRIGATÓRIO para 'Epic', 'dentro de', 'filhos de'.","parameters":{"type":"object","properties":{"parent_id":{"type":"integer","description":"ID do pai."},"parent_type":{"type":"string","description":"Default: 'Epic'."},"child_type":{"type":"string","description":"Default: 'User Story'."},"area_path":{"type":"string"},"title_contains":{"type":"string","description":"Filtro opcional por título (contains, case/accent-insensitive). Ex: 'Créditos Consultar Carteira'"},"parent_title_hint":{"type":"string","description":"(Interno) dica de título do parent para resolução quando parent_id não for fornecido."}}}}},
@@ -2362,6 +2866,17 @@ def _tool_dispatch() -> dict:
             arguments.get("query", ""),
             arguments.get("conv_id", ""),
             arguments.get("user_sub", ""),
+        ),
+        "analyze_uploaded_table": lambda arguments: tool_analyze_uploaded_table(
+            arguments.get("query", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
+            arguments.get("value_column", ""),
+            arguments.get("date_column", ""),
+            arguments.get("group_by", ""),
+            arguments.get("agg", "mean"),
+            arguments.get("top", 500),
         ),
         "analyze_patterns": lambda arguments: tool_analyze_patterns_with_llm(arguments.get("created_by"), arguments.get("topic"), arguments.get("work_item_type","User Story"), arguments.get("area_path"), arguments.get("sample_size",50), arguments.get("analysis_type","template")),
         "generate_user_stories": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("context",""), arguments.get("num_stories",3), arguments.get("reference_area"), arguments.get("reference_author"), arguments.get("reference_topic")),
@@ -2568,6 +3083,7 @@ def get_agent_system_prompt():
     figma_enabled = has_tool("search_figma")
     miro_enabled = has_tool("search_miro")
     uploaded_doc_enabled = has_tool("search_uploaded_document")
+    uploaded_table_enabled = has_tool("analyze_uploaded_table")
 
     def _join_with_ou(parts):
         if not parts:
@@ -2579,6 +3095,8 @@ def get_agent_system_prompt():
     data_sources = ["DevOps", "AI Search", "site MSE"]
     if uploaded_doc_enabled:
         data_sources.append("documento carregado")
+    if uploaded_table_enabled:
+        data_sources.append("ficheiro tabular carregado (CSV/Excel)")
     if figma_enabled:
         data_sources.append("Figma")
     if miro_enabled:
@@ -2589,6 +3107,10 @@ def get_agent_system_prompt():
     if uploaded_doc_enabled:
         gate_priority_hints.append(
             "- Se o utilizador perguntar sobre secções específicas de documento carregado (especialmente PDF grande), usa search_uploaded_document."
+        )
+    if uploaded_table_enabled:
+        gate_priority_hints.append(
+            "- Se o utilizador pedir análise de CSV/Excel carregado (média por ano/mês, agregações, gráficos), usa analyze_uploaded_table e NÃO query_workitems."
         )
     if figma_enabled:
         gate_priority_hints.append(
@@ -2602,6 +3124,8 @@ def get_agent_system_prompt():
     exception_targets = []
     if uploaded_doc_enabled:
         exception_targets.append("documento carregado")
+    if uploaded_table_enabled:
+        exception_targets.append("ficheiro tabular carregado")
     if figma_enabled:
         exception_targets.append("Figma")
     if miro_enabled:
@@ -2657,6 +3181,14 @@ def get_agent_system_prompt():
             "   REGRA: Usa pesquisa semântica nos chunks do documento, em vez de depender só do texto truncado."
         )
         next_rule += 1
+    if uploaded_table_enabled:
+        routing_rules.append(
+            f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> usa analyze_uploaded_table (OBRIGATORIO)\n"
+            "   Exemplos: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\"\n"
+            "   REGRA: NUNCA usar query_workitems para dados de ficheiro carregado.\n"
+            "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
+        )
+        next_rule += 1
     if figma_enabled:
         routing_rules.append(
             f"{next_rule}. Para DESIGN, MOCKUPS, ECRAS UI e PROTOTIPOS FIGMA -> usa search_figma (OBRIGATORIO)\n"
@@ -2690,6 +3222,13 @@ def get_agent_system_prompt():
             [
                 "- \"O que diz o capítulo 3 do PDF?\" -> search_uploaded_document",
                 "- \"Procura no documento onde fala de validação\" -> search_uploaded_document",
+            ]
+        )
+    if uploaded_table_enabled:
+        usage_examples.extend(
+            [
+                "- \"Faz bar chart com volume médio por ano do CSV\" -> analyze_uploaded_table DEPOIS generate_chart",
+                "- \"Qual o min/max do Close no ficheiro?\" -> analyze_uploaded_table",
             ]
         )
     if figma_enabled:

@@ -959,6 +959,24 @@ async def _execute_tool_calls(
                         parts.append(str(p.get("text", "")))
                 return " ".join(parts).strip()
         return ""
+
+    def _latest_chart_ready() -> Dict:
+        for msg in reversed(conversations.get(conv_id, [])):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            chart_ready = parsed.get("chart_ready")
+            if isinstance(chart_ready, dict) and chart_ready:
+                return chart_ready
+        return {}
     
     async def _run(tc: LLMToolCall):
         args = tc.arguments
@@ -980,6 +998,24 @@ async def _execute_tool_calls(
             args["conv_id"] = conv_id
         if tc.name == "search_uploaded_document" and user_sub and not args.get("user_sub"):
             args["user_sub"] = user_sub
+        if tc.name == "analyze_uploaded_table" and not args.get("conv_id"):
+            args["conv_id"] = conv_id
+        if tc.name == "analyze_uploaded_table" and user_sub and not args.get("user_sub"):
+            args["user_sub"] = user_sub
+        if tc.name == "generate_chart":
+            has_explicit_data = bool(
+                args.get("series")
+                or args.get("x_values")
+                or args.get("y_values")
+                or args.get("labels")
+                or args.get("values")
+            )
+            if not has_explicit_data:
+                chart_ready = _latest_chart_ready()
+                if chart_ready:
+                    for key in ("chart_type", "title", "x_values", "y_values", "labels", "values", "series", "x_label", "y_label"):
+                        if key not in args and key in chart_ready:
+                            args[key] = chart_ready.get(key)
         if tc.name == "query_hierarchy":
             has_parent_id = bool(args.get("parent_id"))
             parent_type = str(args.get("parent_type", "") or "").strip().lower()
