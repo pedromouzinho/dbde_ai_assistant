@@ -1227,6 +1227,14 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                     else:
                         yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
 
+            if need_final_response:
+                # Guard rail: se o loop terminar sem resposta final, devolve texto útil
+                # em vez de encerrar o stream sem token (evita "(sem resposta)" no UI).
+                fallback_text = "⚠️ O modelo não conseguiu gerar resposta. Tenta novamente ou muda para o modo Fast."
+                yield _sse({"type": "token", "text": fallback_text})
+                conversations[conv_id].append({"role": "assistant", "content": fallback_text})
+                should_persist = True
+
         except Exception as e:
             yield _sse({"type": "error", "text": str(e)})
 

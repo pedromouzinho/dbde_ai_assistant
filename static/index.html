@@ -1728,7 +1728,7 @@ function App() {
                                             streamCompleted = true;
                                             break;
                                         case "error":
-                                            throw new Error(evt.message || "Erro de streaming");
+                                            throw new Error(evt.text || evt.message || "Erro de streaming");
                                     }
                                 } catch (parseErr) {
                                     if (parseErr.message.includes("Erro de streaming")) throw parseErr;
@@ -1758,7 +1758,7 @@ function App() {
                                     ...u[activeIdx],
                                     id: convId,
                                     messages: [...u[activeIdx].messages, {
-                                        role: "assistant", content: fullText || "(sem resposta)",
+                                        role: "assistant", content: fullText || "⚠️ O modelo não conseguiu gerar resposta. Tenta novamente ou muda para o modo Fast.",
                                         tools_used: toolsUsed.length > 0 ? [...new Set(toolsUsed)] : undefined,
                                         tool_details: toolDetails.length > 0 ? toolDetails : undefined,
                                         tool_results: toolResults.length > 0 ? toolResults : undefined,
@@ -1775,7 +1775,12 @@ function App() {
                     }
                 } catch (streamErr) {
                     console.warn("Stream error, falling back:", streamErr);
-                    useStreaming = false;
+                    if (fullText) {
+                        fullText += "\n\n⚠️ A resposta pode estar incompleta devido a um erro de comunicação.";
+                        streamCompleted = true;
+                    } else {
+                        useStreaming = false;
+                    }
                 }
             }
 
