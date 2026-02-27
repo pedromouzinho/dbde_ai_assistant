@@ -276,6 +276,10 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
             col_analysis = json.loads(row.get("ColAnalysisJson", "[]") or "[]")
         except Exception:
             col_analysis = []
+        try:
+            full_col_stats = json.loads(row.get("FullColStatsJson", "[]") or "[]")
+        except Exception:
+            full_col_stats = []
         files.append(
             {
                 "filename": row.get("Filename", ""),
@@ -283,6 +287,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
                 "row_count": int(row.get("RowCount", 0) or 0),
                 "col_names": col_names if isinstance(col_names, list) else [],
                 "col_analysis": col_analysis if isinstance(col_analysis, list) else [],
+                "full_col_stats": full_col_stats if isinstance(full_col_stats, list) else [],
                 "truncated": bool(row.get("Truncated", False)),
                 "uploaded_at": row.get("UploadedAt", ""),
                 "has_chunks": str(row.get("HasChunks", "")).lower() in ("true", "1"),
@@ -400,6 +405,10 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
         ctx_parts = [
             f"FICHEIROS CARREGADOS: {len(use_files)} (máximo analisado por pedido: {MAX_FILES_CONTEXT})",
             "Analisa TODOS os ficheiros listados antes de responder. Não ignores nenhum.",
+            "Quando existir secção 'ESTATÍSTICAS COMPLETAS', usa SEMPRE esses valores para min/max/mean/std; "
+            "não recalcules a partir da amostra truncada.",
+            "Para pedidos de gráfico sobre ficheiros carregados, usa generate_chart com os dados fornecidos; "
+            "se faltar coluna/agregação, pede clarificação objetiva ao utilizador.",
         ]
 
         total_budget = 90000
@@ -427,9 +436,33 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
             if file_data.get("truncated"):
                 block.append("NOTA: Conteúdo truncado para contexto.")
 
+            full_stats = file_data.get("full_col_stats")
             col_analysis = file_data.get("col_analysis")
-            if col_analysis:
-                block.append("ANÁLISE DE COLUNAS:")
+            if isinstance(full_stats, list) and full_stats:
+                block.append("ESTATÍSTICAS COMPLETAS (calculadas sobre TODAS as linhas):")
+                for fs in full_stats[:20]:
+                    name = str(fs.get("name", "") or "")
+                    if fs.get("type") == "numeric":
+                        block.append(
+                            f"- {name} (numeric): min={fs.get('min')}, max={fs.get('max')}, "
+                            f"mean={fs.get('mean')}, std={fs.get('std')}, "
+                            f"P25={fs.get('p25')}, P50={fs.get('p50')}, P75={fs.get('p75')}, "
+                            f"non_null={fs.get('non_null')}, zeros={fs.get('zeros')}"
+                        )
+                    else:
+                        first_last = ""
+                        if fs.get("first") and fs.get("last"):
+                            first_last = f", range=[{fs.get('first')} ... {fs.get('last')}]"
+                        block.append(
+                            f"- {name} (text): unique≈{fs.get('unique_approx', '?')}, "
+                            f"sample={fs.get('sample', [])}{first_last}"
+                        )
+                block.append(
+                    "NOTA: Os dados acima representam o ficheiro COMPLETO. "
+                    "O conteúdo abaixo é uma AMOSTRA truncada — usa as estatísticas acima para valores exatos."
+                )
+            elif col_analysis:
+                block.append("ANÁLISE DE COLUNAS (amostra):")
                 for ca in col_analysis[:20]:
                     sample = ", ".join((ca.get("sample") or [])[:3])
                     block.append(f"- {ca.get('name','')} ({ca.get('type','text')}): {sample}")

@@ -1577,9 +1577,12 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     data_text, row_count, col_names, truncated = "", 0, [], False
     semantic_chunks = None
     col_analysis = []
+    full_col_stats = []
     image_base64 = None
     image_content_type = None
     detected_delimiter = ","
+    excel_rows = []
+    csv_text = ""
     filename_lower = filename.lower()
     is_pptx_mime = content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     is_image_mime = (content_type or "").startswith("image/")
@@ -1590,6 +1593,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         rows = list(wb.active.iter_rows(values_only=True))
         if not rows:
             raise HTTPException(400, "Excel vazio")
+        excel_rows = rows
         col_names = [str(c) if c else f"Col{i}" for i, c in enumerate(rows[0])]
         row_count = len(rows) - 1
         data_text = "\t".join(col_names) + "\n" + "\n".join(
@@ -1599,6 +1603,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         wb.close()
     elif filename_lower.endswith(".csv"):
         text = content.decode("utf-8", errors="replace")
+        csv_text = text
         lines = [ln for ln in text.strip().split("\n") if ln.strip()]
         if not lines:
             raise HTTPException(400, "CSV vazio")
@@ -1683,6 +1688,96 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     if not image_base64 and len(full_text) > 50000:
         semantic_chunks = await _build_semantic_chunks(full_text)
 
+    if filename_lower.endswith((".xlsx", ".xls", ".csv")) and row_count > 0 and col_names:
+        try:
+            max_stats_rows = 500000
+            columns_data = [[] for _ in col_names]
+
+            if filename_lower.endswith(".csv"):
+                import csv as csv_mod
+                from io import StringIO
+
+                reader = csv_mod.reader(StringIO(csv_text), delimiter=detected_delimiter)
+                _ = next(reader, None)
+                for row_index, row_vals in enumerate(reader):
+                    if row_index >= max_stats_rows:
+                        break
+                    for ci, val in enumerate(row_vals):
+                        if ci < len(columns_data):
+                            columns_data[ci].append(str(val).strip().strip('"'))
+            else:
+                for row_vals in excel_rows[1 : 1 + max_stats_rows]:
+                    for ci, val in enumerate(row_vals):
+                        if ci < len(columns_data):
+                            columns_data[ci].append("" if val is None else str(val))
+
+            def _parse_number(raw_val: str) -> Optional[float]:
+                txt = str(raw_val or "").strip()
+                if not txt:
+                    return None
+                txt = txt.replace("\u00A0", "").replace(" ", "")
+                if "," in txt and "." in txt:
+                    if txt.rfind(",") > txt.rfind("."):
+                        txt = txt.replace(".", "").replace(",", ".")
+                    else:
+                        txt = txt.replace(",", "")
+                else:
+                    txt = txt.replace(",", ".")
+                try:
+                    return float(txt)
+                except Exception:
+                    return None
+
+            for ci, cname in enumerate(col_names):
+                vals = columns_data[ci] if ci < len(columns_data) else []
+                non_empty = [v for v in vals if str(v).strip()]
+                stat = {"name": cname, "count": len(vals)}
+                numeric_vals = []
+                for v in non_empty:
+                    parsed = _parse_number(v)
+                    if parsed is not None:
+                        numeric_vals.append(parsed)
+
+                if non_empty and len(numeric_vals) > len(non_empty) * 0.5:
+                    numeric_sorted = sorted(numeric_vals)
+                    n = len(numeric_sorted)
+                    mean_raw = sum(numeric_sorted) / n
+                    variance = sum((x - mean_raw) ** 2 for x in numeric_sorted) / n
+
+                    def _p(pct: float) -> float:
+                        idx = min(n - 1, max(0, int((n - 1) * pct)))
+                        return numeric_sorted[idx]
+
+                    sample_vals = []
+                    if non_empty:
+                        sample_indexes = [0, len(non_empty) // 4, len(non_empty) // 2, (3 * len(non_empty)) // 4, len(non_empty) - 1]
+                        sample_vals = [non_empty[idx] for idx in sample_indexes if 0 <= idx < len(non_empty)]
+
+                    stat["type"] = "numeric"
+                    stat["min"] = round(numeric_sorted[0], 4)
+                    stat["max"] = round(numeric_sorted[-1], 4)
+                    stat["mean"] = round(mean_raw, 4)
+                    stat["std"] = round(variance ** 0.5, 4)
+                    stat["non_null"] = n
+                    stat["zeros"] = sum(1 for x in numeric_sorted if x == 0)
+                    stat["p25"] = round(_p(0.25), 4)
+                    stat["p50"] = round(_p(0.50), 4)
+                    stat["p75"] = round(_p(0.75), 4)
+                    stat["sample"] = sample_vals[:5]
+                else:
+                    stat["type"] = "text"
+                    unique = set(non_empty[:10000])
+                    stat["unique_approx"] = len(unique)
+                    stat["sample"] = non_empty[:5]
+                    if non_empty:
+                        stat["first"] = non_empty[0]
+                        stat["last"] = non_empty[-1]
+
+                full_col_stats.append(stat)
+        except Exception as e:
+            logger.warning("[App] full_col_stats computation failed: %s", e)
+            full_col_stats = []
+
     if len(data_text) > 100000:
         data_text = data_text[:100000]
         truncated = True
@@ -1722,6 +1817,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
                 }
             )
         store_entry["col_analysis"] = col_analysis
+    store_entry["full_col_stats"] = full_col_stats
 
     response_payload = {
         "filename": filename,
@@ -1730,6 +1826,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "truncated": truncated,
         "preview": "\n".join(data_text.split("\n")[:6]),
         "col_analysis": col_analysis if col_analysis else None,
+        "full_col_stats": full_col_stats if full_col_stats else None,
     }
     return store_entry, response_payload
 
@@ -1814,6 +1911,7 @@ async def _process_upload_job(job: dict) -> None:
 
     col_names = store_entry.get("col_names", [])
     col_analysis = store_entry.get("col_analysis", [])
+    full_col_stats = store_entry.get("full_col_stats", [])
     upload_index_entity = {
         "PartitionKey": conv_id,
         "RowKey": str(job.get("job_id", "")),
@@ -1825,6 +1923,7 @@ async def _process_upload_job(job: dict) -> None:
         "RowCount": int(store_entry.get("row_count", 0) or 0),
         "ColNamesJson": json.dumps(col_names if isinstance(col_names, list) else [], ensure_ascii=False)[:32000],
         "ColAnalysisJson": json.dumps(col_analysis if isinstance(col_analysis, list) else [], ensure_ascii=False)[:32000],
+        "FullColStatsJson": json.dumps(full_col_stats if isinstance(full_col_stats, list) else [], ensure_ascii=False)[:64000],
         "PreviewText": text_payload[:16000],
         "Truncated": bool(store_entry.get("truncated", False)),
         "HasChunks": bool(chunks_blob_ref),
