@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from config import WEB_SEARCH_ENABLED
 from tools_devops import (
     get_devops_debug_log,
+    US_PREFERRED_VOCAB,
     _devops_headers,
     _devops_url,
     tool_query_workitems,
@@ -193,6 +194,25 @@ _SEARCH_FIGMA_PROXY_DEFINITION = {
     },
 }
 
+_ANALYZE_FIGMA_FLOW_PROXY_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "analyze_figma_flow",
+        "description": "Analisa um fluxo Figma e decompõe em steps ordenados para geração de User Stories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_key": {"type": "string", "description": "Figma file key."},
+                "node_ids": {"type": "string", "description": "IDs de frames em CSV ou lista JSON serializada."},
+                "start_node_id": {"type": "string", "description": "Node inicial opcional para seguir fluxo de protótipo."},
+                "include_branches": {"type": "boolean", "description": "Incluir branches de erro/fallback/cancel."},
+                "max_steps": {"type": "integer", "description": "Máximo de steps a processar."},
+            },
+            "required": ["file_key"],
+        },
+    },
+}
+
 _SEARCH_MIRO_PROXY_DEFINITION = {
     "type": "function",
     "function": {
@@ -223,6 +243,22 @@ async def _search_figma_proxy(arguments):
         return {"error": "Integração Figma indisponível neste runtime"}
 
 
+async def _analyze_figma_flow_proxy(arguments):
+    try:
+        from tools_figma import tool_analyze_figma_flow
+
+        return await tool_analyze_figma_flow(
+            file_key=(arguments or {}).get("file_key", ""),
+            node_ids=(arguments or {}).get("node_ids", ""),
+            start_node_id=(arguments or {}).get("start_node_id", ""),
+            include_branches=(arguments or {}).get("include_branches", True),
+            max_steps=(arguments or {}).get("max_steps", 15),
+        )
+    except Exception as e:
+        logging.error("[Tools] analyze_figma_flow proxy failed: %s", e, exc_info=True)
+        return {"error": "Integração Figma indisponível neste runtime"}
+
+
 async def _search_miro_proxy(arguments):
     try:
         from tools_miro import tool_search_miro
@@ -245,6 +281,13 @@ def _ensure_optional_tool_proxies() -> None:
             definition=_SEARCH_FIGMA_PROXY_DEFINITION,
         )
         logging.warning("[Tools] search_figma registada via proxy fallback")
+    if not has_tool("analyze_figma_flow"):
+        register_tool(
+            "analyze_figma_flow",
+            lambda args: _analyze_figma_flow_proxy(args),
+            definition=_ANALYZE_FIGMA_FLOW_PROXY_DEFINITION,
+        )
+        logging.warning("[Tools] analyze_figma_flow registada via proxy fallback")
 
     if not has_tool("search_miro"):
         register_tool(
@@ -531,31 +574,33 @@ EXEMPLOS DE WIQL:
 - Para "quem criou mais", query SEM filtro de criador, top=500, conta por created_by"""
 
 def get_userstory_system_prompt():
+    figma_flow_instruction = ""
+    if has_tool("analyze_figma_flow"):
+        figma_flow_instruction = (
+            "- Se o utilizador fornecer um fluxo Figma com múltiplos ecrãs/frames, usa analyze_figma_flow "
+            "para decompor em steps antes de gerar US.\n"
+        )
     return f"""Tu és PO Sénior especialista no MSE (Millennium Site Empresas).
 Objetivo: transformar pedidos em User Stories rigorosas, refinadas iterativamente.
 DATA: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
 MODO OBRIGATÓRIO: DRAFT → REVIEW → FINAL
 1) DRAFT: gera primeiro uma versão inicial (clara e completa) com base no pedido.
-   - Usa SEMPRE a ferramenta generate_user_stories para gerar o draft.
-   - Apresenta o resultado formatado ao utilizador.
 2) REVIEW: apresenta o draft e pede feedback objetivo (ex: "O que queres ajustar?").
-   - NÃO avances para FINAL sem feedback explícito.
 3) FINAL: só após feedback explícito do utilizador, produz a versão final consolidada.
-   - Aplica TODAS as correcções pedidas.
-   - Mantém rastreabilidade: diz o que foi alterado (breve) antes da versão final.
 
 REGRA DE REFINAMENTO (CRÍTICA):
 - Se o utilizador der feedback, NÃO ignores.
 - Reaplica generate_user_stories com o novo contexto e mostra uma versão revista.
-- Se o utilizador pedir alteração a US EXISTENTE (por ID), usa refine_workitem.
+- Mantém rastreabilidade: diz o que foi alterado (breve) antes da versão final.
 
 FERRAMENTA OBRIGATÓRIA:
 - Usa SEMPRE generate_user_stories para gerar/refinar USs.
-- Quando o utilizador pedir "como o [autor] escreve", passa reference_author.
-- Se o utilizador referir uma US existente por ID, usa refine_workitem.
+- Quando o utilizador pedir "como o [autor] escreve", passa reference_author para aproveitar WriterProfiles.
+- Se o utilizador referir uma US existente por ID e pedir alteração, usa refine_workitem para criar o draft de revisão antes do final.
+{figma_flow_instruction}
 
-PARSING DE INPUT (PRIORIDADE — NÃO ALTERAR ESTA SECÇÃO):
+PARSING DE INPUT (PRIORIDADE):
 - Texto: extrair objetivo, regras e restrições.
 - Imagens/mockups: identificar CTAs, inputs, labels, estados (enabled/disabled), validações, mensagens de erro, modais, toasts.
 - Ficheiros: extrair requisitos e dados relevantes.
@@ -566,17 +611,30 @@ REGRA DE VISUAL PARSING:
 - Se forem fornecidas 2 imagens no mesmo pedido, assume: Imagem 1 = ANTES e Imagem 2 = DEPOIS; gera ACs específicos por cada diferença visual detectada.
 - Se houver ambiguidades visuais, pergunta antes de fechar a versão final.
 
-FORMATO OBRIGATÓRIO:
-Título: MSE | [Área] | [Sub-área] | [Funcionalidade] | [Detalhe Específico]
-Descrição: <div>Eu como <b>[Persona]</b> quero <b>[ação]</b> para que <b>[benefício]</b>.</div>
-AC secções: Objetivo/Âmbito, Composição Visual/Layout, Comportamento/Regras de Negócio, Mockup/Referência Visual
+ESTRUTURA OBRIGATÓRIA:
+Título: MSE | [Domínio] | [Jornada/Subárea] | [Fluxo/Step] | [Detalhe da Alteração]
+- 4 a 6 segmentos separados por " | "
+- Se o domínio não for inferível, usar "Transversal"
+Descrição: <div>Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para <b>[benefício de negócio/utilizador]</b>.</div>
+AC (ordem obrigatória):
+- <b>Proveniência</b> + <ul><li>...</li></ul>
+- <b>Condições</b> + <ul><li>...</li></ul>
+- <b>Composição</b> + <ul><li>...</li></ul>
+- <b>Comportamento</b> + <ul><li>...</li></ul>
+- <b>Mockup</b> + <ul><li>Mockup a confirmar com UX.</li></ul>
 
 QUALIDADE:
-- HTML limpo APENAS (<b>, <ul>, <li>, <br>, <div>), NUNCA HTML sujo (<font>, <span style>, &nbsp;).
+- HTML limpo apenas (<b>, <ul>, <li>, <br>, <div>), sem HTML sujo nem HTML escapado.
 - PT-PT, auto-contida, testável, granular, sem contradições.
-- Vocabulário MSE: CTA, Enable/Disable, Input, Dropdown/Select box, Stepper, Toast, Modal, FEE, Header.
 - Se faltar contexto essencial, faz perguntas curtas antes da versão final.
-- Cada AC deve ser verificável por QA com YES/NO.
+- Não usar Given/When/Then (não é padrão MSE).
+- Não inventar endpoints, APIs, serviços de backoffice ou arquitetura técnica sem evidência explícita no pedido.
+- Quando faltar contexto de negócio, acrescentar secção <b>Assunções</b> no fim dos AC.
+- Prioridade template > WriterProfile: usar perfil histórico apenas para vocabulário/nível de detalhe, nunca para estrutura de secções.
+- Política de detalhe: por defeito seguir template canónico; se o utilizador pedir formato explícito, seguir o formato pedido.
+
+VOCABULÁRIO PREFERENCIAL:
+{", ".join(US_PREFERRED_VOCAB)}
 
 ÁREAS:
 RevampFEE MVP2, MDSE, ACEDigital, MSE"""

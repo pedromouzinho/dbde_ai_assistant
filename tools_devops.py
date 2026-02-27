@@ -46,6 +46,30 @@ _WIQL_BLOCKLIST_RE = re.compile(
 )
 
 _WORKITEM_TYPE_MAP = {str(t).strip().lower(): str(t).strip() for t in DEVOPS_WORKITEM_TYPES}
+US_TEMPLATE_VERSION = "mse-revamp-classic-v1"
+US_REQUIRED_SECTIONS = ["Proveniência", "Condições", "Composição", "Comportamento", "Mockup"]
+US_PREFERRED_VOCAB = [
+    "CTA",
+    "Label",
+    "Card",
+    "Stepper",
+    "Modal",
+    "Toast",
+    "Dropdown",
+    "Input",
+    "Toggle",
+    "Header",
+    "Tab",
+    "Breadcrumb",
+    "Sidebar",
+]
+US_SECTION_SLUGS = {
+    "Proveniência": "proveniencia",
+    "Condições": "condicoes",
+    "Composição": "composicao",
+    "Comportamento": "comportamento",
+    "Mockup": "mockup",
+}
 
 def _devops_headers():
     return {"Authorization": f"Basic {base64.b64encode(f':{DEVOPS_PAT}'.encode()).decode()}", "Content-Type": "application/json"}
@@ -143,33 +167,47 @@ def _clean_html_for_example(html_text: str) -> str:
 
 
 def _validate_us_output(raw_output: str) -> dict:
-    """Valida e pontua o output de geração de US contra o formato MSE."""
+    """Valida output de US segundo template canónico MSE."""
     issues = []
     score = 1.0
     cleaned = str(raw_output or "")
 
-    titles = re.findall(r"\*\*Título\*\*:\s*(.+)", cleaned)
-    if not titles:
-        titles = re.findall(r"Título:\s*(.+)", cleaned)
-    for title in titles:
-        title_txt = str(title or "").strip()
-        if not title_txt.startswith("MSE"):
-            issues.append(f"Título não começa com 'MSE': {title_txt[:60]}")
-            score -= 0.15
-        pipe_count = title_txt.count("|")
-        if pipe_count < 3:
-            issues.append(f"Título com poucos separadores ({pipe_count}): {title_txt[:60]}")
-            score -= 0.1
+    stories = _split_generated_stories(cleaned)
+    if not stories:
+        stories = [cleaned]
+
+    has_any_title = False
+    for story in stories:
+        title, ac_html = _extract_story_title_and_ac(story)
+        if title:
+            has_any_title = True
+        flags = _collect_quality_flags(title, ac_html)
+        for flag in flags:
+            if flag == "missing_mse_prefix":
+                issues.append("Título sem prefixo 'MSE |'")
+                score -= 0.15
+            elif flag == "title_segment_count_invalid":
+                issues.append("Título fora de 4-6 segmentos")
+                score -= 0.1
+            elif flag.startswith("missing_section_"):
+                section_slug = flag.replace("missing_section_", "")
+                issues.append(f"Secção em falta: {section_slug}")
+                score -= 0.08
+            elif flag.startswith("section_out_of_order_"):
+                section_slug = flag.replace("section_out_of_order_", "")
+                issues.append(f"Secção fora de ordem: {section_slug}")
+                score -= 0.05
+            elif flag == "html_escaped":
+                issues.append("HTML escapado detectado (&lt; / &gt;)")
+                score -= 0.1
+
+    if not has_any_title:
+        issues.append("Sem título detectado")
+        score -= 0.15
 
     if "Eu como <b>" not in cleaned and "Eu como" not in cleaned:
         issues.append("Descrição não segue formato 'Eu como <b>[Persona]</b>'")
-        score -= 0.15
-
-    required_sections = ["Objetivo", "Âmbito", "Composição", "Layout", "Comportamento", "Regras"]
-    found_sections = sum(1 for section in required_sections if section.lower() in cleaned.lower())
-    if found_sections < 3:
-        issues.append(f"ACs com poucas secções obrigatórias ({found_sections}/{len(required_sections)})")
-        score -= 0.2
+        score -= 0.1
 
     dirty_tags = re.findall(
         r"<(?:font|span\s+style|table|td|tr|th|p\s+style|h[1-6]\s+style)[^>]*>",
@@ -177,19 +215,12 @@ def _validate_us_output(raw_output: str) -> dict:
     )
     if dirty_tags:
         issues.append(f"HTML sujo detectado: {dirty_tags[:3]}")
-        score -= 0.2
+        score -= 0.15
         cleaned = re.sub(r"</?(?:font|span|table|tr|td|th|p)(?:\s[^>]*)?>", "", cleaned)
         cleaned = re.sub(r'\s*style="[^"]*"', "", cleaned)
         cleaned = cleaned.replace("&nbsp;", " ")
 
-    en_terms = ["Description", "Acceptance Criteria", "As a ", "I want to", "So that"]
-    en_found = [term for term in en_terms if term in cleaned]
-    if en_found:
-        issues.append(f"Termos em inglês detectados: {en_found}")
-        score -= 0.1
-
-    mse_vocab = ["CTA", "Toast", "Modal", "Enable", "Disable", "Dropdown", "Input", "Stepper", "FEE"]
-    vocab_found = sum(1 for term in mse_vocab if term.lower() in cleaned.lower())
+    vocab_found = sum(1 for term in US_PREFERRED_VOCAB if term.lower() in cleaned.lower())
 
     return {
         "valid": len(issues) == 0,
@@ -198,6 +229,216 @@ def _validate_us_output(raw_output: str) -> dict:
         "cleaned_output": cleaned,
         "vocab_mse_count": vocab_found,
     }
+
+
+def _normalize_text_ascii(value: str) -> str:
+    txt = unicodedata.normalize("NFKD", str(value or ""))
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    return txt.lower()
+
+
+def _unescape_html_if_needed(text):
+    raw = str(text or "")
+    if ("&lt;" not in raw and "&gt;" not in raw and "&amp;" not in raw and "&quot;" not in raw):
+        return raw
+    return (
+        raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+    )
+
+
+def _split_generated_stories(text: str):
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    def _split_by_starts(starts):
+        parts = []
+        for idx, start in enumerate(starts):
+            end = starts[idx + 1] if idx + 1 < len(starts) else len(raw)
+            chunk = raw[start:end].strip()
+            if chunk:
+                parts.append(chunk)
+        return parts
+
+    marker_patterns = [
+        r"(?im)^(?:###|##)\s*User Story\s+\d+.*$",
+        r"(?im)^\s*(?:T[ií]tulo|Title)\s*:\s*MSE\s*\|",
+    ]
+    for pattern in marker_patterns:
+        starts = [m.start() for m in re.finditer(pattern, raw)]
+        if len(starts) >= 2:
+            return _split_by_starts(starts)
+
+    parts = [p.strip() for p in re.split(r"(?m)^\s*(?:---+|===+)\s*$", raw) if p.strip()]
+    if len(parts) >= 2:
+        return parts
+
+    return [raw]
+
+
+def _extract_story_title_and_ac(story_text: str):
+    txt = str(story_text or "")
+    title = ""
+
+    title_match = re.search(r"(?im)^\s*(?:T[ií]tulo|Title)\s*:\s*(.+)$", txt)
+    if title_match:
+        title = title_match.group(1).strip()
+    else:
+        inline_title = re.search(r"(?im)\bMSE\s*\|[^\n\r]+", txt)
+        if inline_title:
+            title = inline_title.group(0).strip()
+
+    ac_html = txt
+    ac_match = re.search(
+        r"(?is)(?:Crit[eé]rios?\s+de\s+Aceita[cç][aã]o|AC)\s*:?\s*(.+)$",
+        txt,
+    )
+    if ac_match:
+        ac_html = ac_match.group(1).strip()
+
+    return title, ac_html
+
+
+def _check_required_sections(ac_html):
+    text = str(ac_html or "")
+    normalized_text = _normalize_text_ascii(text)
+    if not normalized_text:
+        return {"missing": list(US_REQUIRED_SECTIONS), "out_of_order": []}
+
+    positions = {}
+    missing = []
+    for section in US_REQUIRED_SECTIONS:
+        target = _normalize_text_ascii(section)
+        bold_match = re.search(rf"<b>\s*{re.escape(target)}\s*</b>", normalized_text, flags=re.IGNORECASE)
+        plain_pos = normalized_text.find(target)
+        pos = bold_match.start() if bold_match else plain_pos
+        if pos < 0:
+            missing.append(section)
+        else:
+            positions[section] = pos
+
+    out_of_order = []
+    last_pos = -1
+    for section in US_REQUIRED_SECTIONS:
+        if section in missing:
+            continue
+        pos = positions.get(section, -1)
+        if pos < last_pos:
+            out_of_order.append(section)
+        else:
+            last_pos = pos
+
+    return {"missing": missing, "out_of_order": out_of_order}
+
+
+def _collect_quality_flags(title, ac_html):
+    title_txt = str(title or "").strip()
+    ac_txt = str(ac_html or "")
+    flags = []
+
+    if not title_txt.startswith("MSE |"):
+        flags.append("missing_mse_prefix")
+
+    segments = [seg.strip() for seg in title_txt.split(" | ") if seg.strip()]
+    if not (4 <= len(segments) <= 6):
+        flags.append("title_segment_count_invalid")
+
+    section_result = _check_required_sections(ac_txt)
+    for section in section_result.get("missing", []):
+        slug = US_SECTION_SLUGS.get(section, _normalize_text_ascii(section).replace(" ", "_"))
+        flags.append(f"missing_section_{slug}")
+    for section in section_result.get("out_of_order", []):
+        slug = US_SECTION_SLUGS.get(section, _normalize_text_ascii(section).replace(" ", "_"))
+        flags.append(f"section_out_of_order_{slug}")
+
+    combined = f"{title_txt}\n{ac_txt}"
+    if "&lt;" in combined or "&gt;" in combined:
+        flags.append("html_escaped")
+
+    return flags
+
+
+def _extract_user_template_request(context, topic):
+    keyword_patterns = [
+        "template",
+        "formato",
+        "estrutura",
+        "segue este padrao",
+        "usa este modelo",
+        "use this format",
+        "follow this structure",
+    ]
+    sources = [str(context or "").strip(), str(topic or "").strip()]
+
+    for source in sources:
+        if not source:
+            continue
+        normalized_source = _normalize_text_ascii(source)
+        has_keyword = any(k in normalized_source for k in keyword_patterns)
+        lines = [line.rstrip() for line in source.splitlines()]
+        structured_lines = [
+            line for line in lines
+            if line.strip() and (
+                ":" in line
+                or line.strip().startswith("#")
+                or line.strip().startswith("- ")
+                or line.strip().startswith("* ")
+                or "**" in line
+            )
+        ]
+        if has_keyword and len(structured_lines) >= 3:
+            return "\n".join(line.strip() for line in lines if line.strip())[:4000]
+
+    merged = "\n".join(part for part in sources if part).strip()
+    if not merged:
+        return None
+    normalized_merged = _normalize_text_ascii(merged)
+    has_keyword = any(k in normalized_merged for k in keyword_patterns)
+    lines = [line.rstrip() for line in merged.splitlines()]
+    structured_lines = [
+        line for line in lines
+        if line.strip() and (
+            ":" in line
+            or line.strip().startswith("#")
+            or line.strip().startswith("- ")
+            or line.strip().startswith("* ")
+            or "**" in line
+        )
+    ]
+    if has_keyword and len(structured_lines) >= 3:
+        return "\n".join(line.strip() for line in lines if line.strip())[:4000]
+    return None
+
+
+def _resolve_detail_policy(context, topic):
+    user_template = _extract_user_template_request(context, topic)
+    if user_template:
+        return {"policy": "user_template", "user_template": user_template}
+    return {"policy": "habitual", "user_template": None}
+
+
+def _extract_flow_context_json(context):
+    marker = "FLOW_CONTEXT_JSON:"
+    raw = str(context or "")
+    idx = raw.find(marker)
+    if idx < 0:
+        return None
+    payload = raw[idx + len(marker):].strip()
+    if not payload:
+        return None
+
+    parsed = None
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        parsed = _extract_json_object(payload)
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("steps"), list):
+        return parsed
+    return None
 
 def _extract_json_object(text: str):
     if not isinstance(text, str):
@@ -616,131 +857,189 @@ async def tool_generate_user_stories(topic, context="", num_stories=3, reference
             ex = "(Sem exemplos — usa boas práticas)"
         reference_ids = [s.get("id") for s in raw.get("analysis_data", [])]
 
-    prompt = f"""TAREFA: Gerar {num_stories} User Story(ies) sobre: "{topic}"
+    detail_policy = _resolve_detail_policy(context, topic)
+    policy = detail_policy.get("policy", "habitual")
+    user_template = detail_policy.get("user_template")
+    flow_context = _extract_flow_context_json(context)
+    flow_mode = isinstance(flow_context, dict)
+    flow_steps = flow_context.get("steps", []) if flow_mode else []
+    flow_branches = flow_context.get("branches", []) if flow_mode else []
 
-{'='*60}
-EXEMPLOS REAIS DA EQUIPA (aprende granularidade e estrutura):
-{'='*60}
-{ex}
+    try:
+        requested_num_stories = max(1, int(num_stories))
+    except Exception:
+        requested_num_stories = 1
+    effective_num_stories = requested_num_stories
 
-{style_hint}
+    preferred_vocab = ", ".join(US_PREFERRED_VOCAB)
+    canonical_template = (
+        "TEMPLATE CANÓNICO MSE (default):\n"
+        "Título: MSE | [Domínio] | [Jornada/Subárea] | [Fluxo/Step] | [Detalhe da Alteração]\n"
+        "- 4 a 6 segmentos obrigatórios separados por ' | '\n"
+        "- Se o domínio não for inferível, usar 'Transversal'\n\n"
+        "Descrição:\n"
+        "<div>Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para <b>[benefício de negócio/utilizador]</b>.</div>\n\n"
+        "Critérios de Aceitação (ordem obrigatória):\n"
+        "1) <b>Proveniência</b> + <ul><li>...</li></ul>\n"
+        "2) <b>Condições</b> + <ul><li>...</li></ul>\n"
+        "3) <b>Composição</b> + <ul><li>...</li></ul>\n"
+        "4) <b>Comportamento</b> + <ul><li>...</li></ul>\n"
+        "5) <b>Mockup</b> + <ul><li>Mockup a confirmar com UX.</li></ul>\n"
+    )
+    common_rules = (
+        "REGRAS OBRIGATÓRIAS:\n"
+        "- PT-PT sempre.\n"
+        "- Não usar Given/When/Then.\n"
+        "- Não inventar endpoints, APIs, serviços de backoffice nem arquitetura técnica sem evidência explícita.\n"
+        "- Quando faltar contexto de negócio, adicionar secção <b>Assunções</b> no final dos AC.\n"
+        "- Vocabulário preferencial: " + preferred_vocab + ".\n"
+        "- HTML limpo e não escapado (nunca produzir &lt;, &gt;, &amp; ou &quot;).\n"
+        "- Prioridade da estrutura: template aplicável > WriterProfile histórico.\n"
+    )
 
-{'='*60}
-CONTEXTO ADICIONAL DO PEDIDO:
-{'='*60}
-{context or "Nenhum contexto adicional fornecido."}
+    if policy == "user_template" and user_template:
+        policy_block = (
+            "POLÍTICA DE DETALHE: user_template\n"
+            "Seguir estritamente o formato pedido pelo utilizador abaixo.\n"
+            "Se o template do utilizador não definir secções de AC, usar fallback das 5 secções canónicas.\n"
+            "TEMPLATE DO UTILIZADOR:\n"
+            f"{user_template}\n"
+        )
+    else:
+        policy_block = (
+            "POLÍTICA DE DETALHE: habitual\n"
+            "Usar o template canónico MSE por defeito.\n\n"
+            f"{canonical_template}\n"
+        )
 
-{'='*60}
-INSTRUÇÕES DE OUTPUT:
-{'='*60}
-Para CADA User Story, gera EXACTAMENTE neste formato:
+    flow_context_block = ""
+    flow_story_map = []
+    flow_steps_detected = 0
+    context_clean = str(context or "")
+    if flow_mode:
+        flow_steps_clean = []
+        for raw_step in flow_steps:
+            if not isinstance(raw_step, dict):
+                continue
+            try:
+                step_idx = int(raw_step.get("step_index") or (len(flow_steps_clean) + 1))
+            except Exception:
+                step_idx = len(flow_steps_clean) + 1
+            flow_steps_clean.append(
+                {
+                    "step_index": step_idx,
+                    "node_id": str(raw_step.get("node_id", "") or "").strip(),
+                    "node_name": str(raw_step.get("node_name", "") or "").strip(),
+                    "ui_components": raw_step.get("ui_components", []) if isinstance(raw_step.get("ui_components", []), list) else [],
+                    "inferred_action": str(raw_step.get("inferred_action", "") or "").strip(),
+                }
+            )
 
-### User Story {{N}}
+        flow_branches_clean = []
+        for raw_branch in flow_branches:
+            if not isinstance(raw_branch, dict):
+                continue
+            try:
+                triggered_from = int(raw_branch.get("triggered_from_step") or 0)
+            except Exception:
+                triggered_from = 0
+            flow_branches_clean.append(
+                {
+                    "node_id": str(raw_branch.get("node_id", "") or "").strip(),
+                    "node_name": str(raw_branch.get("node_name", "") or "").strip(),
+                    "branch_type": str(raw_branch.get("branch_type", "other") or "other").strip(),
+                    "triggered_from_step": triggered_from,
+                }
+            )
 
-**Título**: MSE | [Área] | [Sub-área] | [Funcionalidade] | [Detalhe]
+        flow_steps_detected = len(flow_steps_clean)
+        effective_num_stories = max(1, flow_steps_detected + len(flow_branches_clean))
+        flow_story_map = [
+            {"step_index": step.get("step_index", idx + 1), "story_index": idx}
+            for idx, step in enumerate(flow_steps_clean)
+        ]
 
-**Descrição**:
-<div>
-Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para que <b>[benefício]</b>.
-</div>
+        step_lines = []
+        for idx, step in enumerate(flow_steps_clean):
+            prev_label = "Início do fluxo"
+            if idx > 0:
+                prev = flow_steps_clean[idx - 1]
+                prev_label = f"Step {prev.get('step_index', idx)} - {prev.get('node_name', '')}"
+            comps = ", ".join(step.get("ui_components", [])[:8]) or "Sem componentes explícitos"
+            step_lines.append(
+                f"- Step {step.get('step_index')}: node_id={step.get('node_id')}, nome='{step.get('node_name')}', "
+                f"ação='{step.get('inferred_action') or 'n/a'}', componentes=[{comps}], proveniência_base='{prev_label}'"
+            )
 
-**Critérios de Aceitação**:
-<b>Objetivo / Âmbito</b>
-<ul>
-<li>...</li>
-</ul>
+        branch_lines = []
+        for branch in flow_branches_clean:
+            branch_lines.append(
+                f"- Branch node_id={branch.get('node_id')}, nome='{branch.get('node_name')}', "
+                f"tipo={branch.get('branch_type')}, triggered_from_step={branch.get('triggered_from_step') or 'n/a'}"
+            )
 
-<b>Composição Visual / Layout</b>
-<ul>
-<li>...</li>
-</ul>
+        flow_context_block = (
+            "MODO FLOW FIGMA ACTIVO:\n"
+            f"- Gerar exatamente {effective_num_stories} US(s): 1 por step e 1 por branch relevante.\n"
+            "- Para cada US de step: na secção Proveniência referir o step anterior.\n"
+            "- Para cada US (step/branch): na secção Mockup referir node_id Figma.\n"
+            "- Para branches: tratar como US separadas de exceção/fallback.\n"
+            "STEPS DETECTADOS:\n"
+            f"{chr(10).join(step_lines) if step_lines else '- Sem steps válidos'}\n"
+        )
+        if branch_lines:
+            flow_context_block += "BRANCHES DETECTADOS:\n" + "\n".join(branch_lines) + "\n"
 
-<b>Comportamento / Regras de Negócio</b>
-<ul>
-<li>...</li>
-</ul>
+        marker_idx = context_clean.find("FLOW_CONTEXT_JSON:")
+        if marker_idx >= 0:
+            context_clean = context_clean[:marker_idx].strip()
 
-<b>Mockup / Referência Visual</b>
-<ul>
-<li>...</li>
-</ul>
-
-LEMBRA-TE:
-- Segue o padrão exacto dos exemplos acima (granularidade, nível de detalhe, vocabulário)
-- HTML limpo APENAS (<b>, <ul>, <li>, <br>, <div>)
-- PT-PT, testável, auto-contida
-- Vocabulário MSE: CTA, Enable/Disable, Input, Dropdown, Stepper, Toast, Modal, FEE"""
-    sys_msg = """Tu és Product Owner Sénior no Millennium Site Empresas (MSE), especialista em User Stories de alta qualidade.
-
-PAPEL: Geras User Stories que seguem rigorosamente o padrão MSE. A tua qualidade define o standard da equipa.
-
-FORMATO OBRIGATÓRIO DE TÍTULO:
-MSE | [Área] | [Sub-área] | [Funcionalidade] | [Detalhe Específico]
-Exemplo: MSE | Pagamentos | SEPA | Transferência Nacional | Validação IBAN
-
-FORMATO OBRIGATÓRIO DE DESCRIÇÃO (HTML limpo):
-<div>
-Eu como <b>[Persona — ex: Utilizador Empresa, Gestor de Conta, Administrador]</b>,
-quero <b>[ação concreta e específica]</b>,
-para que <b>[benefício claro e mensurável]</b>.
-</div>
-
-FORMATO OBRIGATÓRIO DE ACCEPTANCE CRITERIA (HTML limpo):
-Divididos em secções com <b>bold</b> headers:
-
-<b>Objetivo / Âmbito</b>
-<ul>
-<li>Descrever o que está em scope e o que NÃO está</li>
-<li>Contexto da funcionalidade dentro do MSE</li>
-</ul>
-
-<b>Composição Visual / Layout</b>
-<ul>
-<li>Elementos UI: CTAs, inputs, dropdowns, select boxes, steppers, toggles</li>
-<li>Estados: enable/disable, loading, empty state, error state</li>
-<li>Labels, placeholders, tooltips — textos exactos quando possível</li>
-</ul>
-
-<b>Comportamento / Regras de Negócio</b>
-<ul>
-<li>Validações de campo (formato, obrigatoriedade, limites)</li>
-<li>Lógica condicional (se X então Y)</li>
-<li>Mensagens de erro específicas</li>
-<li>Toasts de sucesso/erro</li>
-<li>Comportamento de modais (abrir, confirmar, cancelar)</li>
-</ul>
-
-<b>Mockup / Referência Visual</b>
-<ul>
-<li>Referência ao mockup se fornecido (ex: "Conforme imagem 1 — ecrã de listagem")</li>
-<li>Se não houver mockup: descrever layout esperado</li>
-</ul>
-
-VOCABULÁRIO MSE OBRIGATÓRIO:
-- CTA (Call To Action), Enable/Disable, Input, Dropdown/Select box
-- Stepper, Toast (sucesso/erro/warning), Modal, Header, Sidebar
-- FEE (Front End Empresas), Backoffice, API, Endpoint
-- Validação inline, Placeholder, Label, Tooltip, Loading spinner
-- Estado: Activo/Inactivo, Visível/Oculto, Editável/Só-leitura
-
-REGRAS ABSOLUTAS:
-1. HTML LIMPO apenas: <b>, <ul>, <li>, <br>, <div>. NUNCA <font>, <span style>, &nbsp; ou qualquer HTML sujo.
-2. PT-PT sempre. Sem anglicismos desnecessários (usar "Utilizador" não "User", mas manter termos técnicos: CTA, Toast, Modal).
-3. Cada AC deve ser TESTÁVEL — um QA deve conseguir validar com YES/NO.
-4. Granularidade: uma US = uma funcionalidade atómica. Se for muito grande, dividir.
-5. Auto-contida: a US deve fazer sentido sem ler outras USs.
-6. Sem contradições internas.
-7. APRENDE a granularidade dos exemplos fornecidos — não inventes nível de detalhe diferente do que a equipa usa."""
-    try: gen = await llm_simple(f"{sys_msg}\n\n{prompt}", tier="standard", max_tokens=8000)
+    prompt = (
+        f"Gerar {effective_num_stories} User Story(s) sobre: \"{topic}\"\n\n"
+        f"{policy_block}\n"
+        f"{common_rules}\n"
+        f"{flow_context_block}\n"
+        f"EXEMPLOS REAIS (few-shot):\n{ex}\n"
+        f"{style_hint}\n"
+        f"CONTEXTO ADICIONAL:\n{context_clean or 'Nenhum.'}\n\n"
+        "OUTPUT:\n"
+        "- Seguir o formato aplicável.\n"
+        "- Entregar conteúdo pronto para uso em DevOps.\n"
+        "- Não incluir explicações meta nem markdown extra fora do conteúdo da(s) US(s).\n"
+    )
+    sys_msg = (
+        "És PO Sénior MSE. Segue estritamente o template aplicável e evita invenções técnicas. "
+        "Prioriza consistência com backlog Revamp e exemplos reais. "
+        "HTML limpo e não escapado."
+    )
+    try:
+        gen = await llm_simple(f"{sys_msg}\n\n{prompt}", tier="standard", max_tokens=8000)
     except Exception as e:
         logging.error("[Tools] tool_generate_user_stories failed: %s", e)
         gen = f"Erro: {e}"
-    validation = _validate_us_output(gen)
-    if validation.get("cleaned_output") and validation["cleaned_output"] != gen:
+
+    gen_clean = _unescape_html_if_needed(gen)
+    validation = _validate_us_output(gen_clean)
+    if validation.get("cleaned_output") and validation["cleaned_output"] != gen_clean:
         logging.info("[Tools] US output auto-cleaned: %d issues", len(validation.get("issues", [])))
-        gen = validation["cleaned_output"]
-    return {
-        "generated_user_stories": gen,
+        gen_clean = validation["cleaned_output"]
+
+    quality_flags = []
+    if isinstance(gen_clean, str) and not gen_clean.startswith("Erro:"):
+        stories = _split_generated_stories(gen_clean)
+        if not stories:
+            stories = [gen_clean]
+        if effective_num_stories > 1:
+            for idx, story in enumerate(stories, 1):
+                title, ac_html = _extract_story_title_and_ac(story)
+                story_flags = _collect_quality_flags(title, ac_html)
+                quality_flags.extend([f"story_{idx}_{flag}" for flag in story_flags])
+        else:
+            title, ac_html = _extract_story_title_and_ac(stories[0])
+            quality_flags = _collect_quality_flags(title, ac_html)
+
+    result = {
+        "generated_user_stories": gen_clean,
         "based_on_examples": raw.get("samples_returned", 0) if raw else 0,
         "reference_ids": reference_ids,
         "used_writer_profile": bool(style_profile),
@@ -748,7 +1047,15 @@ REGRAS ABSOLUTAS:
         "num_requested": num_stories,
         "quality_score": validation.get("score", 0.0),
         "quality_issues": validation.get("issues", []),
+        "template_version": US_TEMPLATE_VERSION,
+        "quality_flags": quality_flags,
+        "detail_policy_applied": policy,
+        "flow_mode": flow_mode,
+        "flow_steps_detected": flow_steps_detected,
     }
+    if flow_mode:
+        result["flow_story_map"] = flow_story_map
+    return result
 
 async def tool_query_hierarchy(
     parent_id=None,
@@ -1120,6 +1427,11 @@ Objetivo:
 - Aplicar apenas as mudanças pedidas.
 - PT-PT.
 - HTML limpo (div, b, ul, li, br).
+- Estrutura oficial de AC: Proveniência, Condições, Composição, Comportamento, Mockup.
+- Preservar a estrutura original e alterar apenas secções impactadas.
+- Se a US original não seguir o template oficial, NÃO reformatar; aplicar apenas o refinamento pedido.
+- NÃO forçar prefixo "MSE |" no título durante refino; manter título original salvo pedido explícito para mudar.
+- Em change_summary, indicar as secções alteradas.
 
 Responde APENAS em JSON válido neste formato:
 {{
@@ -1149,8 +1461,8 @@ Responde APENAS em JSON válido neste formato:
 
     refined = {
         "title": str(parsed.get("title", "")).strip() or original["title"],
-        "description_html": str(parsed.get("description_html", "")).strip(),
-        "acceptance_criteria_html": str(parsed.get("acceptance_criteria_html", "")).strip(),
+        "description_html": _unescape_html_if_needed(str(parsed.get("description_html", "")).strip()),
+        "acceptance_criteria_html": _unescape_html_if_needed(str(parsed.get("acceptance_criteria_html", "")).strip()),
         "change_summary": str(parsed.get("change_summary", "")).strip(),
     }
 
