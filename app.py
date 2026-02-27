@@ -251,17 +251,150 @@ async def _load_conversation_messages_for_export(conv_id: str, user: Optional[di
     return parsed if isinstance(parsed, list) else []
 
 
+def _normalize_export_blob_refs(export_request: ExportRequest) -> List[str]:
+    refs: List[str] = []
+    seen = set()
+
+    def _append(raw: Any) -> None:
+        ref = str(raw or "").strip()
+        if not ref or ref in seen:
+            return
+        refs.append(ref)
+        seen.add(ref)
+
+    blob_refs = getattr(export_request, "result_blob_refs", None) or []
+    for ref in blob_refs:
+        _append(ref)
+    _append(getattr(export_request, "result_blob_ref", None))
+    return refs
+
+
+async def _load_export_payload_from_blob_ref(blob_ref: str) -> Optional[dict]:
+    ref = str(blob_ref or "").strip()
+    if not ref:
+        return None
+    container, blob_name = parse_blob_ref(ref)
+    if not container or not blob_name:
+        return None
+    try:
+        payload = await blob_download_json(container, blob_name)
+    except Exception as e:
+        logger.warning("[Export] blob load failed (%s): %s", ref, e)
+        return None
+    if isinstance(payload, dict) and payload:
+        return payload
+    return None
+
+
+def _payload_rows_for_merge(payload: dict) -> tuple[str, List[Any]]:
+    if not isinstance(payload, dict):
+        return "", []
+    if isinstance(payload.get("items"), list):
+        return "items", payload.get("items") or []
+    if isinstance(payload.get("analysis_data"), list):
+        return "analysis_data", payload.get("analysis_data") or []
+    if isinstance(payload.get("groups"), list):
+        return "groups", payload.get("groups") or []
+    if isinstance(payload.get("timeline"), list):
+        return "timeline", payload.get("timeline") or []
+    return "", []
+
+
+def _normalize_row_for_merge(raw_row: Any) -> Dict[str, Any]:
+    if isinstance(raw_row, dict):
+        return dict(raw_row)
+    if isinstance(raw_row, list):
+        return {f"col_{idx + 1}": val for idx, val in enumerate(raw_row)}
+    return {"value": raw_row if raw_row is not None else ""}
+
+
+def _combine_export_payloads(payloads: List[dict]) -> Optional[dict]:
+    valid_payloads = [p for p in (payloads or []) if isinstance(p, dict) and p]
+    if not valid_payloads:
+        return None
+    if len(valid_payloads) == 1:
+        return valid_payloads[0]
+
+    sources: List[Dict[str, Any]] = []
+    for idx, payload in enumerate(valid_payloads):
+        _, raw_rows = _payload_rows_for_merge(payload)
+        if not raw_rows:
+            continue
+        normalized_rows = [_normalize_row_for_merge(r) for r in raw_rows]
+        section = str(
+            payload.get("section")
+            or payload.get("title")
+            or payload.get("name")
+            or payload.get("query_name")
+            or f"Tabela {idx + 1}"
+        )
+        sources.append({"section": section, "rows": normalized_rows, "payload": payload})
+
+    if len(sources) == 0:
+        return valid_payloads[0]
+    if len(sources) == 1:
+        single_payload = sources[0].get("payload")
+        return single_payload if isinstance(single_payload, dict) and single_payload else valid_payloads[0]
+
+    signatures: List[str] = []
+    all_columns: List[str] = []
+    all_columns_seen = set()
+    for src in sources:
+        row_columns: List[str] = []
+        row_columns_seen = set()
+        for row in src["rows"]:
+            for key in row.keys():
+                key_txt = str(key)
+                if key_txt not in row_columns_seen:
+                    row_columns_seen.add(key_txt)
+                    row_columns.append(key_txt)
+                if key_txt not in all_columns_seen:
+                    all_columns_seen.add(key_txt)
+                    all_columns.append(key_txt)
+        signatures.append("|".join(row_columns))
+
+    same_columns = len(set(signatures)) <= 1
+    merged_rows: List[Dict[str, Any]] = []
+    if same_columns:
+        for src in sources:
+            merged_rows.extend(src["rows"])
+    else:
+        for src in sources:
+            for row in src["rows"]:
+                normalized = {"section": src["section"]}
+                for col in all_columns:
+                    normalized[col] = row.get(col, "")
+                merged_rows.append(normalized)
+
+    merged = dict(valid_payloads[0])
+    merged["items"] = merged_rows
+    merged["total_count"] = len(merged_rows)
+    merged["_combined_payloads"] = len(sources)
+    merged["_combined_strategy"] = "concat_same_columns" if same_columns else "union_with_section"
+    return merged
+
+
+def _combined_payload_count(payload: Optional[dict]) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        n = int(payload.get("_combined_payloads", 0) or 0)
+    except Exception:
+        n = 0
+    if n > 0:
+        return n
+    key, rows = _payload_rows_for_merge(payload)
+    if key and isinstance(rows, list) and rows:
+        return 1
+    return 0
+
+
 async def _extract_export_data_from_tool_message(tool_msg: dict) -> Optional[dict]:
     blob_ref = str(tool_msg.get("result_blob_ref", "") or "").strip()
     if blob_ref:
-        container, blob_name = parse_blob_ref(blob_ref)
-        if container and blob_name:
-            try:
-                payload = await blob_download_json(container, blob_name)
-                if isinstance(payload, dict) and payload:
-                    return payload
-            except Exception as e:
-                logger.warning("[Export] blob load failed (%s): %s", blob_ref, e)
+        payload = await _load_export_payload_from_blob_ref(blob_ref)
+        if payload:
+            return payload
 
     raw_content = tool_msg.get("content", "")
     if isinstance(raw_content, str):
@@ -297,19 +430,35 @@ def _export_rows_count(data: dict) -> int:
 async def _resolve_export_payload(export_request: ExportRequest, user: dict) -> dict:
     data = None
 
-    blob_ref = str(export_request.result_blob_ref or "").strip()
-    if blob_ref:
-        container, blob_name = parse_blob_ref(blob_ref)
-        if container and blob_name:
-            try:
-                payload = await blob_download_json(container, blob_name)
-                if isinstance(payload, dict) and payload:
-                    data = payload
-            except Exception as e:
-                logger.warning("[Export] explicit blob load failed (%s): %s", blob_ref, e)
+    blob_refs = _normalize_export_blob_refs(export_request)
+    blob_data = None
+    blob_sources = 0
+    loaded_payloads: List[dict] = []
+    if blob_refs:
+        for blob_ref in blob_refs:
+            payload = await _load_export_payload_from_blob_ref(blob_ref)
+            if payload:
+                loaded_payloads.append(payload)
+        blob_sources = len(loaded_payloads)
+        blob_data = _combine_export_payloads(loaded_payloads)
 
-    if data is None and isinstance(export_request.data, dict) and export_request.data:
-        data = export_request.data
+    request_data = export_request.data if isinstance(export_request.data, dict) and export_request.data else None
+    if blob_data is not None and request_data is not None:
+        request_sources = _combined_payload_count(request_data)
+        merged_candidate = _combine_export_payloads([*loaded_payloads, request_data])
+        merged_sources = _combined_payload_count(merged_candidate)
+        if merged_candidate is not None and merged_sources > max(blob_sources, request_sources):
+            data = merged_candidate
+        elif request_sources > blob_sources:
+            data = request_data
+        elif blob_sources > request_sources:
+            data = blob_data
+        else:
+            data = request_data if _export_rows_count(request_data) >= _export_rows_count(blob_data) else blob_data
+    elif blob_data is not None:
+        data = blob_data
+    elif request_data is not None:
+        data = request_data
 
     if data is None:
         conv_id = str(export_request.conversation_id or "").strip()
@@ -1375,9 +1524,12 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     data_text, row_count, col_names, truncated = "", 0, [], False
     semantic_chunks = None
     col_analysis = []
+    full_col_stats = []
     image_base64 = None
     image_content_type = None
     detected_delimiter = ","
+    excel_rows = []
+    csv_text = ""
     filename_lower = filename.lower()
     is_pptx_mime = content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     is_image_mime = (content_type or "").startswith("image/")
@@ -1388,6 +1540,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         rows = list(wb.active.iter_rows(values_only=True))
         if not rows:
             raise HTTPException(400, "Excel vazio")
+        excel_rows = rows
         col_names = [str(c) if c else f"Col{i}" for i, c in enumerate(rows[0])]
         row_count = len(rows) - 1
         data_text = "\t".join(col_names) + "\n" + "\n".join(
@@ -1397,6 +1550,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         wb.close()
     elif filename_lower.endswith(".csv"):
         text = content.decode("utf-8", errors="replace")
+        csv_text = text
         lines = [ln for ln in text.strip().split("\n") if ln.strip()]
         if not lines:
             raise HTTPException(400, "CSV vazio")
@@ -1481,6 +1635,96 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     if not image_base64 and len(full_text) > 50000:
         semantic_chunks = await _build_semantic_chunks(full_text)
 
+    if filename_lower.endswith((".xlsx", ".xls", ".csv")) and row_count > 0 and col_names:
+        try:
+            max_stats_rows = 500000
+            columns_data = [[] for _ in col_names]
+
+            if filename_lower.endswith(".csv"):
+                import csv as csv_mod
+                from io import StringIO
+
+                reader = csv_mod.reader(StringIO(csv_text), delimiter=detected_delimiter)
+                _ = next(reader, None)  # header
+                for row_index, row_vals in enumerate(reader):
+                    if row_index >= max_stats_rows:
+                        break
+                    for ci, val in enumerate(row_vals):
+                        if ci < len(columns_data):
+                            columns_data[ci].append(str(val).strip().strip('"'))
+            else:
+                for row_vals in excel_rows[1 : 1 + max_stats_rows]:
+                    for ci, val in enumerate(row_vals):
+                        if ci < len(columns_data):
+                            columns_data[ci].append("" if val is None else str(val))
+
+            def _parse_number(raw_val: str) -> Optional[float]:
+                txt = str(raw_val or "").strip()
+                if not txt:
+                    return None
+                txt = txt.replace("\u00A0", "").replace(" ", "")
+                if "," in txt and "." in txt:
+                    if txt.rfind(",") > txt.rfind("."):
+                        txt = txt.replace(".", "").replace(",", ".")
+                    else:
+                        txt = txt.replace(",", "")
+                else:
+                    txt = txt.replace(",", ".")
+                try:
+                    return float(txt)
+                except Exception:
+                    return None
+
+            for ci, cname in enumerate(col_names):
+                vals = columns_data[ci] if ci < len(columns_data) else []
+                non_empty = [v for v in vals if str(v).strip()]
+                stat = {"name": cname, "count": len(vals)}
+                numeric_vals = []
+                for v in non_empty:
+                    parsed = _parse_number(v)
+                    if parsed is not None:
+                        numeric_vals.append(parsed)
+
+                if non_empty and len(numeric_vals) > len(non_empty) * 0.5:
+                    numeric_sorted = sorted(numeric_vals)
+                    n = len(numeric_sorted)
+                    mean_raw = sum(numeric_sorted) / n
+                    variance = sum((x - mean_raw) ** 2 for x in numeric_sorted) / n
+
+                    def _p(pct: float) -> float:
+                        idx = min(n - 1, max(0, int((n - 1) * pct)))
+                        return numeric_sorted[idx]
+
+                    sample_vals = []
+                    if non_empty:
+                        sample_indexes = [0, len(non_empty) // 4, len(non_empty) // 2, (3 * len(non_empty)) // 4, len(non_empty) - 1]
+                        sample_vals = [non_empty[idx] for idx in sample_indexes if 0 <= idx < len(non_empty)]
+
+                    stat["type"] = "numeric"
+                    stat["min"] = round(numeric_sorted[0], 4)
+                    stat["max"] = round(numeric_sorted[-1], 4)
+                    stat["mean"] = round(mean_raw, 4)
+                    stat["std"] = round(variance ** 0.5, 4)
+                    stat["non_null"] = n
+                    stat["zeros"] = sum(1 for x in numeric_sorted if x == 0)
+                    stat["p25"] = round(_p(0.25), 4)
+                    stat["p50"] = round(_p(0.50), 4)
+                    stat["p75"] = round(_p(0.75), 4)
+                    stat["sample"] = sample_vals[:5]
+                else:
+                    stat["type"] = "text"
+                    unique = set(non_empty[:10000])
+                    stat["unique_approx"] = len(unique)
+                    stat["sample"] = non_empty[:5]
+                    if non_empty:
+                        stat["first"] = non_empty[0]
+                        stat["last"] = non_empty[-1]
+
+                full_col_stats.append(stat)
+        except Exception as e:
+            logger.warning("[App] full_col_stats computation failed: %s", e)
+            full_col_stats = []
+
     if len(data_text) > 100000:
         data_text = data_text[:100000]
         truncated = True
@@ -1520,6 +1764,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
                 }
             )
         store_entry["col_analysis"] = col_analysis
+    store_entry["full_col_stats"] = full_col_stats
 
     response_payload = {
         "filename": filename,
@@ -1528,6 +1773,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "truncated": truncated,
         "preview": "\n".join(data_text.split("\n")[:6]),
         "col_analysis": col_analysis if col_analysis else None,
+        "full_col_stats": full_col_stats if full_col_stats else None,
     }
     return store_entry, response_payload
 
@@ -1612,6 +1858,7 @@ async def _process_upload_job(job: dict) -> None:
 
     col_names = store_entry.get("col_names", [])
     col_analysis = store_entry.get("col_analysis", [])
+    full_col_stats = store_entry.get("full_col_stats", [])
     upload_index_entity = {
         "PartitionKey": conv_id,
         "RowKey": str(job.get("job_id", "")),
@@ -1623,6 +1870,7 @@ async def _process_upload_job(job: dict) -> None:
         "RowCount": int(store_entry.get("row_count", 0) or 0),
         "ColNamesJson": json.dumps(col_names if isinstance(col_names, list) else [], ensure_ascii=False)[:32000],
         "ColAnalysisJson": json.dumps(col_analysis if isinstance(col_analysis, list) else [], ensure_ascii=False)[:32000],
+        "FullColStatsJson": json.dumps(full_col_stats if isinstance(full_col_stats, list) else [], ensure_ascii=False)[:64000],
         "PreviewText": text_payload[:16000],
         "Truncated": bool(store_entry.get("truncated", False)),
         "HasChunks": bool(chunks_blob_ref),
@@ -2783,6 +3031,7 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
         BASE_DIR / "agent.py",
         BASE_DIR / "tools.py",
         BASE_DIR / "config.py",
+        BASE_DIR / "startup.sh",
         BASE_DIR / "static" / "index.html",
     ]
     files = {}

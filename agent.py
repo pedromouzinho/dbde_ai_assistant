@@ -172,10 +172,38 @@ conversations = ConversationStore(
     on_evict=_cleanup_conversation_related_state,
 )
 logger = logging.getLogger(__name__)
+_AGENT_LLM_STEP_TIMEOUT_SECONDS = 90.0
 
 
 def _odata_escape(value: str) -> str:
     return (value or "").replace("'", "''")
+
+
+def _fallback_answer_from_tool_details(tool_details: List[dict]) -> str:
+    for detail in reversed(tool_details or []):
+        if not isinstance(detail, dict):
+            continue
+        summary = detail.get("result_summary", {}) if isinstance(detail.get("result_summary"), dict) else {}
+        if summary.get("has_error"):
+            continue
+        total = summary.get("total_count")
+        if total in (None, "", "N/A"):
+            total = summary.get("items_returned", 0)
+        tool_name = str(detail.get("tool", "consulta") or "consulta")
+        try:
+            total_int = int(total)
+        except Exception:
+            total_int = 0
+        if total_int > 0:
+            return (
+                f"Encontrei {total_int} resultados via {tool_name}, "
+                "mas não consegui gerar o resumo final. "
+                "Pede \"lista completa\" para mostrar os itens diretamente."
+            )
+    return (
+        "Consegui executar a pesquisa, mas não consegui gerar o texto final. "
+        "Tenta novamente (preferencialmente em Fast) para resposta mais imediata."
+    )
 
 
 def _user_partition_key(user: Optional[dict]) -> str:
@@ -299,6 +327,10 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
             col_analysis = json.loads(row.get("ColAnalysisJson", "[]") or "[]")
         except Exception:
             col_analysis = []
+        try:
+            full_col_stats = json.loads(row.get("FullColStatsJson", "[]") or "[]")
+        except Exception:
+            full_col_stats = []
         files.append(
             {
                 "filename": row.get("Filename", ""),
@@ -306,6 +338,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
                 "row_count": int(row.get("RowCount", 0) or 0),
                 "col_names": col_names if isinstance(col_names, list) else [],
                 "col_analysis": col_analysis if isinstance(col_analysis, list) else [],
+                "full_col_stats": full_col_stats if isinstance(full_col_stats, list) else [],
                 "truncated": bool(row.get("Truncated", False)),
                 "uploaded_at": row.get("UploadedAt", ""),
                 "has_chunks": str(row.get("HasChunks", "")).lower() in ("true", "1"),
@@ -423,6 +456,10 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
         ctx_parts = [
             f"FICHEIROS CARREGADOS: {len(use_files)} (máximo analisado por pedido: {MAX_FILES_CONTEXT})",
             "Analisa TODOS os ficheiros listados antes de responder. Não ignores nenhum.",
+            "Quando existir secção 'ESTATÍSTICAS COMPLETAS', usa SEMPRE esses valores para min/max/mean/std; "
+            "não recalcules a partir da amostra truncada.",
+            "Para pedidos de gráfico sobre ficheiros carregados, usa generate_chart com os dados fornecidos; "
+            "se faltar coluna/agregação, pede clarificação objetiva ao utilizador.",
         ]
 
         total_budget = 90000
@@ -450,9 +487,33 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
             if file_data.get("truncated"):
                 block.append("NOTA: Conteúdo truncado para contexto.")
 
+            full_stats = file_data.get("full_col_stats")
             col_analysis = file_data.get("col_analysis")
-            if col_analysis:
-                block.append("ANÁLISE DE COLUNAS:")
+            if isinstance(full_stats, list) and full_stats:
+                block.append("ESTATÍSTICAS COMPLETAS (calculadas sobre TODAS as linhas):")
+                for fs in full_stats[:20]:
+                    name = str(fs.get("name", "") or "")
+                    if fs.get("type") == "numeric":
+                        block.append(
+                            f"- {name} (numeric): min={fs.get('min')}, max={fs.get('max')}, "
+                            f"mean={fs.get('mean')}, std={fs.get('std')}, "
+                            f"P25={fs.get('p25')}, P50={fs.get('p50')}, P75={fs.get('p75')}, "
+                            f"non_null={fs.get('non_null')}, zeros={fs.get('zeros')}"
+                        )
+                    else:
+                        first_last = ""
+                        if fs.get("first") and fs.get("last"):
+                            first_last = f", range=[{fs.get('first')} ... {fs.get('last')}]"
+                        block.append(
+                            f"- {name} (text): unique≈{fs.get('unique_approx', '?')}, "
+                            f"sample={fs.get('sample', [])}{first_last}"
+                        )
+                block.append(
+                    "NOTA: Os dados acima representam o ficheiro COMPLETO. "
+                    "O conteúdo abaixo é uma AMOSTRA truncada — usa as estatísticas acima para valores exatos."
+                )
+            elif col_analysis:
+                block.append("ANÁLISE DE COLUNAS (amostra):")
                 for ca in col_analysis[:20]:
                     sample = ", ".join((ca.get("sample") or [])[:3])
                     block.append(f"- {ca.get('name','')} ({ca.get('type','text')}): {sample}")
@@ -1058,9 +1119,12 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
             # Agent loop
             ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
-            response = await llm_with_fallback(
-                ephemeral, tools=get_all_tool_definitions(), tier=tier,
-                temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+            response = await asyncio.wait_for(
+                llm_with_fallback(
+                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
+                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                ),
+                timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
             )
             model_used = response.model
             total_usage = response.usage
@@ -1092,9 +1156,12 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
                 # Next LLM call
                 ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
-                response = await llm_with_fallback(
-                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
-                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                response = await asyncio.wait_for(
+                    llm_with_fallback(
+                        ephemeral, tools=get_all_tool_definitions(), tier=tier,
+                        temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                    ),
+                    timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
                 )
                 for k, v in response.usage.items():
                     if isinstance(v, (int, float)):
@@ -1188,9 +1255,12 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
 
                 # Non-streaming call for tool detection
                 ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
-                response = await llm_with_fallback(
-                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
-                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                response = await asyncio.wait_for(
+                    llm_with_fallback(
+                        ephemeral, tools=get_all_tool_definitions(), tier=tier,
+                        temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                    ),
+                    timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
                 )
                 for k, v in response.usage.items():
                     if isinstance(v, (int, float)):
@@ -1226,27 +1296,20 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                     need_final_response = False
 
                     if response.content:
-                        # Try to re-do as streaming for token-by-token delivery
-                        # Remove tools so we get pure text streaming
-                        try:
-                            ephemeral_stream = await _build_llm_messages(conv_id, request.question, request=request)
-                            async for event in provider.chat_stream(
-                                ephemeral_stream, tools=None,
-                                temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-                            ):
-                                if event.type == "token" and event.text:
-                                    yield _sse({"type": "token", "text": event.text})
-                                elif event.type == "done":
-                                    break
-                        except Exception as e:
-                            logger.warning("[Agent] streaming failed, falling back to non-streaming: %s", e)
-                            # Fallback: send full content at once
-                            yield _sse({"type": "token", "text": response.content})
-
+                        # Evita segunda chamada ao LLM no streaming final.
+                        # Reduz latência e elimina cenário de "a pensar" por retries duplicados.
+                        yield _sse({"type": "token", "text": response.content})
                         conversations[conv_id].append({"role": "assistant", "content": response.content})
                         should_persist = True
                     else:
                         yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
+
+            if need_final_response:
+                # Garantir sempre resposta textual quando o loop atinge limite de iterações.
+                fallback_text = _fallback_answer_from_tool_details(tool_details)
+                yield _sse({"type": "token", "text": fallback_text})
+                conversations[conv_id].append({"role": "assistant", "content": fallback_text})
+                should_persist = True
 
         except Exception as e:
             yield _sse({"type": "error", "text": str(e)})
