@@ -68,12 +68,12 @@ LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "fast")
 
 # Mapping de tiers para providers+modelos
 # Formato: "provider:model" — o provider resolve internamente
-LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-5-mini")
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-5-chat")
-LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.2-chat")
+LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4.1-mini")
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-4.1")
+LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.1")
 
 # Fallback provider (se o primário falhar)
-LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:dbde_access_chatbot_41")
+LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:gpt-4.1-mini")
 
 # Model Router — feature flag para routing inteligente entre modelos.
 # Desactivado em produção por omissão. Para activar:
