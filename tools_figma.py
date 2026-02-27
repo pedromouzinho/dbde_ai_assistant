@@ -310,14 +310,43 @@ async def tool_analyze_figma_flow(
     else:
         ordering_mode = "manual"
 
-    for nid in normalized_node_ids:
-        if nid in nodes_by_id:
-            continue
-        fetched = await _fetch_node(nid)
-        if "error" in fetched:
-            assumptions.append(f"Node '{nid}' ignorado: {fetched['error']}")
-            continue
-        nodes_by_id[nid] = fetched["data"]
+    pending_node_ids = [nid for nid in normalized_node_ids if nid and nid not in nodes_by_id]
+    batch_size = 50
+    for offset in range(0, len(pending_node_ids), batch_size):
+        batch_ids = pending_node_ids[offset:offset + batch_size]
+        missing_ids = []
+        batch_resp = await _figma_get(
+            f"/files/{quote(fk, safe='')}/nodes",
+            params={"ids": ",".join(batch_ids)},
+        )
+        if "error" in batch_resp:
+            assumptions.append(
+                f"Lote de nodes Figma falhou (fallback individual): {batch_resp['error']}"
+            )
+            missing_ids.extend(batch_ids)
+        else:
+            raw_nodes = batch_resp.get("nodes", {})
+            if not isinstance(raw_nodes, dict) or not raw_nodes:
+                missing_ids.extend(batch_ids)
+            else:
+                for nid in batch_ids:
+                    node_payload = raw_nodes.get(nid)
+                    if not node_payload and len(batch_ids) == 1:
+                        node_payload = next(iter(raw_nodes.values()), None)
+                    if isinstance(node_payload, dict):
+                        nodes_by_id[nid] = node_payload
+                    else:
+                        missing_ids.append(nid)
+
+        # Fallback individual apenas para os ids não resolvidos no batch.
+        for nid in missing_ids:
+            if nid in nodes_by_id:
+                continue
+            fetched = await _fetch_node(nid)
+            if "error" in fetched:
+                assumptions.append(f"Node '{nid}' ignorado: {fetched['error']}")
+                continue
+            nodes_by_id[nid] = fetched["data"]
 
     if not nodes_by_id:
         return {"error": "Não foi possível carregar nenhum frame do fluxo Figma."}
