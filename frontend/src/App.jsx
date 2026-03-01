@@ -36,7 +36,8 @@ function App() {
     const [streamingStatus, setStreamingStatus] = useState("");
     const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth > 768);
     const [agentMode, setAgentMode] = useState("general");
-    const [modelTier, setModelTier] = useState("fast");
+    const [modelTier, setModelTier] = useState("standard");
+    const [tierRoutingNotice, setTierRoutingNotice] = useState("");
     const [uploadedFiles, setUploadedFiles] = useState([]);
     const [imagePreviews, setImagePreviews] = useState([]);
     const [uploadingFiles, setUploadingFiles] = useState(false);
@@ -663,6 +664,30 @@ function App() {
 
     function removeImage(idx) { setImagePreviews(prev => prev.filter((_, i) => i !== idx)); }
 
+    function normalizeRoutingText(value) {
+        return String(value || "")
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "");
+    }
+
+    function shouldEscalateFastPrompt(question, filesCount = 0, imagesCount = 0) {
+        if (filesCount > 0 || imagesCount > 0) return true;
+        const q = normalizeRoutingText(question);
+        if (!q) return false;
+        const analyticKeywords = [
+            "analisa", "analisar", "analise", "resumo estatistico", "estatistica",
+            "minimo", "maximo", "media", "mediana", "percentil", "desvio padrao",
+            "variancia", "correlacao", "regressao", "comparar", "comparacao",
+            "tendencia", "padrao", "serie temporal", "volatilidade", "agregacao",
+            "por ano", "por mes", "por semana", "por dia", "grafico", "chart",
+            "plot", "scatter", "histograma", "csv", "excel", "xlsx",
+            "dataset", "tabela", "ficheiro", "upload", "anexo",
+        ];
+        if (analyticKeywords.some((kw) => q.includes(kw))) return true;
+        return /\b(min|max|avg|mean|std|p\d{2})\b/.test(q);
+    }
+
     function handleDrop(e) {
         e.preventDefault(); setDragOver(false);
         const files = e.dataTransfer && e.dataTransfer.files;
@@ -705,6 +730,17 @@ function App() {
         }
         const q = input.trim();
         const currentImages = [...imagePreviews];
+        const fastEscalatedToThinking = modelTier === "fast" && shouldEscalateFastPrompt(
+            q,
+            Array.isArray(activeUploadedFiles) ? activeUploadedFiles.length : 0,
+            currentImages.length
+        );
+        const requestTier = fastEscalatedToThinking ? "standard" : modelTier;
+        if (fastEscalatedToThinking) {
+            setTierRoutingNotice("🧠 Pedido analítico detetado: enviado automaticamente em Thinking para melhor qualidade.");
+        } else {
+            setTierRoutingNotice("");
+        }
         setInput(""); setImagePreviews([]);
         if (inputRef.current) inputRef.current.style.height = "auto";
 
@@ -742,7 +778,7 @@ function App() {
                 image_content_type: firstImage ? firstImage.content_type : null,
                 images: imagesPayload.length > 0 ? imagesPayload : null,
                 mode: agentMode,
-                model_tier: modelTier,
+                model_tier: requestTier,
             };
 
             // Try SSE streaming first
@@ -1283,6 +1319,11 @@ function App() {
     const modeLabels = { general: "💬 Geral", userstory: "📋 User Stories" };
     const selectorLabel = `${tierLabels[modelTier]} · ${modeLabels[agentMode]}`;
     const suggestions = getDynamicSuggestions(agentMode, conversations, activeUploadedFiles);
+    const showFastAnalyticHint = modelTier === "fast" && shouldEscalateFastPrompt(
+        input,
+        Array.isArray(activeUploadedFiles) ? activeUploadedFiles.length : 0,
+        imagePreviews.length
+    );
 
     // ─── Render ──────────────────────────────────────────────────────────
 
@@ -1499,7 +1540,7 @@ function App() {
                             ["fast", "standard", "pro"].map(t =>
                                 React.createElement("button", {
                                     key: t,
-                                    onClick: () => { setModelTier(t); },
+                                    onClick: () => { setTierRoutingNotice(""); setModelTier(t); },
                                     style: {
                                         display: "flex", alignItems: "center", gap: 8,
                                         width: "100%", padding: "8px 10px", border: "none",
@@ -1737,6 +1778,19 @@ function App() {
                     ),
                     React.createElement("button", { onClick: () => setImagePreviews([]), style: { marginLeft: "auto", background: "none", border: "none", color: "#999", cursor: "pointer", fontSize: 12, alignSelf: "center" } }, "Limpar"),
                     React.createElement("div", { style: { alignSelf: "center", fontSize: 11, color: "#888" } }, `${imagePreviews.length}/${maxImagesPerMessage}`)
+                ),
+                modelTier === "fast" && (showFastAnalyticHint || tierRoutingNotice) && React.createElement("div", {
+                    style: {
+                        maxWidth: 900, margin: "0 auto 8px", display: "flex", alignItems: "flex-start", gap: 8,
+                        background: "rgba(222,49,99,0.06)", border: "1px solid rgba(222,49,99,0.16)", borderRadius: 10, padding: "8px 14px",
+                    }
+                },
+                    React.createElement("span", { style: { fontSize: 14, marginTop: 1 } }, "⚠️"),
+                    React.createElement("div", {
+                        style: { fontSize: 12, color: "#8a1f3e", fontWeight: 500 }
+                    },
+                        tierRoutingNotice || "No modo Fast, pedidos analíticos podem perder qualidade. Ao enviar, o sistema encaminha automaticamente para Thinking."
+                    )
                 ),
                 React.createElement("div", { style: { maxWidth: 900, margin: "0 auto", display: "flex", gap: 8, alignItems: "flex-end" } },
                     React.createElement("input", { ref: fileInputRef, type: "file", accept: ".xlsx,.xls,.csv,.txt,.pdf,.svg,.png,.jpg,.jpeg,.gif,.webp,.bmp,.pptx", multiple: true, style: { display: "none" }, onChange: handleFileUpload }),
