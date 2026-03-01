@@ -199,6 +199,8 @@ else:
         )
 JWT_EXPIRATION_HOURS = int(_get_env("JWT_EXPIRATION_HOURS", "10"))
 ADMIN_INITIAL_PASSWORD = _get_env("ADMIN_INITIAL_PASSWORD", "")
+ADMIN_USERNAME = _get_env("ADMIN_USERNAME", "pedro.mousinho")
+ADMIN_DISPLAY_NAME = _get_env("ADMIN_DISPLAY_NAME", "Pedro Mousinho")
 AUTH_COOKIE_NAME = _get_env("AUTH_COOKIE_NAME", "dbde_token")
 _jwt_secret_previous_env = _get_env("JWT_SECRET_PREVIOUS", "")
 JWT_SECRET_PREVIOUS = _jwt_secret_previous_env if _jwt_secret_previous_env else None

@@ -27,7 +27,7 @@ export function sanitizeLinkUrl(rawUrl) {
 export function sanitizeHtmlOutput(rawHtml) {
   return DOMPurify.sanitize(String(rawHtml || ''), {
     ALLOWED_TAGS: ['a', 'b', 'i', 'em', 'strong', 'p', 'ul', 'ol', 'li', 'br', 'code', 'pre', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'div', 'span'],
-    ALLOWED_ATTR: ['href', 'target', 'rel', 'class', 'style', 'title'],
+    ALLOWED_ATTR: ['href', 'target', 'rel', 'class', 'title'],
     FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed'],
     FORBID_ATTR: ['onerror', 'onclick', 'onload'],
   });

@@ -20,6 +20,8 @@ from config import (
     STORAGE_ACCOUNT,
     STORAGE_KEY,
     ADMIN_INITIAL_PASSWORD,
+    ADMIN_USERNAME,
+    ADMIN_DISPLAY_NAME,
     UPLOAD_BLOB_CONTAINER_RAW,
     UPLOAD_BLOB_CONTAINER_TEXT,
     UPLOAD_BLOB_CONTAINER_CHUNKS,
@@ -432,31 +434,32 @@ async def _ensure_admin_user():
     """Cria o admin user se não existir."""
     try:
         existing = await table_query(
-            "Users", "PartitionKey eq 'user' and RowKey eq 'pedro.mousinho'", top=1
+            "Users", f"PartitionKey eq 'user' and RowKey eq '{ADMIN_USERNAME}'", top=1
         )
         if not existing:
             initial_password = (ADMIN_INITIAL_PASSWORD or "").strip()
             if not initial_password:
                 initial_password = secrets.token_urlsafe(16)
                 logger.warning(
-                    "[Storage] ADMIN_INITIAL_PASSWORD não definido. Password bootstrap gerada para 'pedro.mousinho'. "
+                    "[Storage] ADMIN_INITIAL_PASSWORD não definido. Password bootstrap gerada para '%s'. "
                     "Define ADMIN_INITIAL_PASSWORD para controlo explícito e sem dependência de bootstrap automático.",
+                    ADMIN_USERNAME,
                 )
             else:
                 logger.info("[Storage] ADMIN_INITIAL_PASSWORD detectado para bootstrap do admin")
             entity = {
                 "PartitionKey": "user",
-                "RowKey": "pedro.mousinho",
-                "DisplayName": "Pedro Mousinho",
+                "RowKey": ADMIN_USERNAME,
+                "DisplayName": ADMIN_DISPLAY_NAME,
                 "PasswordHash": hash_password(initial_password),
                 "Role": "admin",
                 "CreatedAt": datetime.now(timezone.utc).isoformat(),
                 "Active": True,
             }
             await table_insert("Users", entity)
-            logger.info("  🔐 Admin user 'pedro.mousinho' created")
+            logger.info("  🔐 Admin user '%s' created", ADMIN_USERNAME)
         else:
-            logger.info("  🔐 Admin user 'pedro.mousinho' exists")
+            logger.info("  🔐 Admin user '%s' exists", ADMIN_USERNAME)
     except Exception as e:
         logger.error("[Storage] _ensure_admin_user failed: %s", e)
 

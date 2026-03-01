@@ -322,7 +322,7 @@ MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
 async def enforce_allowed_origins(request: Request, call_next):
     global _last_rate_cache_cleanup
     req_path = str(request.url.path or "").strip()
-    is_exempt_path = req_path in _AUTH_EXEMPT_PATHS or req_path.startswith("/health")
+    is_exempt_path = req_path in _AUTH_EXEMPT_PATHS or req_path == "/health"
 
     token_ref = set_request_cookie_token((request.cookies.get(AUTH_COOKIE_NAME) or "").strip())
     try:
@@ -336,6 +336,23 @@ async def enforce_allowed_origins(request: Request, call_next):
                     )
             except ValueError:
                 pass
+        received_body_size = 0
+        original_receive = request._receive
+
+        async def _size_limited_receive():
+            nonlocal received_body_size
+            message = await original_receive()
+            if message.get("type") == "http.request":
+                body_chunk = message.get("body", b"")
+                received_body_size += len(body_chunk)
+                if received_body_size > MAX_REQUEST_BODY_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Payload demasiado grande (máximo {MAX_REQUEST_BODY_BYTES} bytes)",
+                    )
+            return message
+
+        request._receive = _size_limited_receive
 
         if not is_exempt_path:
             origin = request.headers.get("origin")
@@ -365,7 +382,12 @@ async def enforce_allowed_origins(request: Request, call_next):
                     content={"detail": f"Limite de pedidos excedido. Tenta novamente em {retry_after} segundos."},
                     headers={"Retry-After": str(retry_after)},
                 )
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except HTTPException as exc:
+            if exc.status_code == 413:
+                return JSONResponse(status_code=413, content={"detail": str(exc.detail)})
+            raise
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -373,7 +395,7 @@ async def enforce_allowed_origins(request: Request, call_next):
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.plot.ly https://fonts.googleapis.com; "
+            "script-src 'self' https://cdnjs.cloudflare.com https://cdn.plot.ly; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' data: https:; "
@@ -1705,6 +1727,38 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     filename_lower = filename.lower()
     is_pptx_mime = content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     is_image_mime = (content_type or "").startswith("image/")
+    ext = os.path.splitext(filename_lower)[1]
+
+    allowed_extensions = {
+        ".xlsx", ".xls", ".csv", ".pdf", ".png", ".jpg", ".jpeg",
+        ".gif", ".webp", ".bmp", ".pptx", ".svg", ".txt", ".md",
+        ".json", ".xml", ".html", ".htm", ".log", ".tsv",
+    }
+    if ext and ext not in allowed_extensions and not is_image_mime and not is_pptx_mime:
+        raise HTTPException(
+            400,
+            f"Extensão '{ext}' não permitida. Aceites: {', '.join(sorted(allowed_extensions))}",
+        )
+
+    magic_signatures = {
+        ".xlsx": (b"PK\x03\x04",),
+        ".xls": (b"\xd0\xcf\x11\xe0",),
+        ".pdf": (b"%PDF",),
+        ".png": (b"\x89PNG",),
+        ".jpg": (b"\xff\xd8\xff",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".gif": (b"GIF87a", b"GIF89a"),
+        ".webp": (b"RIFF",),
+        ".bmp": (b"BM",),
+        ".pptx": (b"PK\x03\x04",),
+    }
+    if ext in magic_signatures:
+        prefix = content[:8]
+        if not any(prefix.startswith(sig) for sig in magic_signatures[ext]):
+            raise HTTPException(
+                400,
+                f"Conteúdo do ficheiro não corresponde à extensão '{ext}'. Verifica o ficheiro e tenta novamente.",
+            )
 
     if filename_lower.endswith((".xlsx", ".xls")):
         import openpyxl
@@ -2606,7 +2660,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
     sections_wiql = {
         "created_yesterday": (
             "SELECT [System.Id] FROM WorkItems "
-            "WHERE [System.TeamProject] = 'IT.DIT' "
+            f"WHERE [System.TeamProject] = '{DEVOPS_PROJECT}' "
             "AND [System.WorkItemType] = 'User Story' "
             "AND [System.CreatedDate] >= @Today-1 "
             "AND [System.CreatedDate] < @Today "
@@ -2614,7 +2668,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
         ),
         "old_bugs": (
             "SELECT [System.Id] FROM WorkItems "
-            "WHERE [System.TeamProject] = 'IT.DIT' "
+            f"WHERE [System.TeamProject] = '{DEVOPS_PROJECT}' "
             "AND [System.WorkItemType] = 'Bug' "
             "AND [System.State] = 'Active' "
             "AND [System.CreatedDate] < @Today-7 "
@@ -2622,7 +2676,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
         ),
         "unassigned": (
             "SELECT [System.Id] FROM WorkItems "
-            "WHERE [System.TeamProject] = 'IT.DIT' "
+            f"WHERE [System.TeamProject] = '{DEVOPS_PROJECT}' "
             "AND [System.State] <> 'Closed' "
             "AND [System.State] <> 'Removed' "
             "AND [System.AssignedTo] = '' "
@@ -2630,7 +2684,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
         ),
         "closed_this_week": (
             "SELECT [System.Id] FROM WorkItems "
-            "WHERE [System.TeamProject] = 'IT.DIT' "
+            f"WHERE [System.TeamProject] = '{DEVOPS_PROJECT}' "
             "AND [System.State] = 'Closed' "
             "AND [Microsoft.VSTS.Common.ClosedDate] >= @StartOfWeek "
             "ORDER BY [Microsoft.VSTS.Common.ClosedDate] DESC"
@@ -2639,7 +2693,7 @@ async def api_digest(request: Request, credentials: HTTPAuthorizationCredentials
 
     payload = {
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "project": "IT.DIT",
+        "project": DEVOPS_PROJECT,
     }
     section_items = list(sections_wiql.items())
     section_results = await asyncio.gather(
@@ -3312,10 +3366,19 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
 async def health(
     request: Request,
     deep: bool = False,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     result = {"status": "healthy", "mode": "basic", "checks": {"app": "ok"}}
     if not deep:
         return result
+
+    try:
+        get_current_user(credentials)
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Token inválido para deep health check"},
+        )
 
     result["mode"] = "deep"
     checks = {}

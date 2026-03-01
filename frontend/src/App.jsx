@@ -992,7 +992,19 @@ function App() {
             if (!res.ok) throw new Error(data.detail || data.error || "Erro export chat");
             if (data.url) {
                 const target = String(data.url || "");
-                window.open(target.startsWith("http") ? target : (API_URL + target), "_blank");
+                const finalUrl = target.startsWith("http") ? target : (API_URL + target);
+                try {
+                    const parsed = new URL(finalUrl, window.location.origin);
+                    const apiOrigin = new URL(API_URL || window.location.origin, window.location.origin).origin;
+                    const allowedOrigins = new Set([window.location.origin, apiOrigin]);
+                    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && allowedOrigins.has(parsed.origin)) {
+                        window.open(parsed.href, "_blank", "noopener,noreferrer");
+                    } else {
+                        throw new Error("Origem de export não permitida");
+                    }
+                } catch (err) {
+                    throw new Error("URL de export inválida");
+                }
             }
             if (data.format_served && data.format_requested && data.format_served !== data.format_requested) {
                 alert("Aviso: exportado como " + data.format_served.toUpperCase() + " em vez de " + data.format_requested.toUpperCase() + (data.fallback_reason ? " (" + data.fallback_reason + ")" : ""));
