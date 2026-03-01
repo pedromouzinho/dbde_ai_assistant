@@ -307,6 +307,9 @@ app.state.limiter = limiter
 _static_dir = Path(__file__).resolve().parent / "static"
 if _static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+    _dist_dir = _static_dir / "dist"
+    if _dist_dir.exists():
+        app.mount("/dist", StaticFiles(directory=str(_dist_dir)), name="dist")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins, allow_credentials=True,
