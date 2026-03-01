@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Virtual environments
+antenv/
+.venv/
+venv/
+
+# OS
+.DS_Store
+.Rhistory
+*.log
+
+# Build / dependencies
+node_modules/
+static/dist/
+.tmp_wheels/
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# Old docs / handoff (legacy, not part of v7.3.0 codebase)
+*.docx
+CODEX_*.md
+HOTFIX_*.md
+INFRA_COMMANDS_*.md
+MENSAGEM_CODEX_*.md
+MANUAL_UPDATE_NOTES_*.md
+gen_report.*

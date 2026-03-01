@@ -3,12 +3,17 @@
 # =============================================================================
 # Todas as variáveis de ambiente, constantes e configurações num único local.
 # Nenhum outro ficheiro faz os.getenv() — tudo passa por aqui.
+# CHANGELOG:
+# v7.3.0 (Fase G): Reranking activado, US generation fine-tuned,
+#         web search, chat export, file generation improvements
+# v7.2.7 (Fase E): Refactoring completo, eval suite
 # =============================================================================
 
 import os
 import secrets
 import logging
 import hashlib
+import re
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -63,14 +68,20 @@ LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "fast")
 
 # Mapping de tiers para providers+modelos
 # Formato: "provider:model" — o provider resolve internamente
-LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-5-mini")
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-5-chat")
-LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.2-chat")
+LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4.1-mini")
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-4.1")
+LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.1")
+LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4.1")
+VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"
 
 # Fallback provider (se o primário falhar)
-LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:dbde_access_chatbot_41")
+LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:gpt-4.1-mini")
 
-# Model Router (ativação controlada por ambiente; recomendado só em teste primeiro)
+# Model Router — feature flag para routing inteligente entre modelos.
+# Desactivado em produção por omissão. Para activar:
+#   1. Definir MODEL_ROUTER_ENABLED=true
+#   2. Definir MODEL_ROUTER_SPEC=azure_openai:<deployment-name>
+#   3. Opcional: MODEL_ROUTER_NON_PROD_ONLY=false para permitir em produção
 _app_env_hint = _get_env("APP_ENV", "").lower()
 MODEL_ROUTER_ENABLED = _get_env(
     "MODEL_ROUTER_ENABLED",
@@ -100,13 +111,28 @@ TOP_K = int(_get_env("TOP_K", "10"))
 # =============================================================================
 # POST-RETRIEVAL RERANK
 # =============================================================================
-RERANK_ENABLED = _get_env("RERANK_ENABLED", "false").lower() == "true"
+RERANK_ENABLED = _get_env("RERANK_ENABLED", "true").lower() == "true"
 RERANK_ENDPOINT = _get_env("RERANK_ENDPOINT", "")
 RERANK_API_KEY = _get_env("RERANK_API_KEY", "")
 RERANK_MODEL = _get_env("RERANK_MODEL", "cohere-rerank-v4.0-fast")
-RERANK_TOP_N = int(_get_env("RERANK_TOP_N", "30"))
+RERANK_TOP_N = int(_get_env("RERANK_TOP_N", "15"))
 RERANK_TIMEOUT_SECONDS = float(_get_env("RERANK_TIMEOUT_SECONDS", "15"))
 RERANK_AUTH_MODE = _get_env("RERANK_AUTH_MODE", "api-key").lower()
+
+# =============================================================================
+# WEB SEARCH (Brave Search API)
+# =============================================================================
+WEB_SEARCH_ENABLED = _get_env("WEB_SEARCH_ENABLED", "false").lower() == "true"
+WEB_SEARCH_API_KEY = _get_env("WEB_SEARCH_API_KEY", "")
+WEB_SEARCH_ENDPOINT = _get_env("WEB_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search")
+WEB_SEARCH_MAX_RESULTS = int(_get_env("WEB_SEARCH_MAX_RESULTS", "5"))
+WEB_SEARCH_MARKET = _get_env("WEB_SEARCH_MARKET", "pt-PT")
+WEB_ANSWERS_ENABLED = _get_env("WEB_ANSWERS_ENABLED", "false").lower() == "true"
+WEB_ANSWERS_API_KEY = _get_env("WEB_ANSWERS_API_KEY", "")
+WEB_ANSWERS_ENDPOINT = _get_env("WEB_ANSWERS_ENDPOINT", "https://api.search.brave.com/res/v1/chat/completions")
+WEB_ANSWERS_MODEL = _get_env("WEB_ANSWERS_MODEL", "brave")
+WEB_ANSWERS_TIMEOUT_SECONDS = float(_get_env("WEB_ANSWERS_TIMEOUT_SECONDS", "20"))
+WEB_SEARCH_DAILY_QUOTA_PER_USER = int(_get_env("WEB_SEARCH_DAILY_QUOTA_PER_USER", "50"))
 
 # =============================================================================
 # AZURE DEVOPS
@@ -174,6 +200,8 @@ else:
 JWT_EXPIRATION_HOURS = int(_get_env("JWT_EXPIRATION_HOURS", "10"))
 ADMIN_INITIAL_PASSWORD = _get_env("ADMIN_INITIAL_PASSWORD", "")
 AUTH_COOKIE_NAME = _get_env("AUTH_COOKIE_NAME", "dbde_token")
+_jwt_secret_previous_env = _get_env("JWT_SECRET_PREVIOUS", "")
+JWT_SECRET_PREVIOUS = _jwt_secret_previous_env if _jwt_secret_previous_env else None
 AUTH_COOKIE_SECURE = _get_env("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_COOKIE_MAX_AGE_SECONDS = int(_get_env("AUTH_COOKIE_MAX_AGE_SECONDS", "86400"))
 ALLOWED_ORIGINS = _get_env(
@@ -222,11 +250,14 @@ UPLOAD_WORKER_BATCH_SIZE = int(_get_env("UPLOAD_WORKER_BATCH_SIZE", "4"))
 # =============================================================================
 # EXPORT CONFIG
 # =============================================================================
-EXPORT_BRAND_COLOR = "#DE3163"  # Cerise (branding UI/export)
+_EXPORT_BRAND_COLOR_RAW = _get_env("EXPORT_BRAND_COLOR", "#DE3163")
+EXPORT_BRAND_COLOR = _EXPORT_BRAND_COLOR_RAW if re.fullmatch(r"#[0-9A-Fa-f]{6}", _EXPORT_BRAND_COLOR_RAW) else "#DE3163"
 EXPORT_BRAND_NAME = "Millennium BCP"
 EXPORT_AGENT_NAME = "Assistente AI DBDE"
 EXPORT_AUTO_ASYNC_ENABLED = _get_env("EXPORT_AUTO_ASYNC_ENABLED", "true").lower() == "true"
 EXPORT_ASYNC_THRESHOLD_ROWS = int(_get_env("EXPORT_ASYNC_THRESHOLD_ROWS", "250"))
+EXPORT_FILE_ROW_CAP = int(_get_env("EXPORT_FILE_ROW_CAP", "5000"))
+EXPORT_FILE_ROW_CAP_MAX = int(_get_env("EXPORT_FILE_ROW_CAP_MAX", "100000"))
 EXPORT_MAX_CONCURRENT_JOBS = int(_get_env("EXPORT_MAX_CONCURRENT_JOBS", "2"))
 EXPORT_JOB_STALE_SECONDS = int(_get_env("EXPORT_JOB_STALE_SECONDS", "1800"))
 EXPORT_INLINE_WORKER_ENABLED = _get_env("EXPORT_INLINE_WORKER_ENABLED", "false").lower() == "true"
@@ -260,12 +291,47 @@ DEVOPS_STATES = ["New", "Active", "Closed", "Resolved", "Removed"]
 # =============================================================================
 # DEBUG
 # =============================================================================
+STARTUP_FAIL_FAST = _get_env("STARTUP_FAIL_FAST", "true").lower() == "true"
+
+# =============================================================================
+# TOKEN QUOTAS (per tier, hourly/daily)
+# =============================================================================
+# Format: "hourly,daily" — 0 means unlimited
+_QUOTA_FAST = _get_env("TOKEN_QUOTA_FAST", "500000,5000000")
+_QUOTA_STANDARD = _get_env("TOKEN_QUOTA_STANDARD", "200000,2000000")
+_QUOTA_PRO = _get_env("TOKEN_QUOTA_PRO", "100000,1000000")
+
+
+def _parse_quota(raw: str) -> dict:
+    parts = str(raw or "").split(",")
+
+    def _to_int(idx: int) -> int:
+        if idx >= len(parts):
+            return 0
+        txt = str(parts[idx] or "").strip()
+        if not txt:
+            return 0
+        try:
+            return max(0, int(txt))
+        except Exception:
+            return 0
+
+    return {"hourly": _to_int(0), "daily": _to_int(1)}
+
+
+TOKEN_QUOTA_CONFIG = {
+    "fast": _parse_quota(_QUOTA_FAST),
+    "standard": _parse_quota(_QUOTA_STANDARD),
+    "pro": _parse_quota(_QUOTA_PRO),
+}
+
 DEBUG_LOG_SIZE = int(_get_env("DEBUG_LOG_SIZE", "50"))
 DEBUG_MODE = _get_env("DEBUG_MODE", "false").lower() == "true"
+LOG_FORMAT = _get_env("LOG_FORMAT", "text").lower()  # "json" para produção, "text" para dev
 
 # =============================================================================
 # APP METADATA
 # =============================================================================
-APP_VERSION = "7.2.7"
+APP_VERSION = "7.3.0"
 APP_TITLE = "Millennium BCP AI Agent"
 APP_DESCRIPTION = "Agente IA multi-modelo com streaming, exports e integração DevOps"

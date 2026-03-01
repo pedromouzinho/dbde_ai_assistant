@@ -1,0 +1,135 @@
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #EAE4DC;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 1; }
+        }
+        @keyframes tokenFade {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
+
+        /* Message content styling */
+        .msg-content p { margin-bottom: 8px; }
+        .msg-content p:last-child { margin-bottom: 0; }
+        .msg-content strong { font-weight: 600; }
+        .msg-content em { font-style: italic; }
+        .msg-content a {
+            color: #C4284F; text-decoration: none;
+            border-bottom: 1px solid transparent;
+            transition: all 0.2s ease;
+        }
+        .msg-content a:hover { border-bottom-color: #C4284F; color: #9E1D3F; }
+        .msg-content pre {
+            background: #1C1C28; color: #E8E8EC; padding: 16px 20px; border-radius: 12px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+            font-size: 12.5px; overflow-x: auto; margin: 12px 0; line-height: 1.6;
+            white-space: pre-wrap;
+            max-width: calc(100vw - 340px);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .msg-content code {
+            background: rgba(222,49,99,0.07); color: #B0103A; padding: 2px 8px;
+            border-radius: 5px;
+            font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace; font-size: 12.5px;
+        }
+        .msg-content pre code { background: none; color: inherit; padding: 0; }
+
+        /* Table styling */
+        .msg-content .table-wrapper {
+            overflow-x: auto; margin: 14px 0; border-radius: 12px;
+            border: 1px solid rgba(0,0,0,0.08); max-width: calc(100vw - 340px);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+        .msg-content table {
+            border-collapse: collapse; width: 100%; font-size: 13px; min-width: 400px;
+        }
+        .msg-content thead th {
+            background: #1A1A1A; color: white; padding: 11px 16px;
+            text-align: left; font-weight: 600; font-size: 11px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            white-space: nowrap; position: sticky; top: 0;
+        }
+        .msg-content tbody td {
+            padding: 10px 16px; border-bottom: 1px solid rgba(0,0,0,0.05);
+            max-width: 300px; overflow: hidden; text-overflow: ellipsis;
+        }
+        .msg-content tbody tr:nth-child(even) { background: rgba(0,0,0,0.02); }
+        .msg-content tbody tr:hover { background: rgba(222,49,99,0.04); }
+
+        /* Sidebar hover */
+        .sidebar-item { transition: all 0.2s ease; border-radius: 10px; }
+        .sidebar-item:hover { background: rgba(0,0,0,0.04) !important; }
+        .sidebar-item.active { background: rgba(222,49,99,0.08) !important; border-left-color: #DE3163 !important; }
+
+        /* Buttons */
+        .suggestion-btn { transition: all 0.2s ease; }
+        .suggestion-btn:hover {
+            border-color: rgba(222,49,99,0.4) !important;
+            color: #1a1a1a !important;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+        }
+        .export-btn:hover { border-color: #DE3163 !important; color: #DE3163 !important; }
+        .send-btn:disabled { opacity: 0.5; cursor: not-allowed !important; }
+        .send-btn:not(:disabled):hover { transform: scale(1.05); }
+        .del-btn:hover { color: #DE3163 !important; }
+        .new-conv-btn:hover { background: white !important; border-color: #DE3163 !important; color: #DE3163 !important; box-shadow: 0 2px 8px rgba(222,49,99,0.1) !important; }
+        .user-menu-item { display: block; width: 100%; text-align: left; padding: 8px 14px; border: none; background: none; cursor: pointer; font-size: 12px; font-family: 'Montserrat', sans-serif; color: #444; border-radius: 6px; transition: background 0.15s; }
+        .user-menu-item:hover { background: #f5f5f5; }
+        .login-input {
+            width: 100%; padding: 14px 18px; border: 1.5px solid rgba(0,0,0,0.1);
+            border-radius: 12px; font-family: 'Montserrat', sans-serif; font-size: 14px;
+            transition: all 0.2s ease; outline: none; background: #FAFAF8;
+        }
+        .login-input:focus { border-color: #DE3163; background: white; box-shadow: 0 0 0 3px rgba(222,49,99,0.08); }
+        .login-btn {
+            width: 100%; padding: 14px; border: none; border-radius: 12px;
+            background: #1A1A1A; color: white; font-weight: 600; font-size: 14px;
+            cursor: pointer; font-family: 'Montserrat', sans-serif; transition: all 0.25s ease;
+            letter-spacing: 0.3px;
+        }
+        .login-btn:hover:not(:disabled) { background: #333; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Unified selector */
+        .selector-trigger:hover { border-color: #DE3163 !important; color: #DE3163 !important; }
+
+        /* Streaming indicator */
+        .streaming-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #DE3163; animation: pulse 1s infinite; margin-left: 4px; vertical-align: middle; }
+
+        /* Tool badges */
+        .tool-badge {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 3px 10px; border-radius: 20px; font-size: 11px;
+            font-weight: 500; background: rgba(222,49,99,0.06);
+            color: #B0103A; border: 1px solid rgba(222,49,99,0.1);
+        }

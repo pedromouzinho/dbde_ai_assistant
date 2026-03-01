@@ -11,6 +11,7 @@ import uuid
 import asyncio
 import logging
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, AsyncGenerator, Callable, Iterator
@@ -25,9 +26,17 @@ from models import (
     AgentChatRequest, AgentChatResponse, LLMToolCall,
 )
 from llm_provider import (
-    get_provider, llm_with_fallback,
+    get_provider, llm_with_fallback, llm_stream_with_fallback,
     make_assistant_message_from_response,
 )
+from token_counter import (
+    count_messages_tokens,
+    count_tools_tokens,
+    resolve_context_window,
+    RESPONSE_RESERVE_TOKENS,
+)
+from tool_metrics import tool_metrics
+import token_quota as _tq_module
 from learning import get_learned_rules, get_few_shot_examples
 from tool_registry import execute_tool, get_all_tool_definitions
 from tools import (
@@ -42,6 +51,7 @@ from storage import (
     blob_upload_json,
     parse_blob_ref,
 )
+from utils import odata_escape
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -175,10 +185,6 @@ logger = logging.getLogger(__name__)
 _AGENT_LLM_STEP_TIMEOUT_SECONDS = 90.0
 
 
-def _odata_escape(value: str) -> str:
-    return (value or "").replace("'", "''")
-
-
 def _fallback_answer_from_tool_details(tool_details: List[dict]) -> str:
     for detail in reversed(tool_details or []):
         if not isinstance(detail, dict):
@@ -204,6 +210,50 @@ def _fallback_answer_from_tool_details(tool_details: List[dict]) -> str:
         "Consegui executar a pesquisa, mas não consegui gerar o texto final. "
         "Tenta novamente (preferencialmente em Fast) para resposta mais imediata."
     )
+
+
+def _log_fallback_chain_if_needed(response) -> None:
+    chain = getattr(response, "fallback_chain", None)
+    if not isinstance(chain, list) or not chain:
+        return
+    failed = [p for p in chain if isinstance(p, dict) and p.get("status") == "failed"]
+    if failed:
+        logger.warning("[Agent] LLM fallback used: %s", json.dumps(chain, ensure_ascii=False))
+
+
+def _quota_tier_name(tier: Optional[str]) -> str:
+    txt = str(tier or "").strip().lower()
+    return txt if txt in ("fast", "standard", "pro") else "fast"
+
+
+def _check_token_quota(tier: Optional[str], conv_id: str) -> str:
+    mgr = _tq_module.token_quota_manager
+    if not mgr:
+        return ""
+    quota_tier = _quota_tier_name(tier)
+    allowed, reason = mgr.check(quota_tier)
+    if allowed:
+        return ""
+    logger.warning(
+        "[Agent] Token quota exceeded: %s tier=%s conv=%s",
+        reason,
+        quota_tier,
+        conv_id,
+    )
+    return reason or "Token quota exceeded"
+
+
+def _record_token_quota(tier: Optional[str], usage: Dict) -> None:
+    mgr = _tq_module.token_quota_manager
+    if not mgr or not isinstance(usage, dict):
+        return
+    try:
+        total_tokens = int(usage.get("total_tokens", 0) or 0)
+    except Exception:
+        total_tokens = 0
+    if total_tokens <= 0:
+        return
+    mgr.record(_quota_tier_name(tier), total_tokens)
 
 
 def _user_partition_key(user: Optional[dict]) -> str:
@@ -288,7 +338,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
     if current_files:
         return
     try:
-        safe_conv = _odata_escape(conv_id)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
     except Exception as e:
         logger.warning("[Agent] upload index query failed for %s: %s", conv_id, e)
@@ -550,8 +600,8 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
 async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> bool:
     """Tenta carregar conversa do Table Storage. Retorna True se encontrou."""
     try:
-        safe_pk = _odata_escape(partition_key)
-        safe_conv = _odata_escape(conv_id)
+        safe_pk = odata_escape(partition_key)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query(
             "ChatHistory",
             f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -608,7 +658,11 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
 
 
 async def _build_llm_messages(
-    conv_id: str, question: str, request: Optional[AgentChatRequest] = None
+    conv_id: str,
+    question: str,
+    request: Optional[AgentChatRequest] = None,
+    tier: Optional[str] = None,
+    tools_list: Optional[List[dict]] = None,
 ) -> List[dict]:
     """Cópia efémera do histórico + regras + few-shot. Não muta conversations[]."""
     base = conversations[conv_id].copy()
@@ -638,6 +692,27 @@ async def _build_llm_messages(
                     break
             if not replaced:
                 base.append(user_msg)
+
+    tools_tokens = count_tools_tokens(tools_list or [])
+    messages_tokens = count_messages_tokens(base)
+    provider = get_provider(tier)
+    model_name = str(getattr(provider, "deployment", "") or getattr(provider, "model", "") or "")
+    context_window = resolve_context_window(model_name)
+    available = context_window - tools_tokens - messages_tokens - RESPONSE_RESERVE_TOKENS
+    if available < 500:
+        logger.warning(
+            "[Agent] Context budget tight (available=%d, model=%s), trimming history",
+            available,
+            model_name or "unknown",
+        )
+
+    while available < 2000:
+        non_system_indices = [idx for idx, msg in enumerate(base) if msg.get("role") != "system"]
+        if len(non_system_indices) <= 2:
+            break
+        base.pop(non_system_indices[0])
+        messages_tokens = count_messages_tokens(base)
+        available = context_window - tools_tokens - messages_tokens - RESPONSE_RESERVE_TOKENS
 
     return base
 
@@ -917,8 +992,8 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                 "MessageCount": len(compact),
             }
 
-        safe_pk = _odata_escape(partition_key)
-        safe_conv = _odata_escape(conv_id)
+        safe_pk = odata_escape(partition_key)
+        safe_conv = odata_escape(conv_id)
         existing = await table_query(
             "ChatHistory",
             f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -979,10 +1054,45 @@ async def _execute_tool_calls(
         return {}
     
     async def _run(tc: LLMToolCall):
+        started = time.perf_counter()
+        status = "ok"
+        error_msg = ""
         args = tc.arguments
         user_text = _latest_user_text()
-        # Auto-inject file context for US generation
+        # --- Routing guardrail: CSV/Excel uploaded -> never query DevOps ---
         files = _get_uploaded_files(conv_id)
+        if files and tc.name in ("query_workitems", "search_workitems", "compute_kpi", "query_hierarchy"):
+            _file_keywords = ("csv", "excel", "xlsx", "tabela", "ficheiro", "upload", "dados", "coluna",
+                              "linha", "media", "soma", "total", "grafico", "chart", "analise", "analisa")
+            _user_lower = user_text.lower()
+            if any(kw in _user_lower for kw in _file_keywords):
+                logger.info("[Agent] Guardrail: blocked %s — uploaded files present and user references data", tc.name)
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "[ToolCallEvent] %s",
+                    json.dumps(
+                        {
+                            "event": "tool_call_execution",
+                            "conv_id": conv_id,
+                            "user_sub": user_sub or "anon",
+                            "tool": tc.name,
+                            "tool_call_id": tc.id,
+                            "status": "blocked",
+                            "duration_ms": elapsed_ms,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                tool_metrics.record(tc.name, elapsed_ms, "blocked")
+                return tc, {
+                    "error": (
+                        "Existem ficheiros carregados nesta conversa. "
+                        "Para analisar dados do ficheiro, usa analyze_uploaded_table. "
+                        "Para gerar graficos, usa generate_chart com os dados da analise. "
+                        "query_workitems/search_workitems sao para Azure DevOps, nao para ficheiros carregados."
+                    )
+                }
+        # Auto-inject file context for US generation
         if tc.name == "generate_user_stories" and files and not args.get("context"):
             context_blocks = []
             per_file_budget = max(2000, min(12000, 80000 // max(1, len(files))))
@@ -1050,14 +1160,55 @@ async def _execute_tool_calls(
             if _has_explicit_create_confirmation(conv_id):
                 args["confirmed"] = True
             else:
-                return tc, {
+                status = "blocked"
+                result = {
                     "error": (
                         "Confirmação explícita necessária para criar work item. "
                         "Pede ao utilizador para responder 'confirmo' e tenta novamente."
                     )
                 }
-        result = await execute_tool(tc.name, args)
-        return tc, result
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "[ToolCallEvent] %s",
+                    json.dumps(
+                        {
+                            "event": "tool_call_execution",
+                            "conv_id": conv_id,
+                            "user_sub": user_sub or "anon",
+                            "tool": tc.name,
+                            "tool_call_id": tc.id,
+                            "status": status,
+                            "duration_ms": elapsed_ms,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                tool_metrics.record(tc.name, elapsed_ms, "blocked")
+                return tc, result
+        try:
+            result = await execute_tool(tc.name, args)
+            if isinstance(result, dict) and "error" in result:
+                status = "tool_error"
+            return tc, result
+        except Exception as e:
+            status = "exception"
+            error_msg = str(e)
+            raise
+        finally:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            event = {
+                "event": "tool_call_execution",
+                "conv_id": conv_id,
+                "user_sub": user_sub or "anon",
+                "tool": tc.name,
+                "tool_call_id": tc.id,
+                "status": status,
+                "duration_ms": elapsed_ms,
+            }
+            if error_msg:
+                event["error"] = error_msg[:300]
+            logger.info("[ToolCallEvent] %s", json.dumps(event, ensure_ascii=False))
+            tool_metrics.record(tc.name, elapsed_ms, status)
     
     results = await asyncio.gather(
         *[_run(tc) for tc in tool_calls],
@@ -1129,6 +1280,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     has_exportable = False
     export_idx = None
     should_persist = False
+    tool_definitions = get_all_tool_definitions()
 
     async with _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
@@ -1138,84 +1290,108 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
         conversations[conv_id].append({"role": "user", "content": request.question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
-        try:
-            forced_tu, forced_td = await _run_forced_dual_hierarchy(
-                request.question,
-                conv_id,
-                user_sub=str((user or {}).get("sub", "") or ""),
+        quota_reason = _check_token_quota(tier, conv_id)
+        if quota_reason:
+            answer = (
+                f"⚠️ Limite de utilização do tier atingido: {quota_reason}. "
+                "Tenta novamente mais tarde ou muda de tier."
             )
-            if forced_td:
-                tools_used.extend(forced_tu)
-                tool_details.extend(forced_td)
-                batch_start = len(tool_details) - len(forced_td)
-                for local_idx, d in enumerate(forced_td):
-                    if d["result_summary"].get("items_returned", 0) > 0:
-                        has_exportable = True
-                        export_idx = batch_start + local_idx
-
-            # Agent loop
-            ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
-            response = await asyncio.wait_for(
-                llm_with_fallback(
-                    ephemeral, tools=get_all_tool_definitions(), tier=tier,
-                    temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-                ),
-                timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
-            )
-            model_used = response.model
-            total_usage = response.usage
-
-            iteration = 0
-            while response.tool_calls and iteration < AGENT_MAX_ITERATIONS:
-                iteration += 1
-
-                # Add assistant message with tool calls to history
-                conversations[conv_id].append(
-                    make_assistant_message_from_response(response)
-                )
-
-                # Execute tools
-                tu, td = await _execute_tool_calls(
-                    response.tool_calls,
+            conversations[conv_id].append({"role": "assistant", "content": answer})
+            should_persist = True
+        else:
+            try:
+                forced_tu, forced_td = await _run_forced_dual_hierarchy(
+                    request.question,
                     conv_id,
                     user_sub=str((user or {}).get("sub", "") or ""),
                 )
-                tools_used.extend(tu)
-                tool_details.extend(td)
+                if forced_td:
+                    tools_used.extend(forced_tu)
+                    tool_details.extend(forced_td)
+                    batch_start = len(tool_details) - len(forced_td)
+                    for local_idx, d in enumerate(forced_td):
+                        if d["result_summary"].get("items_returned", 0) > 0:
+                            has_exportable = True
+                            export_idx = batch_start + local_idx
 
-                # Check for exportable data
-                batch_start = len(tool_details) - len(td)
-                for local_idx, d in enumerate(td):
-                    if d["result_summary"].get("items_returned", 0) > 0:
-                        has_exportable = True
-                        export_idx = batch_start + local_idx
-
-                # Next LLM call
-                ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
+                # Agent loop
+                ephemeral = await _build_llm_messages(
+                    conv_id,
+                    request.question,
+                    request=request,
+                    tier=tier,
+                    tools_list=tool_definitions,
+                )
                 response = await asyncio.wait_for(
                     llm_with_fallback(
-                        ephemeral, tools=get_all_tool_definitions(), tier=tier,
+                        ephemeral, tools=tool_definitions, tier=tier,
                         temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
                     ),
                     timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
                 )
-                for k, v in response.usage.items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
+                _log_fallback_chain_if_needed(response)
+                model_used = response.model
+                total_usage = response.usage
 
-            answer = response.content or "Não consegui processar a tua pergunta."
-            conversations[conv_id].append({"role": "assistant", "content": answer})
-            should_persist = True
+                iteration = 0
+                while response.tool_calls and iteration < AGENT_MAX_ITERATIONS:
+                    iteration += 1
 
-        except Exception as e:
-            logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
-            answer = f"Erro: {str(e)}"
+                    # Add assistant message with tool calls to history
+                    conversations[conv_id].append(
+                        make_assistant_message_from_response(response)
+                    )
+
+                    # Execute tools
+                    tu, td = await _execute_tool_calls(
+                        response.tool_calls,
+                        conv_id,
+                        user_sub=str((user or {}).get("sub", "") or ""),
+                    )
+                    tools_used.extend(tu)
+                    tool_details.extend(td)
+
+                    # Check for exportable data
+                    batch_start = len(tool_details) - len(td)
+                    for local_idx, d in enumerate(td):
+                        if d["result_summary"].get("items_returned", 0) > 0:
+                            has_exportable = True
+                            export_idx = batch_start + local_idx
+
+                    # Next LLM call
+                    ephemeral = await _build_llm_messages(
+                        conv_id,
+                        request.question,
+                        request=request,
+                        tier=tier,
+                        tools_list=tool_definitions,
+                    )
+                    response = await asyncio.wait_for(
+                        llm_with_fallback(
+                            ephemeral, tools=tool_definitions, tier=tier,
+                            temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                        ),
+                        timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
+                    )
+                    _log_fallback_chain_if_needed(response)
+                    for k, v in response.usage.items():
+                        if isinstance(v, (int, float)):
+                            total_usage[k] = total_usage.get(k, 0) + v
+
+                answer = response.content or "Não consegui processar a tua pergunta."
+                conversations[conv_id].append({"role": "assistant", "content": answer})
+                should_persist = True
+
+            except Exception as e:
+                logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
+                answer = f"Erro: {str(e)}"
 
     if should_persist:
         try:
             await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
         except Exception:
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
+    _record_token_quota(tier, total_usage)
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
     
@@ -1250,6 +1426,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     total_usage = {}
     model_used = ""
     should_persist = False
+    tool_definitions = get_all_tool_definitions()
     
     def _sse(event: dict) -> str:
         return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -1263,6 +1440,25 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
 
         # Emit conversation_id immediately
         yield _sse({"type": "init", "conversation_id": conv_id, "mode": mode})
+
+        quota_reason = _check_token_quota(tier, conv_id)
+        if quota_reason:
+            yield _sse({
+                "type": "error",
+                "text": f"Limite de utilização do tier atingido: {quota_reason}.",
+            })
+            yield _sse({
+                "type": "done",
+                "tools_used": [],
+                "tool_details": [],
+                "has_exportable_data": False,
+                "export_index": None,
+                "tokens_used": {},
+                "total_time_ms": int((datetime.now() - start).total_seconds() * 1000),
+                "model_used": "",
+                "conversation_id": conv_id,
+            })
+            return
 
         try:
             forced_tu, forced_td = await _run_forced_dual_hierarchy(
@@ -1290,14 +1486,21 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
 
                 # Non-streaming call for tool detection
-                ephemeral = await _build_llm_messages(conv_id, request.question, request=request)
+                ephemeral = await _build_llm_messages(
+                    conv_id,
+                    request.question,
+                    request=request,
+                    tier=tier,
+                    tools_list=tool_definitions,
+                )
                 response = await asyncio.wait_for(
                     llm_with_fallback(
-                        ephemeral, tools=get_all_tool_definitions(), tier=tier,
+                        ephemeral, tools=tool_definitions, tier=tier,
                         temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
                     ),
                     timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
                 )
+                _log_fallback_chain_if_needed(response)
                 for k, v in response.usage.items():
                     if isinstance(v, (int, float)):
                         total_usage[k] = total_usage.get(k, 0) + v
@@ -1328,17 +1531,57 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                     # Continue loop for next LLM call
                     need_final_response = True
                 else:
-                    # Final text response — stream it
+                    # Final text response — stream token by token
                     need_final_response = False
 
                     if response.content:
-                        # Evita segunda chamada ao LLM no streaming final.
-                        # Reduz latência e elimina cenário de "a pensar" por retries duplicados.
+                        # Response já obtida via non-streaming (necessário para tool detection).
                         yield _sse({"type": "token", "text": response.content})
                         conversations[conv_id].append({"role": "assistant", "content": response.content})
                         should_persist = True
-                    else:
-                        yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
+                    elif not response.tool_calls:
+                        ttft_start = time.perf_counter()
+                        ttft_logged = False
+                        stream_content = ""
+                        try:
+                            stream_ephemeral = await _build_llm_messages(
+                                conv_id,
+                                request.question,
+                                request=request,
+                                tier=tier,
+                                tools_list=None,
+                            )
+                            async for event in llm_stream_with_fallback(
+                                stream_ephemeral,
+                                tools=None,
+                                tier=tier,
+                                temperature=AGENT_TEMPERATURE,
+                                max_tokens=AGENT_MAX_TOKENS,
+                            ):
+                                if event.type == "token" and event.text:
+                                    if not ttft_logged:
+                                        ttft_ms = int((time.perf_counter() - ttft_start) * 1000)
+                                        logger.info("[Agent] TTFT=%dms conv=%s", ttft_ms, conv_id)
+                                        ttft_logged = True
+                                    stream_content += event.text
+                                    yield _sse({"type": "token", "text": event.text})
+                                elif event.type == "done":
+                                    done_data = event.data or {}
+                                    if isinstance(done_data, dict):
+                                        for k, v in (done_data.get("usage", {}) or {}).items():
+                                            if isinstance(v, (int, float)):
+                                                total_usage[k] = total_usage.get(k, 0) + v
+                        except Exception as stream_err:
+                            logger.warning("[Agent] streaming fallback to static: %s", stream_err)
+                            if not stream_content:
+                                stream_content = "Não consegui processar a tua pergunta."
+                                yield _sse({"type": "token", "text": stream_content})
+
+                        if stream_content:
+                            conversations[conv_id].append({"role": "assistant", "content": stream_content})
+                            should_persist = True
+                        else:
+                            yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
 
             if need_final_response:
                 # Garantir sempre resposta textual quando o loop atinge limite de iterações.
@@ -1355,6 +1598,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
             await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
         except Exception:
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
+    _record_token_quota(tier, total_usage)
     
     total_time = int((datetime.now() - start).total_seconds() * 1000)
     has_exportable = False

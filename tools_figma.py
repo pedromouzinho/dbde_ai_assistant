@@ -19,6 +19,7 @@ _FIGMA_API_BASE = "https://api.figma.com/v1"
 _FIGMA_CACHE_TTL_SECONDS = 300
 _MAX_CACHE_ENTRIES = 200
 _figma_cache = {}
+_http_client: httpx.AsyncClient | None = None
 
 
 def _get_figma_token() -> str:
@@ -52,38 +53,52 @@ def _cache_set(key: str, data):
     _figma_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=25)
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 async def _figma_get(path: str, params=None):
     token = _get_figma_token()
     if not token:
         return {"error": "Integração Figma não configurada (token em falta)"}
     headers = {"X-Figma-Token": token}
     url = f"{_FIGMA_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=25) as client:
-        for attempt in range(1, 4):
-            try:
-                resp = await client.get(url, headers=headers, params=params)
-                if resp.status_code == 429:
-                    wait = min(int(resp.headers.get("Retry-After", "2")), 20)
-                    if attempt == 3:
-                        return {"error": "Figma 429: limite de requests"}
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    if attempt == 3:
-                        return {"error": f"Figma {resp.status_code}: erro servidor"}
-                    await asyncio.sleep(attempt)
-                    continue
-                if resp.status_code >= 400:
-                    return {"error": f"Figma {resp.status_code}: {resp.text[:200]}"}
-                return resp.json()
-            except httpx.TimeoutException:
+    client = _get_http_client()
+    for attempt in range(1, 4):
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After", "2")), 20)
                 if attempt == 3:
-                    return {"error": "Figma timeout"}
-                await asyncio.sleep(attempt)
-            except Exception as e:
+                    return {"error": "Figma 429: limite de requests"}
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code >= 500:
                 if attempt == 3:
-                    return {"error": f"Figma erro: {str(e)}"}
+                    return {"error": f"Figma {resp.status_code}: erro servidor"}
                 await asyncio.sleep(attempt)
+                continue
+            if resp.status_code >= 400:
+                return {"error": f"Figma {resp.status_code}: {resp.text[:200]}"}
+            return resp.json()
+        except httpx.TimeoutException:
+            if attempt == 3:
+                return {"error": "Figma timeout"}
+            await asyncio.sleep(attempt)
+        except Exception as e:
+            if attempt == 3:
+                return {"error": f"Figma erro: {str(e)}"}
+            await asyncio.sleep(attempt)
     return {"error": "Figma erro desconhecido"}
 
 
@@ -338,7 +353,6 @@ async def tool_analyze_figma_flow(
                     else:
                         missing_ids.append(nid)
 
-        # Fallback individual apenas para os ids não resolvidos no batch.
         for nid in missing_ids:
             if nid in nodes_by_id:
                 continue
@@ -485,22 +499,22 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
         return cached
 
     if fk:
-        file_meta = await _figma_get(f"/files/{quote(fk, safe='')}")
-        if "error" in file_meta:
-            return file_meta
-
-        file_name = file_meta.get("name", "")
-        thumbnail_url = file_meta.get("thumbnailUrl", "")
-        last_modified = file_meta.get("lastModified", "")
+        file_name = ""
+        thumbnail_url = ""
+        last_modified = ""
         items = []
 
         if nid:
+            # Fast path: fetch only the requested node and avoid loading full file payload.
             nodes = await _figma_get(
                 f"/files/{quote(fk, safe='')}/nodes",
                 params={"ids": nid},
             )
             if "error" in nodes:
                 return nodes
+            file_name = nodes.get("name", "")
+            thumbnail_url = nodes.get("thumbnailUrl", "")
+            last_modified = nodes.get("lastModified", "")
             raw_nodes = nodes.get("nodes", {})
             for node_key, node_val in raw_nodes.items():
                 document = (node_val or {}).get("document", {})
@@ -519,6 +533,17 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
                         }
                     )
         else:
+            # Use bounded depth to prevent very large responses on large design files.
+            file_meta = await _figma_get(
+                f"/files/{quote(fk, safe='')}",
+                params={"depth": 2},
+            )
+            if "error" in file_meta:
+                return file_meta
+
+            file_name = file_meta.get("name", "")
+            thumbnail_url = file_meta.get("thumbnailUrl", "")
+            last_modified = file_meta.get("lastModified", "")
             doc = file_meta.get("document", {})
             for page in doc.get("children", [])[:50]:
                 page_name = page.get("name", "")
@@ -606,7 +631,6 @@ _SEARCH_FIGMA_DEFINITION = {
     },
 }
 
-
 _ANALYZE_FIGMA_FLOW_DEFINITION = {
     "type": "function",
     "function": {
@@ -652,6 +676,3 @@ def _register_figma_tool() -> None:
         logging.info("[Figma] search_figma e analyze_figma_flow registadas")
     else:
         logging.warning("[Figma] search_figma e analyze_figma_flow registadas sem token (erro controlado)")
-
-
-_register_figma_tool()

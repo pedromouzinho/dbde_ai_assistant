@@ -15,7 +15,8 @@ from config import (
     API_VERSION_SEARCH,
 )
 from storage import table_query
-from tools import get_embedding, _search_request_with_retry
+from tools_knowledge import get_embedding
+from http_helpers import search_request_with_retry
 
 _prompt_rules_cache: Dict = {"rules": [], "last_refresh": None}
 _few_shot_cache: Dict = {}  # key: question_hash -> {"result": str, "ts": datetime}
@@ -53,7 +54,7 @@ async def _search_examples_semantic(embedding, filter_expr="", top=3):
         if filter_expr:
             body["filter"] = filter_expr
 
-        data = await _search_request_with_retry(
+        data = await search_request_with_retry(
             url=url,
             headers={"api-key": SEARCH_KEY, "Content-Type": "application/json"},
             json_body=body,

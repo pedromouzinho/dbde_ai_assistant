@@ -17,6 +17,7 @@ _MIRO_API_BASE = "https://api.miro.com/v2"
 _MIRO_CACHE_TTL_SECONDS = 300
 _MAX_CACHE_ENTRIES = 200
 _miro_cache = {}
+_http_client: httpx.AsyncClient | None = None
 
 
 def _get_miro_token() -> str:
@@ -50,38 +51,52 @@ def _cache_set(key: str, data):
     _miro_cache[key] = {"ts": datetime.now(timezone.utc), "data": data}
 
 
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=25)
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 async def _miro_get(path: str, params=None):
     token = _get_miro_token()
     if not token:
         return {"error": "Integração Miro não configurada (token em falta)"}
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{_MIRO_API_BASE}{path}"
-    async with httpx.AsyncClient(timeout=25) as client:
-        for attempt in range(1, 4):
-            try:
-                resp = await client.get(url, headers=headers, params=params)
-                if resp.status_code == 429:
-                    wait = min(int(resp.headers.get("Retry-After", "2")), 20)
-                    if attempt == 3:
-                        return {"error": "Miro 429: limite de requests"}
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    if attempt == 3:
-                        return {"error": f"Miro {resp.status_code}: erro servidor"}
-                    await asyncio.sleep(attempt)
-                    continue
-                if resp.status_code >= 400:
-                    return {"error": f"Miro {resp.status_code}: {resp.text[:200]}"}
-                return resp.json()
-            except httpx.TimeoutException:
+    client = _get_http_client()
+    for attempt in range(1, 4):
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After", "2")), 20)
                 if attempt == 3:
-                    return {"error": "Miro timeout"}
-                await asyncio.sleep(attempt)
-            except Exception as e:
+                    return {"error": "Miro 429: limite de requests"}
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code >= 500:
                 if attempt == 3:
-                    return {"error": f"Miro erro: {str(e)}"}
+                    return {"error": f"Miro {resp.status_code}: erro servidor"}
                 await asyncio.sleep(attempt)
+                continue
+            if resp.status_code >= 400:
+                return {"error": f"Miro {resp.status_code}: {resp.text[:200]}"}
+            return resp.json()
+        except httpx.TimeoutException:
+            if attempt == 3:
+                return {"error": "Miro timeout"}
+            await asyncio.sleep(attempt)
+        except Exception as e:
+            if attempt == 3:
+                return {"error": f"Miro erro: {str(e)}"}
+            await asyncio.sleep(attempt)
     return {"error": "Miro erro desconhecido"}
 
 
@@ -222,6 +237,3 @@ def _register_miro_tool() -> None:
         logging.info("[Miro] search_miro registada")
     else:
         logging.warning("[Miro] search_miro registada sem token (vai devolver erro controlado)")
-
-
-_register_miro_tool()

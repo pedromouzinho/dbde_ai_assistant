@@ -12,7 +12,8 @@ import logging
 import html as html_lib
 import os
 import re
-from datetime import datetime
+import zipfile
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from urllib.parse import urlparse
 
@@ -296,6 +297,7 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     
     # Subtitle
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    # Local time intentional for user-facing display.
     sub = ws.cell(row=2, column=1, value=f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: {tool_result.get('total_count', len(rows))} registos")
     sub.font = Font(size=9, color="666666", italic=True)
     
@@ -330,6 +332,114 @@ def to_xlsx(tool_result: dict, title: str = "Export", filename: str = "export.xl
     return buf
 
 
+def _fallback_docx_from_lines(lines: List[str]) -> io.BytesIO:
+    """Gera DOCX mínimo sem dependências externas (fallback)."""
+    def _xml_escape(value: str) -> str:
+        return html_lib.escape(str(value or ""), quote=False)
+
+    body_xml = "".join(
+        f"<w:p><w:r><w:t>{_xml_escape(line)}</w:t></w:r></w:p>"
+        for line in lines
+    )
+    if not body_xml:
+        body_xml = "<w:p><w:r><w:t>Sem dados para exportar.</w:t></w:r></w:p>"
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
+        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+        'xmlns:o="urn:schemas-microsoft-com:office:office" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
+        'xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
+        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
+        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
+        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+        'mc:Ignorable="w14 wp14">'
+        f"<w:body>{body_xml}<w:sectPr/></w:body></w:document>"
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        '</Relationships>'
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+    )
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/_rels/document.xml.rels", doc_rels)
+    out.seek(0)
+    return out
+
+
+def to_docx(tool_result: dict, title: str = "Export", filename: str = "export.docx") -> io.BytesIO:
+    """Gera DOCX com branding e tabela simples."""
+    headers, rows = extract_table_data(tool_result)
+    generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
+    total = tool_result.get("total_count", len(rows))
+
+    try:
+        from docx import Document
+
+        doc = Document()
+        doc.add_heading(f"{EXPORT_AGENT_NAME} — {title}", level=1)
+        doc.add_paragraph(f"Gerado em {generated_at} | Total: {total} registos")
+
+        if headers:
+            table = doc.add_table(rows=1, cols=len(headers))
+            table.style = "Table Grid"
+            hdr_cells = table.rows[0].cells
+            for idx, header in enumerate(headers):
+                run = hdr_cells[idx].paragraphs[0].add_run(_clean_header(header))
+                run.bold = True
+            for row in rows:
+                row_cells = table.add_row().cells
+                for idx, val in enumerate(row):
+                    row_cells[idx].text = str(val)
+        else:
+            doc.add_paragraph("Sem dados para exportar.")
+
+        doc.add_paragraph(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}")
+        out = io.BytesIO()
+        doc.save(out)
+        out.seek(0)
+        return out
+    except Exception as e:
+        logging.warning("[ExportEngine] to_docx fallback ativo: %s", e)
+        lines = [f"{EXPORT_AGENT_NAME} — {title}", f"Gerado em {generated_at} | Total: {total} registos"]
+        if headers and rows:
+            lines.append(" | ".join(_clean_header(h) for h in headers))
+            lines.extend(" | ".join(str(v) for v in row) for row in rows)
+        else:
+            lines.append("Sem dados para exportar.")
+        lines.append(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}")
+        return _fallback_docx_from_lines(lines)
+
+
 # =============================================================================
 # PDF EXPORT (fpdf2)
 # =============================================================================
@@ -338,6 +448,7 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
     """Gera PDF com tabela de dados."""
     try:
         from fpdf import FPDF
+        from fpdf.enums import XPos, YPos
     except ImportError:
         # Fallback
         buf = io.BytesIO()
@@ -352,16 +463,17 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         pdf.add_page('L')  # Landscape for tables
         pdf.set_auto_page_break(auto=True, margin=15)
         font_family = _configure_pdf_font(pdf)
-        cerise_rgb = _hex_to_rgb("#DE3163", (222, 49, 99))
+        cerise_rgb = _hex_to_rgb(str(EXPORT_BRAND_COLOR or "#DE3163"), (222, 49, 99))
 
         # Title
         pdf.set_font(font_family, 'B', 16)
         pdf.set_text_color(*cerise_rgb)
-        pdf.cell(0, 10, _latin1_safe(title, 160), ln=True)
+        pdf.cell(0, 10, _latin1_safe(title, 160), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         # Subtitle
         pdf.set_font(font_family, '', 9)
         pdf.set_text_color(100, 100, 100)
+        # Local time intentional for user-facing display.
         pdf.multi_cell(0, 5, _latin1_safe(f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | {EXPORT_AGENT_NAME}"))
         if summary:
             pdf.set_font(font_family, 'I', 8.5)
@@ -451,7 +563,13 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         pdf.ln(10)
         pdf.set_font(font_family, 'I', 8)
         pdf.set_text_color(150, 150, 150)
-        pdf.cell(0, 5, _latin1_safe(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}"), ln=True)
+        pdf.cell(
+            0,
+            5,
+            _latin1_safe(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}"),
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
 
         buf = io.BytesIO()
         pdf.output(buf)
@@ -462,7 +580,13 @@ def to_pdf(tool_result: dict, title: str = "Export", summary: str = "") -> io.By
         pdf_fallback = FPDF()
         pdf_fallback.add_page()
         pdf_fallback.set_font('Helvetica', '', 12)
-        pdf_fallback.cell(0, 10, "Erro ao gerar PDF. Tenta CSV ou XLSX.", ln=True)
+        pdf_fallback.cell(
+            0,
+            10,
+            "Erro ao gerar PDF. Tenta CSV ou XLSX.",
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
         buf = io.BytesIO()
         pdf_fallback.output(buf)
         buf.seek(0)
@@ -512,6 +636,7 @@ def to_svg_bar_chart(tool_result: dict, title: str = "Chart") -> str:
         y += bar_h
     
     # Footer
+    # Local time intentional for user-facing display.
     svg.append(f'<text x="{chart_w//2}" y="{total_h - 10}" text-anchor="middle" font-size="9" fill="#999">{EXPORT_AGENT_NAME} | {datetime.now().strftime("%d/%m/%Y")}</text>')
     svg.append('</svg>')
     
@@ -528,6 +653,7 @@ def to_html_report(tool_result: dict, title: str = "Relatório", summary: str = 
     safe_title = html_lib.escape(str(title or "Relatório"))
     safe_summary = html_lib.escape(str(summary or ""))
     total_count = html_lib.escape(str(tool_result.get('total_count', len(rows))))
+    # Local time intentional for user-facing display.
     generated_at = html_lib.escape(datetime.now().strftime('%d/%m/%Y %H:%M'))
     
     html = f"""<!DOCTYPE html>
@@ -585,3 +711,118 @@ a {{ color: {html_lib.escape(EXPORT_BRAND_COLOR)}; text-decoration: none; }}
     
     html += f'\n<div class="footer">{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}</div>\n</body></html>'
     return html
+
+
+def to_html(tool_result: dict, title: str = "Export") -> io.BytesIO:
+    """Gera HTML em BytesIO para paridade com to_csv/to_xlsx/to_pdf/to_docx."""
+    html_str = to_html_report(tool_result, title=title)
+    buf = io.BytesIO()
+    buf.write(html_str.encode("utf-8"))
+    buf.seek(0)
+    return buf
+
+
+# =============================================================================
+# CHAT PDF EXPORT (fpdf2) — substitui weasyprint
+# =============================================================================
+
+def to_chat_pdf(messages: list, title: str = "Chat Export") -> bytes:
+    """Gera PDF de conversa de chat com fpdf2. Substitui weasyprint.
+
+    Args:
+        messages: lista de dicts com 'role' e 'content'.
+        title: titulo do export.
+    Returns:
+        bytes do PDF gerado.
+    """
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise RuntimeError("fpdf2 required for chat PDF export")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    font_family = _configure_pdf_font(pdf)
+    cerise_rgb = _hex_to_rgb(str(EXPORT_BRAND_COLOR or "#DE3163"), (222, 49, 99))
+
+    pdf.add_page()
+
+    # --- Header ---
+    pdf.set_font(font_family, "B", 16)
+    pdf.set_text_color(*cerise_rgb)
+    pdf.cell(0, 10, _latin1_safe(title, 120), ln=True)
+
+    pdf.set_font(font_family, "", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(
+        0, 5,
+        _latin1_safe(f"Exportado em {datetime.now().strftime('%d/%m/%Y %H:%M')} | {EXPORT_AGENT_NAME}"),
+        ln=True,
+    )
+    pdf.ln(6)
+
+    # --- Messages ---
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+
+    for msg in messages:
+        role = str(msg.get("role", "user")).strip().lower()
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+
+        # Role label
+        if role == "assistant":
+            label = "Assistente"
+            label_rgb = cerise_rgb
+        elif role == "system":
+            label = "Sistema"
+            label_rgb = (100, 100, 100)
+        else:
+            label = "Utilizador"
+            label_rgb = (50, 50, 50)
+
+        # Check page space — add page if < 30mm left
+        if pdf.get_y() > pdf.h - 30:
+            pdf.add_page()
+
+        # Role badge
+        pdf.set_font(font_family, "B", 9)
+        pdf.set_text_color(*label_rgb)
+        pdf.cell(0, 5, _latin1_safe(label), ln=True)
+
+        # Content
+        pdf.set_font(font_family, "", 9)
+        pdf.set_text_color(30, 30, 30)
+
+        safe_content = _latin1_safe(content, 20000)
+        for paragraph in safe_content.split("\n"):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                pdf.ln(2)
+                continue
+            try:
+                pdf.multi_cell(page_w, 4.5, paragraph)
+            except Exception:
+                # Fallback for problematic text
+                pdf.cell(0, 4.5, paragraph[:500], ln=True)
+
+        # Separator line
+        pdf.ln(3)
+        y = pdf.get_y()
+        pdf.set_draw_color(220, 220, 220)
+        pdf.line(pdf.l_margin, y, pdf.l_margin + page_w, y)
+        pdf.ln(4)
+
+    # --- Footer ---
+    pdf.ln(5)
+    pdf.set_font(font_family, "I", 8)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(
+        0, 5,
+        _latin1_safe(f"{EXPORT_BRAND_NAME} | {EXPORT_AGENT_NAME} v{APP_VERSION}"),
+        ln=True,
+    )
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()

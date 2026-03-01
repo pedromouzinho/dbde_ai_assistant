@@ -7,6 +7,7 @@
 
 import io
 import json
+import html
 import base64
 import zipfile
 import os
@@ -16,18 +17,48 @@ import logging
 import traceback
 import re
 import hashlib
+import time
+import contextlib
 from pathlib import Path
-from collections import deque
+from collections import deque, OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, Tuple
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
+from fastapi.staticfiles import StaticFiles
+
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+def configure_logging(log_format: str = "text") -> None:
+    handler = logging.StreamHandler()
+    if str(log_format or "text").strip().lower() == "json":
+        handler.setFormatter(JSONFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+
+
+# Bootstrap logging before optional imports that may emit warnings.
+configure_logging(
+    (os.getenv("LOG_FORMAT") or os.getenv("APPSETTING_LOG_FORMAT") or "text").strip().lower()
+)
 
 _pptx_import_traceback = ""
 
@@ -43,14 +74,15 @@ except Exception:
 
 from config import (
     APP_VERSION, APP_TITLE, APP_DESCRIPTION,
+    AZURE_OPENAI_KEY,
     DEVOPS_INDEX, OMNI_INDEX, EXAMPLES_INDEX,
     DEVOPS_ORG, DEVOPS_PROJECT,
     SEARCH_SERVICE, SEARCH_KEY, API_VERSION_SEARCH,
-    LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO,
+    LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO, LLM_TIER_VISION, VISION_ENABLED,
     MODEL_ROUTER_ENABLED, MODEL_ROUTER_SPEC, MODEL_ROUTER_TARGET_TIERS, MODEL_ROUTER_NON_PROD_ONLY,
     IS_PRODUCTION,
     RERANK_ENABLED, RERANK_MODEL, RERANK_ENDPOINT, RERANK_TOP_N, RERANK_AUTH_MODE,
-    ALLOWED_ORIGINS, DEBUG_MODE,
+    ALLOWED_ORIGINS, DEBUG_MODE, LOG_FORMAT,
     AUTH_COOKIE_NAME, AUTH_COOKIE_SECURE, AUTH_COOKIE_MAX_AGE_SECONDS,
     UPLOAD_MAX_FILES_PER_CONVERSATION, UPLOAD_MAX_FILE_BYTES,
     UPLOAD_MAX_CONCURRENT_JOBS, UPLOAD_MAX_PENDING_JOBS_PER_USER,
@@ -64,12 +96,15 @@ from config import (
     EXPORT_AUTO_ASYNC_ENABLED, EXPORT_ASYNC_THRESHOLD_ROWS, EXPORT_MAX_CONCURRENT_JOBS,
     EXPORT_JOB_STALE_SECONDS, EXPORT_INLINE_WORKER_ENABLED, EXPORT_WORKER_POLL_SECONDS,
     EXPORT_WORKER_BATCH_SIZE,
+    EXPORT_BRAND_COLOR, EXPORT_BRAND_NAME, EXPORT_AGENT_NAME,
+    STARTUP_FAIL_FAST, TOKEN_QUOTA_CONFIG,
 )
 from models import (
     AgentChatRequest, AgentChatResponse,
     LoginRequest, CreateUserRequest, ChangePasswordRequest,
     FeedbackRequest, ExportRequest, SaveChatRequest,
     ModeSwitchRequest, ModeSwitchResponse,
+    ClientErrorReport,
 )
 from auth import (
     get_current_user, jwt_encode, jwt_decode, hash_password, verify_password,
@@ -85,8 +120,12 @@ from storage import (
 from tools import (
     get_embedding, get_devops_debug_log, get_generated_file,
     _store_generated_file,
-    _devops_request_with_retry, _devops_url, _devops_headers,
+    _devops_url, _devops_headers,
 )
+from http_helpers import devops_request_with_retry as _devops_request_with_retry
+from tools_knowledge import _close_http_client as _close_knowledge_client
+from tools_figma import _close_http_client as _close_figma_client
+from tools_miro import _close_http_client as _close_miro_client
 from tool_registry import get_registered_tool_names
 from learning import invalidate_prompt_rules_cache
 from agent import (
@@ -95,7 +134,13 @@ from agent import (
     switch_conversation_mode,
 )
 from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_report
-from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
+from llm_provider import llm_simple, get_debug_log as get_llm_debug_log, close_all_providers
+from rate_limit_storage import TableStorageRateLimit
+from job_store import PersistentJobStore
+from utils import odata_escape, safe_blob_component, create_logged_task
+from tool_metrics import tool_metrics
+import token_quota as _tq_module
+from token_quota import TokenQuotaManager
 
 # =============================================================================
 # APP SETUP
@@ -104,8 +149,12 @@ from llm_provider import llm_simple, get_debug_log as get_llm_debug_log
 security = HTTPBearer(auto_error=False)
 _allowed_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 _allowed_origins_set = set(_allowed_origins)
+_AUTH_EXEMPT_PATHS = {"/health", "/api/info", "/api/client-error", "/docs", "/openapi.json", "/redoc"}
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
+WORKER_RUN_DIR = os.getenv("WORKER_RUN_DIR", "/home/site/wwwroot/run")
+UPLOAD_WORKER_PID_FILE = os.getenv("UPLOAD_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/upload-worker.pid")
+EXPORT_WORKER_PID_FILE = os.getenv("EXPORT_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/export-worker.pid")
 _inline_worker_task: Optional[asyncio.Task] = None
 _inline_export_worker_task: Optional[asyncio.Task] = None
 
@@ -146,21 +195,88 @@ def _user_or_ip_rate_key(request: Request) -> str:
     return f"ip:{_client_ip(request)}"
 
 
-def _retry_after_from_limit_detail(exc: RateLimitExceeded) -> int:
-    detail = str(getattr(exc, "detail", "") or "")
-    m = re.search(r"per\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", detail, re.IGNORECASE)
-    if not m:
-        return 60
-    qty = int(m.group(1))
-    unit = m.group(2).lower()
-    factor = 1
-    if unit.startswith("minute"):
-        factor = 60
-    elif unit.startswith("hour"):
-        factor = 3600
-    elif unit.startswith("day"):
-        factor = 86400
-    return max(1, qty * factor)
+@dataclass(frozen=True)
+class _RateLimitRule:
+    max_requests: int
+    window_seconds: int
+    key_func: Callable[[Request], str]
+    scope: Optional[str] = None
+
+
+class _DecoratorRateLimiter:
+    """Compat layer para manter @limiter.limit e @limiter.shared_limit."""
+
+    def __init__(self, key_func: Callable[[Request], str]):
+        self._default_key_func = key_func
+
+    @staticmethod
+    def _parse_limit(limit_spec: str) -> Tuple[int, int]:
+        text = str(limit_spec or "").strip().lower()
+        match = re.fullmatch(r"(\d+)\s*/\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
+        if not match:
+            raise ValueError(f"Rate limit inválido: {limit_spec}")
+        amount = int(match.group(1))
+        unit = match.group(2)
+        factor = 1
+        if unit.startswith("minute"):
+            factor = 60
+        elif unit.startswith("hour"):
+            factor = 3600
+        elif unit.startswith("day"):
+            factor = 86400
+        return amount, factor
+
+    def limit(self, limit_spec: str, key_func: Optional[Callable[[Request], str]] = None):
+        max_requests, window_seconds = self._parse_limit(limit_spec)
+        resolved_key_func = key_func or self._default_key_func
+
+        def decorator(fn):
+            setattr(
+                fn,
+                "__dbde_rate_limit__",
+                _RateLimitRule(
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    key_func=resolved_key_func,
+                    scope=None,
+                ),
+            )
+            return fn
+
+        return decorator
+
+    def shared_limit(
+        self,
+        limit_spec: str,
+        scope: str,
+        key_func: Optional[Callable[[Request], str]] = None,
+    ):
+        max_requests, window_seconds = self._parse_limit(limit_spec)
+        resolved_key_func = key_func or self._default_key_func
+        shared_scope = str(scope or "").strip()
+
+        def decorator(fn):
+            setattr(
+                fn,
+                "__dbde_rate_limit__",
+                _RateLimitRule(
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    key_func=resolved_key_func,
+                    scope=shared_scope if shared_scope else None,
+                ),
+            )
+            return fn
+
+        return decorator
+
+    @staticmethod
+    def resolve(request: Request) -> Optional[_RateLimitRule]:
+        route = request.scope.get("route")
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:
+            return None
+        return getattr(endpoint, "__dbde_rate_limit__", None)
 
 
 def _request_is_https(request: Request) -> bool:
@@ -168,44 +284,106 @@ def _request_is_https(request: Request) -> bool:
     return request.url.scheme == "https" or proto == "https"
 
 
-limiter = Limiter(key_func=_user_or_ip_rate_key, default_limits=[])
+_rate_limiter_backend = TableStorageRateLimit()
+_last_rate_cache_cleanup = 0.0
+limiter = _DecoratorRateLimiter(key_func=_user_or_ip_rate_key)
 
-app = FastAPI(title=APP_TITLE, version=APP_VERSION, description=APP_DESCRIPTION)
+@contextlib.asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
+
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    description=APP_DESCRIPTION,
+    lifespan=lifespan,
+)
 app.state.limiter = limiter
+_static_dir = Path(__file__).resolve().parent / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins, allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
 
 http_client: Optional[httpx.AsyncClient] = None
-
-
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
-    retry_after = _retry_after_from_limit_detail(exc)
-    return JSONResponse(
-        status_code=429,
-        content={"detail": f"Limite de pedidos excedido. Tenta novamente em {retry_after} segundos."},
-        headers={"Retry-After": str(retry_after)},
-    )
+MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
 
 
 @app.middleware("http")
 async def enforce_allowed_origins(request: Request, call_next):
+    global _last_rate_cache_cleanup
+    req_path = str(request.url.path or "").strip()
+    is_exempt_path = req_path in _AUTH_EXEMPT_PATHS or req_path.startswith("/health")
+
     token_ref = set_request_cookie_token((request.cookies.get(AUTH_COOKIE_NAME) or "").strip())
     try:
-        origin = request.headers.get("origin")
-        if origin and _allowed_origins_set and origin not in _allowed_origins_set:
-            return JSONResponse(status_code=403, content={"detail": "Origin não permitida"})
-        return await call_next(request)
+        content_length = (request.headers.get("content-length") or "").strip()
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": f"Payload demasiado grande (máximo {MAX_REQUEST_BODY_BYTES} bytes)"},
+                    )
+            except ValueError:
+                pass
+
+        if not is_exempt_path:
+            origin = request.headers.get("origin")
+            if origin and _allowed_origins_set and origin not in _allowed_origins_set:
+                return JSONResponse(status_code=403, content={"detail": "Origin não permitida"})
+
+        now = time.time()
+        if now - _last_rate_cache_cleanup > 60:
+            _rate_limiter_backend.cleanup_local_cache()
+            _last_rate_cache_cleanup = now
+
+        rule = limiter.resolve(request)
+        if rule:
+            route = request.scope.get("route")
+            route_template = str(getattr(route, "path", request.url.path) or request.url.path)
+            scope = rule.scope or f"route:{route_template}"
+            rate_key = f"{scope}:{rule.key_func(request)}"
+            limited = await _rate_limiter_backend.is_rate_limited(
+                key=rate_key,
+                limit=rule.max_requests,
+                window_seconds=rule.window_seconds,
+            )
+            if limited:
+                retry_after = max(1, int(rule.window_seconds))
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": f"Limite de pedidos excedido. Tenta novamente em {retry_after} segundos."},
+                    headers={"Retry-After": str(retry_after)},
+                )
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.plot.ly https://fonts.googleapis.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self';",
+        )
+        if _request_is_https(request):
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
     finally:
         reset_request_cookie_token(token_ref)
-
-
-def _odata_escape(value: Optional[str]) -> str:
-    """Escapa valor para uso seguro em filtros OData."""
-    return str(value or "").replace("'", "''")
 
 
 def _file_sha256(path: Path) -> str:
@@ -219,12 +397,25 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _safe_blob_component(raw: str, max_len: int = 120) -> str:
-    txt = (raw or "").strip()
-    safe = "".join(c if c.isalnum() or c in "._- " else "_" for c in txt).strip().replace(" ", "_")
-    if not safe:
-        safe = "file"
-    return safe[:max_len]
+def _load_pid_from_file(path: str) -> Optional[int]:
+    try:
+        txt = Path(path).read_text(encoding="utf-8").strip()
+        if not txt:
+            return None
+        pid = int(txt)
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _is_process_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
 
 
 def _chat_partition_key_for_user(user: Optional[dict]) -> str:
@@ -234,8 +425,8 @@ def _chat_partition_key_for_user(user: Optional[dict]) -> str:
 
 
 async def _load_conversation_messages_for_export(conv_id: str, user: Optional[dict]) -> List[dict]:
-    safe_conv = _odata_escape(conv_id)
-    safe_pk = _odata_escape(_chat_partition_key_for_user(user))
+    safe_conv = odata_escape(conv_id)
+    safe_pk = odata_escape(_chat_partition_key_for_user(user))
     rows = await table_query(
         "ChatHistory",
         f"PartitionKey eq '{safe_pk}' and RowKey eq '{safe_conv}'",
@@ -251,150 +442,17 @@ async def _load_conversation_messages_for_export(conv_id: str, user: Optional[di
     return parsed if isinstance(parsed, list) else []
 
 
-def _normalize_export_blob_refs(export_request: ExportRequest) -> List[str]:
-    refs: List[str] = []
-    seen = set()
-
-    def _append(raw: Any) -> None:
-        ref = str(raw or "").strip()
-        if not ref or ref in seen:
-            return
-        refs.append(ref)
-        seen.add(ref)
-
-    blob_refs = getattr(export_request, "result_blob_refs", None) or []
-    for ref in blob_refs:
-        _append(ref)
-    _append(getattr(export_request, "result_blob_ref", None))
-    return refs
-
-
-async def _load_export_payload_from_blob_ref(blob_ref: str) -> Optional[dict]:
-    ref = str(blob_ref or "").strip()
-    if not ref:
-        return None
-    container, blob_name = parse_blob_ref(ref)
-    if not container or not blob_name:
-        return None
-    try:
-        payload = await blob_download_json(container, blob_name)
-    except Exception as e:
-        logger.warning("[Export] blob load failed (%s): %s", ref, e)
-        return None
-    if isinstance(payload, dict) and payload:
-        return payload
-    return None
-
-
-def _payload_rows_for_merge(payload: dict) -> tuple[str, List[Any]]:
-    if not isinstance(payload, dict):
-        return "", []
-    if isinstance(payload.get("items"), list):
-        return "items", payload.get("items") or []
-    if isinstance(payload.get("analysis_data"), list):
-        return "analysis_data", payload.get("analysis_data") or []
-    if isinstance(payload.get("groups"), list):
-        return "groups", payload.get("groups") or []
-    if isinstance(payload.get("timeline"), list):
-        return "timeline", payload.get("timeline") or []
-    return "", []
-
-
-def _normalize_row_for_merge(raw_row: Any) -> Dict[str, Any]:
-    if isinstance(raw_row, dict):
-        return dict(raw_row)
-    if isinstance(raw_row, list):
-        return {f"col_{idx + 1}": val for idx, val in enumerate(raw_row)}
-    return {"value": raw_row if raw_row is not None else ""}
-
-
-def _combine_export_payloads(payloads: List[dict]) -> Optional[dict]:
-    valid_payloads = [p for p in (payloads or []) if isinstance(p, dict) and p]
-    if not valid_payloads:
-        return None
-    if len(valid_payloads) == 1:
-        return valid_payloads[0]
-
-    sources: List[Dict[str, Any]] = []
-    for idx, payload in enumerate(valid_payloads):
-        _, raw_rows = _payload_rows_for_merge(payload)
-        if not raw_rows:
-            continue
-        normalized_rows = [_normalize_row_for_merge(r) for r in raw_rows]
-        section = str(
-            payload.get("section")
-            or payload.get("title")
-            or payload.get("name")
-            or payload.get("query_name")
-            or f"Tabela {idx + 1}"
-        )
-        sources.append({"section": section, "rows": normalized_rows, "payload": payload})
-
-    if len(sources) == 0:
-        return valid_payloads[0]
-    if len(sources) == 1:
-        single_payload = sources[0].get("payload")
-        return single_payload if isinstance(single_payload, dict) and single_payload else valid_payloads[0]
-
-    signatures: List[str] = []
-    all_columns: List[str] = []
-    all_columns_seen = set()
-    for src in sources:
-        row_columns: List[str] = []
-        row_columns_seen = set()
-        for row in src["rows"]:
-            for key in row.keys():
-                key_txt = str(key)
-                if key_txt not in row_columns_seen:
-                    row_columns_seen.add(key_txt)
-                    row_columns.append(key_txt)
-                if key_txt not in all_columns_seen:
-                    all_columns_seen.add(key_txt)
-                    all_columns.append(key_txt)
-        signatures.append("|".join(row_columns))
-
-    same_columns = len(set(signatures)) <= 1
-    merged_rows: List[Dict[str, Any]] = []
-    if same_columns:
-        for src in sources:
-            merged_rows.extend(src["rows"])
-    else:
-        for src in sources:
-            for row in src["rows"]:
-                normalized = {"section": src["section"]}
-                for col in all_columns:
-                    normalized[col] = row.get(col, "")
-                merged_rows.append(normalized)
-
-    merged = dict(valid_payloads[0])
-    merged["items"] = merged_rows
-    merged["total_count"] = len(merged_rows)
-    merged["_combined_payloads"] = len(sources)
-    merged["_combined_strategy"] = "concat_same_columns" if same_columns else "union_with_section"
-    return merged
-
-
-def _combined_payload_count(payload: Optional[dict]) -> int:
-    if not isinstance(payload, dict):
-        return 0
-    try:
-        n = int(payload.get("_combined_payloads", 0) or 0)
-    except Exception:
-        n = 0
-    if n > 0:
-        return n
-    key, rows = _payload_rows_for_merge(payload)
-    if key and isinstance(rows, list) and rows:
-        return 1
-    return 0
-
-
 async def _extract_export_data_from_tool_message(tool_msg: dict) -> Optional[dict]:
     blob_ref = str(tool_msg.get("result_blob_ref", "") or "").strip()
     if blob_ref:
-        payload = await _load_export_payload_from_blob_ref(blob_ref)
-        if payload:
-            return payload
+        container, blob_name = parse_blob_ref(blob_ref)
+        if container and blob_name:
+            try:
+                payload = await blob_download_json(container, blob_name)
+                if isinstance(payload, dict) and payload:
+                    return payload
+            except Exception as e:
+                logger.warning("[Export] blob load failed (%s): %s", blob_ref, e)
 
     raw_content = tool_msg.get("content", "")
     if isinstance(raw_content, str):
@@ -430,35 +488,19 @@ def _export_rows_count(data: dict) -> int:
 async def _resolve_export_payload(export_request: ExportRequest, user: dict) -> dict:
     data = None
 
-    blob_refs = _normalize_export_blob_refs(export_request)
-    blob_data = None
-    blob_sources = 0
-    loaded_payloads: List[dict] = []
-    if blob_refs:
-        for blob_ref in blob_refs:
-            payload = await _load_export_payload_from_blob_ref(blob_ref)
-            if payload:
-                loaded_payloads.append(payload)
-        blob_sources = len(loaded_payloads)
-        blob_data = _combine_export_payloads(loaded_payloads)
+    blob_ref = str(export_request.result_blob_ref or "").strip()
+    if blob_ref:
+        container, blob_name = parse_blob_ref(blob_ref)
+        if container and blob_name:
+            try:
+                payload = await blob_download_json(container, blob_name)
+                if isinstance(payload, dict) and payload:
+                    data = payload
+            except Exception as e:
+                logger.warning("[Export] explicit blob load failed (%s): %s", blob_ref, e)
 
-    request_data = export_request.data if isinstance(export_request.data, dict) and export_request.data else None
-    if blob_data is not None and request_data is not None:
-        request_sources = _combined_payload_count(request_data)
-        merged_candidate = _combine_export_payloads([*loaded_payloads, request_data])
-        merged_sources = _combined_payload_count(merged_candidate)
-        if merged_candidate is not None and merged_sources > max(blob_sources, request_sources):
-            data = merged_candidate
-        elif request_sources > blob_sources:
-            data = request_data
-        elif blob_sources > request_sources:
-            data = blob_data
-        else:
-            data = request_data if _export_rows_count(request_data) >= _export_rows_count(blob_data) else blob_data
-    elif blob_data is not None:
-        data = blob_data
-    elif request_data is not None:
-        data = request_data
+    if data is None and isinstance(export_request.data, dict) and export_request.data:
+        data = export_request.data
 
     if data is None:
         conv_id = str(export_request.conversation_id or "").strip()
@@ -536,6 +578,92 @@ def _build_export_file(format_name: str, data: dict, title: str, summary: str = 
     if fmt == "zip":
         return _build_export_zip_bytes(data, safe_title, summary or ""), "application/zip", f"{safe_title}.zip"
     raise HTTPException(400, f"Formato não suportado: {fmt}")
+
+
+def _render_chat_segment_to_html(raw_content: Any) -> str:
+    if isinstance(raw_content, str):
+        text = raw_content
+    elif isinstance(raw_content, list):
+        chunks = []
+        for part in raw_content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                chunks.append(str(part.get("text", "")))
+        text = "\n".join(chunks)
+    else:
+        text = str(raw_content or "")
+
+    safe = html.escape(text)
+    parts = safe.split("```")
+    if len(parts) == 1:
+        return safe.replace("\n", "<br>")
+
+    rendered = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 0:
+            rendered.append(part.replace("\n", "<br>"))
+        else:
+            rendered.append(f"<pre><code>{part}</code></pre>")
+    return "".join(rendered)
+
+
+def _render_chat_html(messages: list, title: str) -> str:
+    safe_title = html.escape(_safe_export_title(title or "Chat Export"))
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    rows = []
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content_html = _render_chat_segment_to_html(msg.get("content", ""))
+        role_label = "Utilizador" if role == "user" else "Assistente"
+        bubble_class = "msg-user" if role == "user" else "msg-assistant"
+        msg_ts = str(msg.get("timestamp", "") or msg.get("created_at", "") or "").strip()
+        ts_html = f"<div class='msg-ts'>{html.escape(msg_ts)}</div>" if msg_ts else ""
+        rows.append(
+            f"<div class='msg-row {bubble_class}'>"
+            f"<div class='msg-meta'>{role_label}</div>"
+            f"<div class='msg-content'>{content_html}</div>"
+            f"{ts_html}"
+            "</div>"
+        )
+
+    body = "\n".join(rows) if rows else "<div class='msg-empty'>Sem mensagens para exportar.</div>"
+    return f"""<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{safe_title}</title>
+  <style>
+    body {{ font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif; background:#f6f7fb; color:#1f2937; margin:0; }}
+    .wrap {{ max-width: 980px; margin: 24px auto; padding: 0 16px; }}
+    .header {{ background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:16px 18px; margin-bottom:16px; }}
+    .title {{ margin:0; font-size:20px; color:{EXPORT_BRAND_COLOR}; }}
+    .meta {{ margin-top:6px; font-size:12px; color:#6b7280; }}
+    .chat {{ display:flex; flex-direction:column; gap:12px; }}
+    .msg-row {{ max-width:80%; border-radius:14px; padding:10px 12px; border:1px solid #e5e7eb; background:#fff; }}
+    .msg-user {{ margin-left:auto; background:#eef6ff; border-color:#bfdbfe; }}
+    .msg-assistant {{ margin-right:auto; background:#f3f4f6; border-color:#e5e7eb; }}
+    .msg-meta {{ font-size:11px; font-weight:700; letter-spacing:0.02em; color:#6b7280; margin-bottom:6px; text-transform:uppercase; }}
+    .msg-content {{ font-size:14px; line-height:1.55; }}
+    .msg-content pre {{ background:#111827; color:#f9fafb; padding:10px; border-radius:8px; overflow:auto; }}
+    .msg-ts {{ margin-top:6px; font-size:11px; color:#9ca3af; }}
+    .footer {{ margin-top:18px; font-size:12px; color:#6b7280; text-align:center; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1 class="title">{safe_title}</h1>
+      <div class="meta">{html.escape(EXPORT_BRAND_NAME)} · exportado em {exported_at}</div>
+    </div>
+    <div class="chat">{body}</div>
+    <div class="footer">Exportado por {html.escape(EXPORT_AGENT_NAME)} v{APP_VERSION}</div>
+  </div>
+</body>
+</html>"""
 
 
 def _export_job_from_storage_row(row: dict, fallback_job_id: str = "") -> dict:
@@ -628,7 +756,7 @@ async def _persist_export_job(job: dict) -> None:
         }
         rows = await table_query(
             "ExportJobs",
-            f"PartitionKey eq 'export' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'export' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if rows:
@@ -643,7 +771,7 @@ async def _load_export_job_from_storage(job_id: str) -> Optional[dict]:
     try:
         rows = await table_query(
             "ExportJobs",
-            f"PartitionKey eq 'export' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'export' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if not rows:
@@ -659,7 +787,7 @@ async def _load_fresh_export_job_state(job_id: str, in_memory_job: Optional[dict
     if not storage_job:
         return in_memory_job
     if not in_memory_job:
-        export_jobs_store[job_id] = storage_job
+        await export_jobs_store.put(job_id, storage_job)
         return storage_job
 
     mem_status = str(in_memory_job.get("status", "")).lower()
@@ -673,7 +801,7 @@ async def _load_fresh_export_job_state(job_id: str, in_memory_job: Optional[dict
     status_promoted = mem_status in ("queued", "processing") and stg_status in ("completed", "failed")
     storage_newer = stg_ts is not None and (mem_ts is None or stg_ts >= mem_ts)
     if status_promoted or storage_newer:
-        export_jobs_store[job_id] = storage_job
+        await export_jobs_store.put(job_id, storage_job)
         return storage_job
     return in_memory_job
 
@@ -689,8 +817,8 @@ async def _queue_export_job(
     job_id = uuid.uuid4().hex
     now_iso = datetime.now(timezone.utc).isoformat()
     blob_name = (
-        f"export-jobs/{_safe_blob_component(user_sub or 'anon', max_len=90)}/"
-        f"{_safe_blob_component(job_id, max_len=90)}/payload.json"
+        f"export-jobs/{safe_blob_component(user_sub or 'anon', max_len=90)}/"
+        f"{safe_blob_component(job_id, max_len=90)}/payload.json"
     )
     payload = {
         "format": str(format_name or "xlsx").lower(),
@@ -720,7 +848,7 @@ async def _queue_export_job(
         "error": "",
         "result": None,
     }
-    export_jobs_store[job_id] = job
+    await export_jobs_store.put(job_id, job)
     await _persist_export_job(job)
     return job
 
@@ -764,13 +892,13 @@ async def _process_export_job(job: dict) -> None:
 
 async def _run_export_job(job_id: str) -> None:
     _cleanup_export_jobs()
-    job = export_jobs_store.get(job_id)
+    job = await export_jobs_store.get_or_fetch(job_id)
     if not job:
         loaded = await _load_export_job_from_storage(job_id)
         if not loaded:
             return
         job = loaded
-        export_jobs_store[job_id] = job
+        await export_jobs_store.put(job_id, job)
 
     if str(job.get("status", "")).lower() in ("completed", "failed"):
         return
@@ -791,7 +919,7 @@ async def _run_export_job(job_id: str) -> None:
         finally:
             job["finished_at"] = datetime.now(timezone.utc).isoformat()
             job["updated_at"] = datetime.now(timezone.utc).isoformat()
-            export_jobs_store[str(job.get("job_id", ""))] = job
+            await export_jobs_store.put(str(job.get("job_id", "")), job)
             await _persist_export_job(job)
 
 
@@ -830,13 +958,13 @@ async def process_export_jobs_once(max_jobs: int = EXPORT_WORKER_BATCH_SIZE) -> 
         job["status"] = "processing"
         job["started_at"] = datetime.now(timezone.utc).isoformat()
         job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        export_jobs_store[job_id] = job
+        await export_jobs_store.put(job_id, job)
         await _persist_export_job(job)
         claimed += 1
 
         latest = await _load_export_job_from_storage(job_id)
         if latest:
-            export_jobs_store[job_id] = latest
+            await export_jobs_store.put(job_id, latest)
             if str(latest.get("claim_token", "")) != claim_token:
                 skipped += 1
                 continue
@@ -856,26 +984,58 @@ async def _export_worker_loop() -> None:
             logger.warning("[Export] worker loop failed: %s", e)
         await asyncio.sleep(max(0.5, float(EXPORT_WORKER_POLL_SECONDS)))
 
-@app.on_event("startup")
 async def startup_event():
     global http_client, _inline_worker_task, _inline_export_worker_task
+    configure_logging(LOG_FORMAT)
     http_client = httpx.AsyncClient(timeout=60)
     init_http_client(http_client)
     logger.info("HTTP client OK")
+
+    critical_failures: list[str] = []
+
+    if not AZURE_OPENAI_KEY:
+        critical_failures.append("AZURE_OPENAI_KEY não configurada")
+
     try:
         await asyncio.wait_for(ensure_tables_exist(), timeout=15)
+        logger.info("Table Storage OK")
     except asyncio.TimeoutError:
-        logger.warning("Table init timeout (15s) — continuing anyway")
+        msg = "Table Storage timeout (15s)"
+        logger.warning(msg)
+        critical_failures.append(msg)
     except Exception as e:
-        logger.warning("Table init error: %s — continuing anyway", e)
+        msg = f"Table Storage error: {e}"
+        logger.warning(msg)
+        critical_failures.append(msg)
+
     try:
         await asyncio.wait_for(ensure_blob_containers(), timeout=15)
+        logger.info("Blob Storage OK")
     except asyncio.TimeoutError:
-        logger.warning("Blob container init timeout (15s) — continuing anyway")
+        msg = "Blob Storage timeout (15s)"
+        logger.warning(msg)
+        critical_failures.append(msg)
     except Exception as e:
-        logger.warning("Blob container init error: %s — continuing anyway", e)
+        msg = f"Blob Storage error: {e}"
+        logger.warning(msg)
+        critical_failures.append(msg)
+
+    if critical_failures and STARTUP_FAIL_FAST:
+        for f in critical_failures:
+            logger.error("[STARTUP FAIL-FAST] %s", f)
+        raise RuntimeError(
+            f"Startup fail-fast: {len(critical_failures)} critical deps failed: "
+            + "; ".join(critical_failures)
+        )
+    elif critical_failures:
+        for f in critical_failures:
+            logger.warning("[STARTUP] Non-blocking failure: %s", f)
+
+    _tq_module.token_quota_manager = TokenQuotaManager(TOKEN_QUOTA_CONFIG)
+    logger.info("[Startup] Token quota manager initialised: %s", list(TOKEN_QUOTA_CONFIG.keys()))
+
     if INLINE_WORKER_ENABLED_EFFECTIVE:
-        _inline_worker_task = asyncio.create_task(_upload_worker_loop(), name="upload-inline-worker")
+        _inline_worker_task = create_logged_task(_upload_worker_loop(), name="upload-inline-worker")
         logger.info(
             "Inline upload worker enabled (poll=%.1fs, batch=%s)",
             UPLOAD_WORKER_POLL_SECONDS,
@@ -883,12 +1043,12 @@ async def startup_event():
         )
     else:
         logger.info(
-            "Inline upload worker disabled (configured=%s guard=%s); external worker required for queued uploads",
+            "Inline upload worker disabled (configured=%s guard=%s)",
             UPLOAD_INLINE_WORKER_ENABLED,
             INLINE_WORKER_RUNTIME_GUARD,
         )
     if EXPORT_INLINE_WORKER_ENABLED_EFFECTIVE:
-        _inline_export_worker_task = asyncio.create_task(_export_worker_loop(), name="export-inline-worker")
+        _inline_export_worker_task = create_logged_task(_export_worker_loop(), name="export-inline-worker")
         logger.info(
             "Inline export worker enabled (poll=%.1fs, batch=%s)",
             EXPORT_WORKER_POLL_SECONDS,
@@ -896,13 +1056,12 @@ async def startup_event():
         )
     else:
         logger.info(
-            "Inline export worker disabled (configured=%s guard=%s); external worker recommended for heavy exports",
+            "Inline export worker disabled (configured=%s guard=%s)",
             EXPORT_INLINE_WORKER_ENABLED,
             INLINE_WORKER_RUNTIME_GUARD,
         )
     logger.info("DBDE AI Agent v%s ready", APP_VERSION)
 
-@app.on_event("shutdown")
 async def shutdown_event():
     global _inline_worker_task, _inline_export_worker_task
     if _inline_worker_task:
@@ -921,6 +1080,10 @@ async def shutdown_event():
         _inline_export_worker_task = None
     if http_client:
         await http_client.aclose()
+    await _close_knowledge_client()
+    await _close_figma_client()
+    await _close_miro_client()
+    await close_all_providers()
 
 # =============================================================================
 # LEARNING / FEW-SHOT HELPERS
@@ -933,8 +1096,13 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
         if not emb: return
         doc = {"id":example_id,"question":question[:2000],"answer":answer[:4000],"tools_used":",".join(tools_used) if tools_used else "","rating":rating,"feedback_note":feedback_note[:500],"example_type":example_type,"created_at":datetime.now(timezone.utc).isoformat(),"question_vector":emb}
         url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{EXAMPLES_INDEX}/docs/index?api-version={API_VERSION_SEARCH}"
-        async with httpx.AsyncClient(timeout=30) as c:
-            await c.post(url, json={"value":[{"@search.action":"mergeOrUpload",**doc}]}, headers={"api-key":SEARCH_KEY,"Content-Type":"application/json"})
+        payload = {"value": [{"@search.action": "mergeOrUpload", **doc}]}
+        headers = {"api-key": SEARCH_KEY, "Content-Type": "application/json"}
+        if http_client:
+            await http_client.post(url, json=payload, headers=headers, timeout=30)
+        else:
+            async with httpx.AsyncClient(timeout=30) as c:
+                await c.post(url, json=payload, headers=headers)
     except Exception as e:
         logger.error("[App] _index_example failed: %s", e)
 
@@ -1031,11 +1199,26 @@ EXPORT_WORKER_INSTANCE_ID = os.getenv("EXPORT_WORKER_INSTANCE_ID", f"export-web-
 EXPORT_INLINE_WORKER_ENABLED_EFFECTIVE = bool(EXPORT_INLINE_WORKER_ENABLED and INLINE_WORKER_RUNTIME_GUARD)
 EXPORT_JOB_TTL_SECONDS = 24 * 3600
 
-upload_jobs_store: Dict[str, Dict[str, Any]] = {}
+upload_jobs_store = PersistentJobStore("UploadJobs", partition_key="upload-cache")
 _upload_jobs_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOAD_JOBS)
-_upload_conv_locks: Dict[str, asyncio.Lock] = {}
-export_jobs_store: Dict[str, Dict[str, Any]] = {}
+_upload_conv_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+_UPLOAD_CONV_LOCKS_MAX = 500
+export_jobs_store = PersistentJobStore("ExportJobs", partition_key="export-cache")
 _export_jobs_semaphore = asyncio.Semaphore(max(1, EXPORT_MAX_CONCURRENT_JOBS))
+
+
+async def _read_upload_with_limit(upload: UploadFile, max_bytes: int) -> bytes:
+    total = 0
+    chunks: List[bytes] = []
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(413, f"Ficheiro excede limite máximo de {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _normalize_uploaded_conv_entry(conv_id: str) -> dict:
@@ -1051,7 +1234,7 @@ def _normalize_uploaded_conv_entry(conv_id: str) -> dict:
 
     normalized = {
         "files": files,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
     uploaded_files_store[conv_id] = normalized
     return normalized
@@ -1081,7 +1264,7 @@ def _append_uploaded_entry(conv_id: str, store_entry: dict) -> list:
     if len(files) > MAX_FILES_PER_CONVERSATION:
         files = files[-MAX_FILES_PER_CONVERSATION:]
     conv_entry["files"] = files
-    conv_entry["updated_at"] = datetime.now().isoformat()
+    conv_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
     uploaded_files_store[conv_id] = conv_entry
     return [_file_entry_summary(f) for f in conv_entry.get("files", [])]
 
@@ -1089,8 +1272,12 @@ def _append_uploaded_entry(conv_id: str, store_entry: dict) -> list:
 def _get_upload_conv_lock(conv_id: str) -> asyncio.Lock:
     lock = _upload_conv_locks.get(conv_id)
     if lock is None:
+        while len(_upload_conv_locks) >= _UPLOAD_CONV_LOCKS_MAX:
+            _upload_conv_locks.popitem(last=False)
         lock = asyncio.Lock()
         _upload_conv_locks[conv_id] = lock
+    else:
+        _upload_conv_locks.move_to_end(conv_id)
     return lock
 
 
@@ -1122,7 +1309,7 @@ async def _count_pending_jobs_for_user(user_sub: str) -> int:
     # Source of truth é Table Storage para evitar drift entre instâncias.
     pending_job_ids = set()
     try:
-        safe_user = _odata_escape(user_sub)
+        safe_user = odata_escape(user_sub)
         rows = await table_query(
             "UploadJobs",
             f"PartitionKey eq 'upload' and UserSub eq '{safe_user}'",
@@ -1148,7 +1335,7 @@ async def _count_pending_jobs_for_conversation(conv_id: str, user_sub: str = "",
     # Source of truth é Table Storage para evitar overcount por cache stale local.
     seen = set()
     try:
-        safe_conv = _odata_escape(conv_id)
+        safe_conv = odata_escape(conv_id)
         rows = await table_query("UploadJobs", f"PartitionKey eq 'upload' and ConversationId eq '{safe_conv}'", top=500)
         for row in rows:
             if not include_all_users and user_sub and str(row.get("UserSub", "")) != user_sub:
@@ -1201,18 +1388,6 @@ def _is_job_stale(job: dict, now: Optional[datetime] = None) -> bool:
     return (now_dt - ref_dt).total_seconds() > UPLOAD_JOB_STALE_SECONDS
 
 
-def _create_logged_task(coro, label: str) -> None:
-    task = asyncio.create_task(coro)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except Exception as e:
-            logger.warning("[App] background task '%s' failed: %s", label, e, exc_info=True)
-
-    task.add_done_callback(_on_done)
-
-
 def _job_public_view(job: dict) -> dict:
     return {
         "job_id": job.get("job_id"),
@@ -1236,7 +1411,7 @@ async def _load_fresh_job_state(job_id: str, in_memory_job: Optional[dict]) -> O
     if not storage_job:
         return in_memory_job
     if not in_memory_job:
-        upload_jobs_store[job_id] = storage_job
+        await upload_jobs_store.put(job_id, storage_job)
         return storage_job
 
     mem_status = str(in_memory_job.get("status", "")).lower()
@@ -1251,7 +1426,7 @@ async def _load_fresh_job_state(job_id: str, in_memory_job: Optional[dict]) -> O
     status_promoted = mem_status in ("queued", "processing") and stg_status in ("completed", "failed")
     storage_newer = stg_ts is not None and (mem_ts is None or stg_ts >= mem_ts)
     if status_promoted or storage_newer:
-        upload_jobs_store[job_id] = storage_job
+        await upload_jobs_store.put(job_id, storage_job)
         return storage_job
     return in_memory_job
 
@@ -1294,7 +1469,7 @@ async def _upsert_upload_index(entity: dict) -> None:
     try:
         rows = await table_query(
             "UploadIndex",
-            f"PartitionKey eq '{_odata_escape(conv_id)}' and RowKey eq '{_odata_escape(row_key)}'",
+            f"PartitionKey eq '{odata_escape(conv_id)}' and RowKey eq '{odata_escape(row_key)}'",
             top=1,
         )
         if rows:
@@ -1306,7 +1481,7 @@ async def _upsert_upload_index(entity: dict) -> None:
 
 
 async def _list_upload_index(conv_id: str, user_sub: str = "", top: int = UPLOAD_INDEX_TOP) -> list:
-    safe_conv = _odata_escape(conv_id)
+    safe_conv = odata_escape(conv_id)
     rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(top, 500)))
     if not user_sub:
         return rows
@@ -1352,7 +1527,7 @@ async def _refresh_conversation_files_from_index(conv_id: str, user_sub: str = "
     entries = [_upload_index_row_to_memory_entry(r) for r in rows_sorted[-MAX_FILES_PER_CONVERSATION:]]
     uploaded_files_store[conv_id] = {
         "files": entries,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "from_index": True,
     }
     return [_file_entry_summary(e) for e in entries]
@@ -1478,7 +1653,7 @@ async def _persist_upload_job(job: dict) -> None:
         }
         rows = await table_query(
             "UploadJobs",
-            f"PartitionKey eq 'upload' and RowKey eq '{_odata_escape(rk)}'",
+            f"PartitionKey eq 'upload' and RowKey eq '{odata_escape(rk)}'",
             top=1,
         )
         if rows:
@@ -1493,7 +1668,7 @@ async def _load_upload_job_from_storage(job_id: str) -> Optional[dict]:
     try:
         rows = await table_query(
             "UploadJobs",
-            f"PartitionKey eq 'upload' and RowKey eq '{_odata_escape(job_id)}'",
+            f"PartitionKey eq 'upload' and RowKey eq '{odata_escape(job_id)}'",
             top=1,
         )
         if not rows:
@@ -1515,7 +1690,7 @@ async def _mark_job_failed(job: dict, reason: str) -> dict:
     job["error"] = reason
     job["finished_at"] = now_iso
     job["updated_at"] = now_iso
-    upload_jobs_store[str(job.get("job_id", ""))] = job
+    await upload_jobs_store.put(str(job.get("job_id", "")), job)
     await _persist_upload_job(job)
     return job
 
@@ -1524,12 +1699,9 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     data_text, row_count, col_names, truncated = "", 0, [], False
     semantic_chunks = None
     col_analysis = []
-    full_col_stats = []
     image_base64 = None
     image_content_type = None
     detected_delimiter = ","
-    excel_rows = []
-    csv_text = ""
     filename_lower = filename.lower()
     is_pptx_mime = content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     is_image_mime = (content_type or "").startswith("image/")
@@ -1540,7 +1712,6 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         rows = list(wb.active.iter_rows(values_only=True))
         if not rows:
             raise HTTPException(400, "Excel vazio")
-        excel_rows = rows
         col_names = [str(c) if c else f"Col{i}" for i, c in enumerate(rows[0])]
         row_count = len(rows) - 1
         data_text = "\t".join(col_names) + "\n" + "\n".join(
@@ -1550,7 +1721,6 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         wb.close()
     elif filename_lower.endswith(".csv"):
         text = content.decode("utf-8", errors="replace")
-        csv_text = text
         lines = [ln for ln in text.strip().split("\n") if ln.strip()]
         if not lines:
             raise HTTPException(400, "CSV vazio")
@@ -1635,96 +1805,6 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     if not image_base64 and len(full_text) > 50000:
         semantic_chunks = await _build_semantic_chunks(full_text)
 
-    if filename_lower.endswith((".xlsx", ".xls", ".csv")) and row_count > 0 and col_names:
-        try:
-            max_stats_rows = 500000
-            columns_data = [[] for _ in col_names]
-
-            if filename_lower.endswith(".csv"):
-                import csv as csv_mod
-                from io import StringIO
-
-                reader = csv_mod.reader(StringIO(csv_text), delimiter=detected_delimiter)
-                _ = next(reader, None)  # header
-                for row_index, row_vals in enumerate(reader):
-                    if row_index >= max_stats_rows:
-                        break
-                    for ci, val in enumerate(row_vals):
-                        if ci < len(columns_data):
-                            columns_data[ci].append(str(val).strip().strip('"'))
-            else:
-                for row_vals in excel_rows[1 : 1 + max_stats_rows]:
-                    for ci, val in enumerate(row_vals):
-                        if ci < len(columns_data):
-                            columns_data[ci].append("" if val is None else str(val))
-
-            def _parse_number(raw_val: str) -> Optional[float]:
-                txt = str(raw_val or "").strip()
-                if not txt:
-                    return None
-                txt = txt.replace("\u00A0", "").replace(" ", "")
-                if "," in txt and "." in txt:
-                    if txt.rfind(",") > txt.rfind("."):
-                        txt = txt.replace(".", "").replace(",", ".")
-                    else:
-                        txt = txt.replace(",", "")
-                else:
-                    txt = txt.replace(",", ".")
-                try:
-                    return float(txt)
-                except Exception:
-                    return None
-
-            for ci, cname in enumerate(col_names):
-                vals = columns_data[ci] if ci < len(columns_data) else []
-                non_empty = [v for v in vals if str(v).strip()]
-                stat = {"name": cname, "count": len(vals)}
-                numeric_vals = []
-                for v in non_empty:
-                    parsed = _parse_number(v)
-                    if parsed is not None:
-                        numeric_vals.append(parsed)
-
-                if non_empty and len(numeric_vals) > len(non_empty) * 0.5:
-                    numeric_sorted = sorted(numeric_vals)
-                    n = len(numeric_sorted)
-                    mean_raw = sum(numeric_sorted) / n
-                    variance = sum((x - mean_raw) ** 2 for x in numeric_sorted) / n
-
-                    def _p(pct: float) -> float:
-                        idx = min(n - 1, max(0, int((n - 1) * pct)))
-                        return numeric_sorted[idx]
-
-                    sample_vals = []
-                    if non_empty:
-                        sample_indexes = [0, len(non_empty) // 4, len(non_empty) // 2, (3 * len(non_empty)) // 4, len(non_empty) - 1]
-                        sample_vals = [non_empty[idx] for idx in sample_indexes if 0 <= idx < len(non_empty)]
-
-                    stat["type"] = "numeric"
-                    stat["min"] = round(numeric_sorted[0], 4)
-                    stat["max"] = round(numeric_sorted[-1], 4)
-                    stat["mean"] = round(mean_raw, 4)
-                    stat["std"] = round(variance ** 0.5, 4)
-                    stat["non_null"] = n
-                    stat["zeros"] = sum(1 for x in numeric_sorted if x == 0)
-                    stat["p25"] = round(_p(0.25), 4)
-                    stat["p50"] = round(_p(0.50), 4)
-                    stat["p75"] = round(_p(0.75), 4)
-                    stat["sample"] = sample_vals[:5]
-                else:
-                    stat["type"] = "text"
-                    unique = set(non_empty[:10000])
-                    stat["unique_approx"] = len(unique)
-                    stat["sample"] = non_empty[:5]
-                    if non_empty:
-                        stat["first"] = non_empty[0]
-                        stat["last"] = non_empty[-1]
-
-                full_col_stats.append(stat)
-        except Exception as e:
-            logger.warning("[App] full_col_stats computation failed: %s", e)
-            full_col_stats = []
-
     if len(data_text) > 100000:
         data_text = data_text[:100000]
         truncated = True
@@ -1735,7 +1815,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "row_count": row_count,
         "col_names": col_names,
         "truncated": truncated,
-        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
     if image_base64:
         store_entry["image_base64"] = image_base64
@@ -1764,7 +1844,6 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
                 }
             )
         store_entry["col_analysis"] = col_analysis
-    store_entry["full_col_stats"] = full_col_stats
 
     response_payload = {
         "filename": filename,
@@ -1773,14 +1852,13 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "truncated": truncated,
         "preview": "\n".join(data_text.split("\n")[:6]),
         "col_analysis": col_analysis if col_analysis else None,
-        "full_col_stats": full_col_stats if full_col_stats else None,
     }
     return store_entry, response_payload
 
 
 def _build_upload_blob_paths(conv_id: str, job_id: str, filename: str) -> dict:
-    safe_name = _safe_blob_component(filename or "upload.bin", max_len=180)
-    prefix = f"{_safe_blob_component(conv_id, max_len=90)}/{_safe_blob_component(job_id, max_len=90)}"
+    safe_name = safe_blob_component(filename or "upload.bin", max_len=180)
+    prefix = f"{safe_blob_component(conv_id, max_len=90)}/{safe_blob_component(job_id, max_len=90)}"
     return {
         "raw_blob_name": f"{prefix}/raw/{safe_name}",
         "text_blob_name": f"{prefix}/extracted/text.txt",
@@ -1858,7 +1936,6 @@ async def _process_upload_job(job: dict) -> None:
 
     col_names = store_entry.get("col_names", [])
     col_analysis = store_entry.get("col_analysis", [])
-    full_col_stats = store_entry.get("full_col_stats", [])
     upload_index_entity = {
         "PartitionKey": conv_id,
         "RowKey": str(job.get("job_id", "")),
@@ -1870,7 +1947,6 @@ async def _process_upload_job(job: dict) -> None:
         "RowCount": int(store_entry.get("row_count", 0) or 0),
         "ColNamesJson": json.dumps(col_names if isinstance(col_names, list) else [], ensure_ascii=False)[:32000],
         "ColAnalysisJson": json.dumps(col_analysis if isinstance(col_analysis, list) else [], ensure_ascii=False)[:32000],
-        "FullColStatsJson": json.dumps(full_col_stats if isinstance(full_col_stats, list) else [], ensure_ascii=False)[:64000],
         "PreviewText": text_payload[:16000],
         "Truncated": bool(store_entry.get("truncated", False)),
         "HasChunks": bool(chunks_blob_ref),
@@ -1894,13 +1970,13 @@ async def _process_upload_job(job: dict) -> None:
 
 async def _run_upload_job(job_id: str) -> None:
     _cleanup_upload_jobs()
-    job = upload_jobs_store.get(job_id)
+    job = await upload_jobs_store.get_or_fetch(job_id)
     if not job:
         loaded = await _load_upload_job_from_storage(job_id)
         if not loaded:
             return
         job = loaded
-        upload_jobs_store[job_id] = job
+        await upload_jobs_store.put(job_id, job)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     if str(job.get("status", "")).lower() in ("completed", "failed"):
@@ -1921,7 +1997,7 @@ async def _run_upload_job(job_id: str) -> None:
         finally:
             job["finished_at"] = datetime.now(timezone.utc).isoformat()
             job["updated_at"] = datetime.now(timezone.utc).isoformat()
-            upload_jobs_store[str(job.get("job_id", ""))] = job
+            await upload_jobs_store.put(str(job.get("job_id", "")), job)
             await _persist_upload_job(job)
 
 
@@ -1959,7 +2035,7 @@ async def _queue_upload_job(
         "text_blob_name": blob_paths["text_blob_name"],
         "chunks_blob_name": blob_paths["chunks_blob_name"],
     }
-    upload_jobs_store[job_id] = job
+    await upload_jobs_store.put(job_id, job)
     await _persist_upload_job(job)
     # Processamento é feito por worker (inline loop ou worker externo).
     return job
@@ -2001,13 +2077,13 @@ async def process_upload_jobs_once(max_jobs: int = UPLOAD_WORKER_BATCH_SIZE) -> 
         job["status"] = "processing"
         job["started_at"] = datetime.now(timezone.utc).isoformat()
         job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        upload_jobs_store[job_id] = job
+        await upload_jobs_store.put(job_id, job)
         await _persist_upload_job(job)
         claimed += 1
 
         latest = await _load_upload_job_from_storage(job_id)
         if latest:
-            upload_jobs_store[job_id] = latest
+            await upload_jobs_store.put(job_id, latest)
             if str(latest.get("claim_token", "")) != claim_token:
                 skipped += 1
                 continue
@@ -2034,10 +2110,8 @@ async def _upload_worker_loop() -> None:
 async def upload_file(request: Request, file: UploadFile = File(...), conversation_id: Optional[str] = Form(None), credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     conv_id = conversation_id or str(uuid.uuid4())
-    content = await file.read()
+    content = await _read_upload_with_limit(file, MAX_UPLOAD_FILE_BYTES)
     filename = file.filename or "unknown"
-    if len(content) > MAX_UPLOAD_FILE_BYTES:
-        raise HTTPException(400, "Max 10MB")
     user_sub = str(user.get("sub", "") or "")
     reserved_slots = await _count_reserved_slots_for_conversation(conv_id, user_sub=user_sub)
     if reserved_slots >= MAX_FILES_PER_CONVERSATION:
@@ -2081,10 +2155,8 @@ async def upload_file_async(
 ):
     user = get_current_user(credentials)
     conv_id = conversation_id or str(uuid.uuid4())
-    content = await file.read()
+    content = await _read_upload_with_limit(file, MAX_UPLOAD_FILE_BYTES)
     filename = file.filename or "unknown"
-    if len(content) > MAX_UPLOAD_FILE_BYTES:
-        raise HTTPException(400, "Max 10MB")
 
     user_sub = str(user.get("sub", "") or "")
     reserved_slots = await _count_reserved_slots_for_conversation(conv_id, user_sub=user_sub)
@@ -2179,20 +2251,21 @@ async def upload_files_async_batch(
     batch_total_bytes = 0
     for uf in files_to_queue:
         filename = uf.filename or "unknown"
-        content = await uf.read()
+        try:
+            content = await _read_upload_with_limit(uf, MAX_UPLOAD_FILE_BYTES)
+        except HTTPException as exc:
+            skipped.append(
+                {
+                    "filename": filename,
+                    "reason": exc.detail,
+                }
+            )
+            continue
         if batch_total_bytes + len(content) > UPLOAD_MAX_BATCH_TOTAL_BYTES:
             skipped.append(
                 {
                     "filename": filename,
                     "reason": "Lote excede tamanho total máximo permitido",
-                }
-            )
-            continue
-        if len(content) > MAX_UPLOAD_FILE_BYTES:
-            skipped.append(
-                {
-                    "filename": filename,
-                    "reason": "Ficheiro excede tamanho máximo permitido",
                 }
             )
             continue
@@ -2230,7 +2303,7 @@ async def upload_job_status(
     user = get_current_user(credentials)
     _cleanup_upload_jobs()
 
-    job = upload_jobs_store.get(job_id)
+    job = await upload_jobs_store.get_or_fetch(job_id)
     job = await _load_fresh_job_state(job_id, job)
 
     if not job:
@@ -2270,7 +2343,7 @@ async def upload_jobs_status_batch(
     stale_msg = "Upload interrompido por timeout/stale (possível restart do servidor). Reenvia o ficheiro."
     items = []
     for job_id in job_ids:
-        job = upload_jobs_store.get(job_id)
+        job = await upload_jobs_store.get_or_fetch(job_id)
         job = await _load_fresh_job_state(job_id, job)
         if not job:
             items.append({"job_id": job_id, "status": "not_found", "error": "Upload job não encontrado"})
@@ -2385,7 +2458,7 @@ async def upload_pending_for_conversation(
     stale_msg = "Upload interrompido por timeout/stale (possível restart do servidor). Reenvia o ficheiro."
     # Marca stale com base em estado persistido para consistência cross-instância.
     try:
-        safe_conv = _odata_escape(conversation_id)
+        safe_conv = odata_escape(conversation_id)
         rows = await table_query("UploadJobs", f"PartitionKey eq 'upload' and ConversationId eq '{safe_conv}'", top=500)
         for row in rows:
             job = _job_from_storage_row(row)
@@ -2479,44 +2552,43 @@ async def _run_digest_section(section_name: str, wiql_query: str) -> dict:
     batch_errors = []
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            wiql_resp = await _devops_request_with_retry(
-                client,
-                "POST",
-                _devops_url("wit/wiql?api-version=7.1"),
-                headers,
-                {"query": wiql_query},
-                max_retries=3,
-            )
-            if "error" in wiql_resp:
-                section["error"] = wiql_resp["error"]
-                return section
-
-            ids = [wi.get("id") for wi in wiql_resp.get("workItems", []) if wi.get("id")]
-            section["count"] = len(ids)
-            if not ids:
-                return section
-
-            details = []
-            for i in range(0, len(ids), 100):
-                batch = ids[i:i + 100]
-                batch_resp = await _devops_request_with_retry(
-                    client,
-                    "POST",
-                    _devops_url("wit/workitemsbatch?api-version=7.1"),
-                    headers,
-                    {"ids": batch, "fields": _DIGEST_FIELDS},
-                    max_retries=3,
-                )
-                if "error" in batch_resp:
-                    batch_errors.append(batch_resp["error"])
-                    continue
-                details.extend(batch_resp.get("value", []))
-
-            section["items"] = [_digest_format_item(item) for item in details]
-            if batch_errors:
-                section["error"] = "; ".join(batch_errors[:3])
+        wiql_resp = await _devops_request_with_retry(
+            "POST",
+            _devops_url("wit/wiql?api-version=7.1"),
+            headers,
+            {"query": wiql_query},
+            max_retries=3,
+            timeout=60,
+        )
+        if "error" in wiql_resp:
+            section["error"] = wiql_resp["error"]
             return section
+
+        ids = [wi.get("id") for wi in wiql_resp.get("workItems", []) if wi.get("id")]
+        section["count"] = len(ids)
+        if not ids:
+            return section
+
+        details = []
+        for i in range(0, len(ids), 100):
+            batch = ids[i:i + 100]
+            batch_resp = await _devops_request_with_retry(
+                "POST",
+                _devops_url("wit/workitemsbatch?api-version=7.1"),
+                headers,
+                {"ids": batch, "fields": _DIGEST_FIELDS},
+                max_retries=3,
+                timeout=60,
+            )
+            if "error" in batch_resp:
+                batch_errors.append(batch_resp["error"])
+                continue
+            details.extend(batch_resp.get("value", []))
+
+        section["items"] = [_digest_format_item(item) for item in details]
+        if batch_errors:
+            section["error"] = "; ".join(batch_errors[:3])
+        return section
     except Exception as e:
         section["error"] = f"{section_name} failed: {str(e)}"
         return section
@@ -2659,6 +2731,65 @@ async def export_data_async(request: Request, export_request: ExportRequest, cre
     }
 
 
+@app.post("/api/export-chat")
+@limiter.limit("10/minute", key_func=_user_or_ip_rate_key)
+async def export_chat(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Exporta histórico de chat em HTML/PDF."""
+    get_current_user(credentials)
+    body = await request.json()
+    messages = body.get("messages", [])
+    format_type = str(body.get("format", "html") or "html").strip().lower()
+    title = str(body.get("title", "Chat Export") or "Chat Export")
+
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse({"error": "Sem mensagens para exportar"}, status_code=400)
+
+    html_content = _render_chat_html(messages, title)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_title = _safe_export_title(title or "Chat Export")
+
+    format_requested = format_type
+    fallback_reason = None
+
+    if format_type == "pdf":
+        try:
+            from export_engine import to_chat_pdf
+
+            pdf_bytes = to_chat_pdf(messages, title)
+            filename = f"{safe_title}_{ts}.pdf"
+            download_id = await _store_generated_file(pdf_bytes, "application/pdf", filename, "pdf")
+            if not download_id:
+                raise HTTPException(500, "Falha ao armazenar PDF exportado")
+            return {
+                "url": f"/api/download/{download_id}",
+                "filename": filename,
+                "format_requested": "pdf",
+                "format_served": "pdf",
+                "fallback_reason": None,
+            }
+        except Exception as e:
+            logging.warning("[ExportChat] PDF generation failed, falling back to HTML: %s", e)
+            format_type = "html"
+            fallback_reason = f"PDF generation failed: {str(e)[:200]}"
+
+    filename = f"{safe_title}_{ts}.html"
+    download_id = await _store_generated_file(
+        html_content.encode("utf-8"),
+        "text/html; charset=utf-8",
+        filename,
+        "html",
+    )
+    if not download_id:
+        raise HTTPException(500, "Falha ao armazenar HTML exportado")
+    return {
+        "url": f"/api/download/{download_id}",
+        "filename": filename,
+        "format_requested": format_requested,
+        "format_served": "html",
+        "fallback_reason": fallback_reason,
+    }
+
+
 @app.get("/api/export/status/{job_id}")
 @limiter.limit("60/minute", key_func=_user_or_ip_rate_key)
 async def export_job_status(request: Request, job_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -2667,7 +2798,7 @@ async def export_job_status(request: Request, job_id: str, credentials: HTTPAuth
     is_admin = user.get("role") == "admin"
 
     _cleanup_export_jobs()
-    job = export_jobs_store.get(job_id)
+    job = await export_jobs_store.get_or_fetch(job_id)
     job = await _load_fresh_export_job_state(job_id, job)
     if not job:
         raise HTTPException(404, "Export job não encontrado")
@@ -2714,7 +2845,7 @@ async def download_generated_file(request: Request, download_id: str, credential
 @app.post("/api/auth/login")
 @limiter.limit("5/minute", key_func=_login_rate_key)
 async def login(request: Request, login_request: LoginRequest):
-    safe_username = _odata_escape(login_request.username)
+    safe_username = odata_escape(login_request.username)
     users = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if not users: raise HTTPException(401, "Credenciais inválidas")
     user = users[0]
@@ -2763,7 +2894,7 @@ async def logout(request: Request):
 async def create_user(request: Request, payload: CreateUserRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
-    safe_username = _odata_escape(payload.username)
+    safe_username = odata_escape(payload.username)
     existing = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if existing: raise HTTPException(409, "Username já existe")
     entity = {"PartitionKey":"user","RowKey":payload.username,"PasswordHash":hash_password(payload.password),"DisplayName":payload.display_name or payload.username,"Role":payload.role or "user","IsActive":True,"CreatedAt":datetime.now(timezone.utc).isoformat(),"CreatedBy":user.get("sub")}
@@ -2792,7 +2923,7 @@ async def deactivate_user(request: Request, username: str, credentials: HTTPAuth
 async def change_password(request: Request, payload: ChangePasswordRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     username = user.get("sub")
-    safe_username = _odata_escape(username)
+    safe_username = odata_escape(username)
     users = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
     if not users: raise HTTPException(404, "User não encontrado")
     if not verify_password(payload.current_password, users[0].get("PasswordHash","")): raise HTTPException(401, "Password actual incorrecta")
@@ -2877,7 +3008,7 @@ async def save_chat(request: Request, payload: SaveChatRequest, credentials: HTT
 async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     uid = user.get("sub") if user.get("role")!="admin" else user_id
-    safe_uid = _odata_escape(uid)
+    safe_uid = odata_escape(uid)
     entities = await table_query("ChatHistory", f"PartitionKey eq '{safe_uid}'", top=100)
     chats = sorted([{"conversation_id":e.get("RowKey",""),"title":e.get("Title",""),"message_count":e.get("MessageCount",0),"updated_at":e.get("UpdatedAt","")} for e in entities], key=lambda c:c["updated_at"], reverse=True)
     return {"chats":chats}
@@ -2887,8 +3018,8 @@ async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizat
 async def get_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     uid = user.get("sub") if user.get("role")!="admin" else user_id
-    safe_uid = _odata_escape(uid)
-    safe_conv = _odata_escape(conversation_id)
+    safe_uid = odata_escape(uid)
+    safe_conv = odata_escape(conversation_id)
     es = await table_query("ChatHistory", f"PartitionKey eq '{safe_uid}' and RowKey eq '{safe_conv}'", top=1)
     if not es: raise HTTPException(404, "Não encontrada")
     return {"conversation_id":conversation_id,"title":es[0].get("Title",""),"messages":json.loads(es[0].get("Messages","[]")),"updated_at":es[0].get("UpdatedAt","")}
@@ -2958,11 +3089,12 @@ async def analyze_feedback(request: Request, credentials: HTTPAuthorizationCrede
 # INFO / HEALTH / DEBUG
 # =============================================================================
 
-@app.get("/api/info")
-async def api_info():
+def _build_admin_info_payload() -> dict:
     return {
-        "service": APP_TITLE, "version": APP_VERSION, "status": "running",
-        "models": {"fast": LLM_TIER_FAST, "standard": LLM_TIER_STANDARD, "pro": LLM_TIER_PRO},
+        "service": APP_TITLE,
+        "version": APP_VERSION,
+        "status": "running",
+        "models": {"fast": LLM_TIER_FAST, "standard": LLM_TIER_STANDARD, "pro": LLM_TIER_PRO, "vision": LLM_TIER_VISION},
         "routing": {
             "model_router_enabled": MODEL_ROUTER_ENABLED,
             "model_router_effective": bool(MODEL_ROUTER_ENABLED and (not MODEL_ROUTER_NON_PROD_ONLY or not IS_PRODUCTION)),
@@ -2979,7 +3111,18 @@ async def api_info():
         },
         "indexes": {"devops": DEVOPS_INDEX, "omni": OMNI_INDEX, "examples": EXAMPLES_INDEX},
         "active_tools": get_registered_tool_names(),
-        "capabilities": ["multi_model","streaming_sse","jwt_cookie_auth","agent_routing","parallel_tools","export_csv_xlsx_pdf_svg_html_zip","feedback","file_upload","chat_persistence","adaptive_learning"],
+        "capabilities": [
+            "multi_model",
+            "streaming_sse",
+            "jwt_cookie_auth",
+            "agent_routing",
+            "parallel_tools",
+            "export_csv_xlsx_pdf_svg_html_zip",
+            "feedback",
+            "file_upload",
+            "chat_persistence",
+            "adaptive_learning",
+        ],
         "upload_limits": {
             "max_files_per_conversation": MAX_FILES_PER_CONVERSATION,
             "max_images_per_message": UPLOAD_MAX_IMAGES_PER_MESSAGE,
@@ -3020,6 +3163,77 @@ async def api_info():
     }
 
 
+@app.get("/api/info")
+@limiter.limit("120/minute", key_func=_login_rate_key)
+async def api_info(request: Request):
+    return {
+        "service": APP_TITLE,
+        "version": APP_VERSION,
+        "status": "running",
+        "mode": "public",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/admin/info")
+@limiter.limit("60/minute", key_func=_user_or_ip_rate_key)
+async def api_admin_info(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user = get_current_user(credentials)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Apenas admins")
+    payload = _build_admin_info_payload()
+    payload["mode"] = "admin"
+    return payload
+
+
+@app.get("/api/admin/tool-metrics")
+async def api_admin_tool_metrics(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user = get_current_user(credentials)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Apenas admins")
+    return tool_metrics.snapshot()
+
+
+@app.get("/api/admin/token-quotas")
+async def api_admin_token_quotas(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user = get_current_user(credentials)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Apenas admins")
+    mgr = _tq_module.token_quota_manager
+    if not mgr:
+        return {"error": "Token quota manager not initialised"}
+    return mgr.snapshot()
+
+
+@app.post("/api/client-error")
+@limiter.limit("10/minute", key_func=_user_or_ip_rate_key)
+async def report_client_error(request: Request, report: ClientErrorReport):
+    """Receive and log frontend errors for observability."""
+    user = None
+    try:
+        user = _auth_payload_from_request(request)
+    except Exception:
+        user = None
+    user_id = str((user or {}).get("sub", "") or "anonymous")
+
+    logger.warning(
+        json.dumps(
+            {
+                "event": "client_error",
+                "user_id": user_id,
+                "error_type": report.error_type,
+                "message": report.message[:500],
+                "component": report.component or "",
+                "url": report.url or "",
+                "timestamp": report.timestamp or "",
+                "has_stack": bool(report.stack),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return {"status": "logged"}
+
+
 @app.get("/api/runtime/check")
 async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
@@ -3031,7 +3245,6 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
         BASE_DIR / "agent.py",
         BASE_DIR / "tools.py",
         BASE_DIR / "config.py",
-        BASE_DIR / "startup.sh",
         BASE_DIR / "static" / "index.html",
     ]
     files = {}
@@ -3099,33 +3312,92 @@ async def runtime_check(credentials: HTTPAuthorizationCredentials = Depends(secu
 async def health(
     request: Request,
     deep: bool = False,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
+    result = {"status": "healthy", "mode": "basic", "checks": {"app": "ok"}}
     if not deep:
-        return {"status": "healthy", "mode": "basic", "checks": {"app": "ok"}}
+        return result
 
-    user = get_current_user(credentials)
-    if user.get("role") != "admin":
-        raise HTTPException(403, "Apenas admins")
-
+    result["mode"] = "deep"
     checks = {}
+
+    # 1) Table Storage
     try:
-        emb = await get_embedding("test")
-        checks["embeddings"] = "ok" if emb else "error"
-    except Exception as e: checks["embeddings"] = f"error: {str(e)[:80]}"
-    
-    for name, idx in [("devops", DEVOPS_INDEX), ("omni", OMNI_INDEX)]:
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{idx}/docs/$count?api-version={API_VERSION_SEARCH}", headers={"api-key":SEARCH_KEY})
-                checks[f"search_{name}"] = f"ok ({r.text} docs)" if r.status_code==200 else f"error: {r.status_code}"
-        except Exception as e: checks[f"search_{name}"] = f"error: {str(e)[:80]}"
-    
-    if DEBUG_MODE:
-        checks["devops_log"] = get_devops_debug_log()[-5:]
-        checks["llm_log"] = get_llm_debug_log()[-5:]
-    
-    return {"status": "healthy" if all("ok" in str(v) for k,v in checks.items() if "log" not in k) else "degraded", "checks": checks}
+        await table_query("feedback", top=1)
+        checks["table_storage"] = "ok"
+    except Exception as e:
+        checks["table_storage"] = f"error: {str(e)[:100]}"
+
+    # 2) Blob Storage
+    try:
+        probe_blob = "__health_probe__.txt"
+        _ = await blob_download_bytes(UPLOAD_BLOB_CONTAINER_RAW, probe_blob)
+        checks["blob_storage"] = "ok"
+    except Exception as e:
+        checks["blob_storage"] = f"error: {str(e)[:100]}"
+
+    # 3) Azure OpenAI (tier fast)
+    try:
+        _ = await llm_simple("ping", tier="fast", max_tokens=5)
+        checks["llm_fast"] = "ok"
+    except Exception as e:
+        checks["llm_fast"] = f"error: {str(e)[:100]}"
+
+    # 3b) Azure OpenAI (tier vision)
+    try:
+        if VISION_ENABLED:
+            _ = await llm_simple("ping", tier="vision", max_tokens=5)
+            checks["llm_vision"] = "ok"
+        else:
+            checks["llm_vision"] = "disabled"
+    except Exception as e:
+        checks["llm_vision"] = f"error: {str(e)[:100]}"
+
+    # 4) Azure AI Search
+    try:
+        from http_helpers import search_request_with_retry
+        url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{DEVOPS_INDEX}/docs/search?api-version={API_VERSION_SEARCH}"
+        headers = {"Content-Type": "application/json", "api-key": SEARCH_KEY}
+        payload = {"search": "*", "top": 1}
+        search_resp = await search_request_with_retry(url=url, headers=headers, json_body=payload, max_retries=2)
+        checks["ai_search"] = "ok" if "error" not in search_resp else f"error: {str(search_resp.get('error', 'unknown'))[:100]}"
+    except Exception as e:
+        checks["ai_search"] = f"error: {str(e)[:100]}"
+
+    # 5) Rerank
+    try:
+        if RERANK_ENABLED:
+            endpoint_configured = bool(str(RERANK_ENDPOINT or "").strip())
+            checks["rerank"] = "configured" if endpoint_configured else "error: missing endpoint"
+        else:
+            checks["rerank"] = "disabled"
+    except Exception as e:
+        checks["rerank"] = f"error: {str(e)[:100]}"
+
+    # 6) Dedicated workers (when enabled)
+    try:
+        upload_worker_enabled = os.getenv("UPLOAD_DEDICATED_WORKER_ENABLED", "true").strip().lower() == "true"
+        if upload_worker_enabled:
+            pid = _load_pid_from_file(UPLOAD_WORKER_PID_FILE)
+            checks["upload_worker"] = "ok" if _is_process_alive(pid) else "error: worker_not_running"
+        else:
+            checks["upload_worker"] = "disabled"
+    except Exception as e:
+        checks["upload_worker"] = f"error: {str(e)[:100]}"
+
+    try:
+        export_worker_enabled = os.getenv("EXPORT_DEDICATED_WORKER_ENABLED", "true").strip().lower() == "true"
+        if export_worker_enabled:
+            pid = _load_pid_from_file(EXPORT_WORKER_PID_FILE)
+            checks["export_worker"] = "ok" if _is_process_alive(pid) else "error: worker_not_running"
+        else:
+            checks["export_worker"] = "disabled"
+    except Exception as e:
+        checks["export_worker"] = f"error: {str(e)[:100]}"
+
+    result["checks"] = checks
+    all_ok = all(v == "ok" or v in ("configured", "disabled") for v in checks.values())
+    result["status"] = "healthy" if all_ok else "degraded"
+    return JSONResponse(status_code=200 if all_ok else 503, content=result)
 
 @app.get("/debug/conversations")
 async def debug_conversations(credentials: HTTPAuthorizationCredentials = Depends(security)):

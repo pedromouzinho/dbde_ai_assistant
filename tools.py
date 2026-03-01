@@ -2,7 +2,7 @@
 # tools.py — Tool definitions, implementations e system prompts v7.2
 # =============================================================================
 
-import json, base64, asyncio, logging, uuid, re, math, unicodedata, io, csv
+import json, base64, asyncio, logging, uuid, re, math, unicodedata, io, csv, statistics
 from datetime import datetime, timezone
 from collections import deque
 from urllib.parse import quote
@@ -19,8 +19,9 @@ from config import (
     RERANK_ENABLED, RERANK_ENDPOINT, RERANK_API_KEY, RERANK_MODEL,
     RERANK_TOP_N, RERANK_TIMEOUT_SECONDS, RERANK_AUTH_MODE,
     UPLOAD_INDEX_TOP, GENERATED_FILES_BLOB_CONTAINER,
+    VISION_ENABLED,
 )
-from llm_provider import get_embedding_provider, llm_simple
+from llm_provider import get_embedding_provider, llm_simple, llm_with_fallback
 from export_engine import to_csv, to_xlsx, to_pdf
 from storage import (
     table_query,
@@ -38,6 +39,19 @@ from tool_registry import (
     execute_tool as registry_execute_tool,
     get_all_tool_definitions as registry_get_all_tool_definitions,
 )
+from tools_devops import (
+    tool_query_workitems,
+    tool_analyze_patterns_with_llm,
+    tool_generate_user_stories,
+    tool_query_hierarchy,
+    tool_compute_kpi,
+    tool_create_workitem,
+    tool_refine_workitem,
+)
+from tools_knowledge import tool_search_workitems, tool_search_website, tool_search_web
+from tools_upload import tool_search_uploaded_document
+from tools_export import tool_generate_chart, tool_generate_file
+from tools_learning import tool_get_writer_profile, tool_save_writer_profile
 
 _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
@@ -50,14 +64,8 @@ _generated_files_lock = asyncio.Lock()
 _GENERATED_FILE_TTL_SECONDS = 30 * 60
 _GENERATED_FILE_MAX = 100
 _GENERATED_FILE_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB
-_AUTO_EXPORT_MIN_ROWS = 25
-_WRITER_PROFILE_PARTITION = "writer"
-_WIQL_BLOCKLIST_RE = re.compile(
-    r"(?i)(;|--|/\*|\*/|\b(select|drop|delete|update|insert|merge|exec|execute|union)\b)"
-)
-_WORKITEM_TYPE_MAP = {str(t).strip().lower(): str(t).strip() for t in DEVOPS_WORKITEM_TYPES}
-US_TEMPLATE_VERSION = "mse-revamp-classic-v1"
-US_REQUIRED_SECTIONS = ["Proveniência", "Condições", "Composição", "Comportamento", "Mockup"]
+CHART_MAX_POINTS = 10_000  # limite de pontos no payload chart_ready (render)
+
 US_PREFERRED_VOCAB = [
     "CTA",
     "Label",
@@ -73,113 +81,6 @@ US_PREFERRED_VOCAB = [
     "Breadcrumb",
     "Sidebar",
 ]
-US_SECTION_SLUGS = {
-    "Proveniência": "proveniencia",
-    "Condições": "condicoes",
-    "Composição": "composicao",
-    "Comportamento": "comportamento",
-    "Mockup": "mockup",
-}
-
-
-def _normalize_author(author_name: str) -> str:
-    return " ".join((author_name or "").strip().lower().split())
-
-
-def _writer_profile_row_key(author_name: str) -> str:
-    base = _normalize_author(author_name)
-    if not base:
-        return ""
-    safe = (
-        base.replace("/", "_")
-        .replace("\\", "_")
-        .replace("#", "_")
-        .replace("?", "_")
-        .replace("'", "_")
-        .replace('"', "_")
-    )
-    return safe[:120]
-
-
-async def _save_writer_profile(
-    author_name: str,
-    analysis: str,
-    sample_ids=None,
-    sample_count: int = 0,
-    topic: str = "",
-    work_item_type: str = "User Story",
-) -> bool:
-    row_key = _writer_profile_row_key(author_name)
-    if not row_key or not analysis:
-        return False
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    entity = {
-        "PartitionKey": _WRITER_PROFILE_PARTITION,
-        "RowKey": row_key,
-        "AuthorName": (author_name or "").strip()[:200],
-        "AuthorLower": _normalize_author(author_name)[:200],
-        "StyleAnalysis": analysis[:20000],
-        "SampleCount": int(sample_count or 0),
-        "SampleIdsJson": json.dumps((sample_ids or [])[:100], ensure_ascii=False),
-        "Topic": (topic or "")[:200],
-        "WorkItemType": (work_item_type or "User Story")[:80],
-        "UpdatedAt": now_iso,
-    }
-
-    try:
-        existing = await table_query(
-            "WriterProfiles",
-            f"PartitionKey eq '{_WRITER_PROFILE_PARTITION}' and RowKey eq '{row_key}'",
-            top=1,
-        )
-        if existing:
-            await table_merge("WriterProfiles", entity)
-        else:
-            entity["CreatedAt"] = now_iso
-            inserted = await table_insert("WriterProfiles", entity)
-            if not inserted:
-                logging.error("[Tools] _save_writer_profile insert returned False")
-                return False
-        return True
-    except Exception as e:
-        logging.error("[Tools] _save_writer_profile failed: %s", e)
-        return False
-
-
-async def _load_writer_profile(author_name: str):
-    row_key = _writer_profile_row_key(author_name)
-    if not row_key:
-        return None
-
-    try:
-        rows = await table_query(
-            "WriterProfiles",
-            f"PartitionKey eq '{_WRITER_PROFILE_PARTITION}' and RowKey eq '{row_key}'",
-            top=1,
-        )
-        if not rows:
-            return None
-        row = rows[0]
-        sample_ids = []
-        raw_ids = row.get("SampleIdsJson", "[]")
-        try:
-            sample_ids = json.loads(raw_ids) if raw_ids else []
-        except Exception as e:
-            logging.warning("[Tools] _load_writer_profile sample ids parse failed: %s", e)
-        return {
-            "author_name": row.get("AuthorName", author_name),
-            "style_analysis": row.get("StyleAnalysis", ""),
-            "sample_count": int(row.get("SampleCount", 0) or 0),
-            "sample_ids": sample_ids if isinstance(sample_ids, list) else [],
-            "topic": row.get("Topic", ""),
-            "work_item_type": row.get("WorkItemType", "User Story"),
-            "updated_at": row.get("UpdatedAt", ""),
-        }
-    except Exception as e:
-        logging.error("[Tools] _load_writer_profile failed: %s", e)
-        return None
-
 
 def _as_dt(value):
     if isinstance(value, datetime):
@@ -284,53 +185,6 @@ async def _store_generated_file(content: bytes, mime_type: str, filename: str, f
     return fid
 
 
-async def _attach_auto_csv_export(result: dict, title_hint: str, min_rows: int = _AUTO_EXPORT_MIN_ROWS) -> None:
-    """Para resultados pesados, gera CSV completo automaticamente."""
-    if not isinstance(result, dict):
-        return
-    items = result.get("items")
-    if not isinstance(items, list):
-        return
-    total = int(result.get("total_count", len(items)) or 0)
-    if total < min_rows or len(items) < min_rows:
-        return
-    if total >= max(100, EXPORT_ASYNC_THRESHOLD_ROWS):
-        # Evita trabalho pesado inline; export pesado deve ir para worker assíncrono.
-        result["_auto_export_deferred"] = True
-        result["_auto_export_reason"] = "heavy_result_async_recommended"
-        return
-    if result.get("_auto_file_downloads"):
-        return
-
-    try:
-        payload = {"items": items, "total_count": total}
-        buf = to_csv(payload)
-        content = buf.getvalue()
-        if not content:
-            return
-        base_name = "".join(ch if ch.isalnum() or ch in " _-" else "_" for ch in str(title_hint or "export_completo")).strip()
-        base_name = (base_name or "export_completo")[:50]
-        filename = f"{base_name}.csv"
-        download_id = await _store_generated_file(content, "text/csv", filename, "csv")
-        if not download_id:
-            return
-        result["_auto_file_downloads"] = [
-            {
-                "download_id": download_id,
-                "endpoint": f"/api/download/{download_id}",
-                "filename": filename,
-                "format": "csv",
-                "mime_type": "text/csv",
-                "size_bytes": len(content),
-                "expires_in_seconds": _GENERATED_FILE_TTL_SECONDS,
-                "auto_generated": True,
-                "scope": "full_result",
-            }
-        ]
-    except Exception as e:
-        logging.warning("[Tools] auto csv export skipped: %s", e)
-
-
 async def get_generated_file(download_id: str):
     await _cleanup_generated_files()
     entry = _generated_files_store.get(download_id)
@@ -376,545 +230,11 @@ async def get_generated_file(download_id: str):
         logging.warning("[Tools] get_generated_file persistent fallback failed for %s: %s", download_id, e)
         return None
 
-# --- DevOps helpers ---
-async def _devops_request_with_retry(client, method, url, headers, json_body=None, max_retries=5):
-    last_status = None
-    for attempt in range(max_retries):
-        try:
-            resp = await (client.post(url, json=json_body, headers=headers) if method == "POST" else client.get(url, headers=headers))
-            last_status = resp.status_code
-            if resp.status_code == 429:
-                wait = min(int(resp.headers.get("Retry-After", 3*(attempt+1))), 30)
-                _log(f"429, attempt {attempt+1}/{max_retries}, wait {wait}s")
-                await asyncio.sleep(wait); continue
-            if resp.status_code >= 500:
-                await asyncio.sleep(2*(attempt+1)); continue
-            if resp.status_code >= 400:
-                _log(f"{resp.status_code}: {resp.text[:200]}")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            if attempt == max_retries-1: return {"error": f"DevOps {e.response.status_code}: {e.response.text[:200]}"}
-            await asyncio.sleep(1)
-        except httpx.TimeoutException:
-            if attempt == max_retries-1: return {"error": f"DevOps timeout após {max_retries} tentativas"}
-            await asyncio.sleep(2*(attempt+1))
-        except Exception as e:
-            if attempt == max_retries-1: return {"error": f"DevOps erro: {str(e)}"}
-    return {"error": f"Max retries (last status: {last_status})"}
-
-
-async def _search_request_with_retry(url, headers, json_body, max_retries=3):
-    """POST ao Azure AI Search com retries para 429/5xx/timeouts."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = await client.post(url, json=json_body, headers=headers)
-
-                if resp.status_code == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    try:
-                        wait = int(float(retry_after)) if retry_after is not None else 2 ** (attempt - 1)
-                    except (TypeError, ValueError):
-                        wait = 2 ** (attempt - 1)
-                    wait = max(1, min(wait, 30))
-                    if attempt == max_retries:
-                        logging.warning(
-                            "[Search] 429 attempt %s/%s, sem retries restantes",
-                            attempt, max_retries,
-                        )
-                        return {"error": f"Search 429 após {max_retries} tentativas"}
-                    logging.warning(
-                        "[Search] 429 attempt %s/%s, retry em %ss",
-                        attempt, max_retries, wait,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-
-                if resp.status_code >= 500:
-                    wait = min(2 ** (attempt - 1), 30)
-                    if attempt == max_retries:
-                        logging.warning(
-                            "[Search] %s attempt %s/%s, sem retries restantes",
-                            resp.status_code, attempt, max_retries,
-                        )
-                        return {"error": f"Search {resp.status_code} após {max_retries} tentativas"}
-                    logging.warning(
-                        "[Search] %s attempt %s/%s, retry em %ss",
-                        resp.status_code, attempt, max_retries, wait,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-
-                if resp.status_code >= 400:
-                    return {"error": f"Search {resp.status_code}: {resp.text[:200]}"}
-
-                return resp.json()
-
-            except httpx.TimeoutException:
-                wait = min(2 ** (attempt - 1), 30)
-                if attempt == max_retries:
-                    logging.warning(
-                        "[Search] timeout attempt %s/%s, sem retries restantes",
-                        attempt, max_retries,
-                    )
-                    return {"error": f"Search timeout após {max_retries} tentativas"}
-                logging.warning(
-                    "[Search] timeout attempt %s/%s, retry em %ss",
-                    attempt, max_retries, wait,
-                )
-                await asyncio.sleep(wait)
-            except httpx.RequestError as e:
-                wait = min(2 ** (attempt - 1), 30)
-                if attempt == max_retries:
-                    logging.warning(
-                        "[Search] request error attempt %s/%s (%s), sem retries restantes",
-                        attempt, max_retries, str(e),
-                    )
-                    return {"error": f"Search request error após {max_retries} tentativas: {str(e)}"}
-                logging.warning(
-                    "[Search] request error attempt %s/%s (%s), retry em %ss",
-                    attempt, max_retries, str(e), wait,
-                )
-                await asyncio.sleep(wait)
-            except Exception as e:
-                wait = min(2 ** (attempt - 1), 30)
-                if attempt == max_retries:
-                    logging.warning(
-                        "[Search] erro inesperado attempt %s/%s (%s), sem retries restantes",
-                        attempt, max_retries, str(e),
-                    )
-                    return {"error": f"Search erro: {str(e)}"}
-                logging.warning(
-                    "[Search] erro inesperado attempt %s/%s (%s), retry em %ss",
-                    attempt, max_retries, str(e), wait,
-                )
-                await asyncio.sleep(wait)
-
-    return {"error": "Search erro desconhecido"}
-
-
-def _build_rerank_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    token = str(RERANK_API_KEY or "").strip()
-    mode = str(RERANK_AUTH_MODE or "").strip().lower()
-    if token:
-        if mode == "bearer":
-            headers["Authorization"] = f"Bearer {token}"
-        elif mode == "api-key":
-            headers["api-key"] = token
-    return headers
-
-
-def _rerank_document_from_item(item: dict) -> str:
-    parts = []
-    for key in ("title", "content", "tag", "status", "type", "state", "area"):
-        val = str((item or {}).get(key, "") or "").strip()
-        if val:
-            parts.append(val)
-    return "\n".join(parts)[:8000]
-
-
-def _build_chat_rerank_payload(query: str, documents: list, top_n: int) -> dict:
-    safe_query = str(query or "").strip()[:2000]
-    docs_lines = []
-    for idx, doc in enumerate(documents):
-        compact = " ".join(str(doc or "").split())
-        docs_lines.append(f"{idx}: {compact[:1400]}")
-    docs_block = "\n".join(docs_lines)
-    system_prompt = (
-        "You are a strict retrieval reranker. "
-        "Return ONLY JSON with this exact shape: "
-        "{\"results\":[{\"index\":0,\"relevance_score\":1.0}]}. "
-        "Use indexes from provided documents and sort descending by relevance."
-    )
-    user_prompt = (
-        f"Query:\n{safe_query}\n\n"
-        f"TopN: {top_n}\n"
-        "Documents (index: content):\n"
-        f"{docs_block}\n\n"
-        "Return only JSON."
-    )
-    return {
-        "model": RERANK_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0,
-        "max_completion_tokens": max(256, min(1400, top_n * 48)),
-    }
-
-
-def _extract_rerank_rows_from_chat_response(data: dict) -> list:
-    if not isinstance(data, dict):
-        return []
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return []
-    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-    content = message.get("content", "")
-    text = ""
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        parts = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text":
-                parts.append(str(part.get("text", "") or ""))
-        text = "\n".join(parts).strip()
-    if not text:
-        return []
-
-    payload = None
-    try:
-        payload = json.loads(text)
-    except Exception:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return []
-        try:
-            payload = json.loads(match.group(0))
-        except Exception:
-            return []
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("results")
-    if isinstance(rows, list):
-        return rows
-    rows = payload.get("data")
-    if isinstance(rows, list):
-        return rows
-    return []
-
-
-async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, dict]:
-    if not isinstance(items, list):
-        return items, {"applied": False, "reason": "invalid_items"}
-    if len(items) < 2:
-        return items, {"applied": False, "reason": "too_few_items"}
-    if not RERANK_ENABLED:
-        return items, {"applied": False, "reason": "disabled"}
-    if not RERANK_ENDPOINT:
-        return items, {"applied": False, "reason": "missing_endpoint"}
-    if str(RERANK_AUTH_MODE or "").strip().lower() in ("api-key", "bearer") and not RERANK_API_KEY:
-        return items, {"applied": False, "reason": "missing_api_key"}
-
-    top_n = max(1, min(int(RERANK_TOP_N or len(items)), len(items)))
-    documents = [_rerank_document_from_item(item) for item in items]
-    endpoint_lower = str(RERANK_ENDPOINT or "").strip().lower()
-    use_chat_completions = "/chat/completions" in endpoint_lower
-    payload = (
-        _build_chat_rerank_payload(query, documents, top_n)
-        if use_chat_completions
-        else {
-            "model": RERANK_MODEL,
-            "query": str(query or "")[:2000],
-            "documents": documents,
-            "top_n": top_n,
-        }
-    )
-    headers = _build_rerank_headers()
-
-    try:
-        async with httpx.AsyncClient(timeout=RERANK_TIMEOUT_SECONDS) as client:
-            resp = await client.post(RERANK_ENDPOINT, headers=headers, json=payload)
-        if resp.status_code >= 400:
-            logging.warning("[Tools] rerank HTTP %s: %s", resp.status_code, resp.text[:300])
-            return items, {"applied": False, "reason": f"http_{resp.status_code}"}
-
-        data = resp.json()
-    except Exception as e:
-        logging.warning("[Tools] rerank request failed: %s", e)
-        return items, {"applied": False, "reason": "request_failed"}
-
-    ranked_rows = data.get("results")
-    if not isinstance(ranked_rows, list):
-        ranked_rows = data.get("data")
-    if not isinstance(ranked_rows, list) and use_chat_completions:
-        ranked_rows = _extract_rerank_rows_from_chat_response(data)
-    if not isinstance(ranked_rows, list):
-        return items, {"applied": False, "reason": "invalid_response"}
-
-    ranked_items = []
-    used_indexes = set()
-    for row in ranked_rows:
-        if not isinstance(row, dict):
-            continue
-        idx = row.get("index")
-        if not isinstance(idx, int):
-            continue
-        if idx < 0 or idx >= len(items):
-            continue
-        if idx in used_indexes:
-            continue
-        cloned = dict(items[idx])
-        score = row.get("relevance_score", row.get("score"))
-        try:
-            if score is not None:
-                cloned["rerank_score"] = round(float(score), 6)
-        except Exception:
-            pass
-        ranked_items.append(cloned)
-        used_indexes.add(idx)
-
-    if not ranked_items:
-        return items, {"applied": False, "reason": "empty_results"}
-
-    for idx, item in enumerate(items):
-        if idx not in used_indexes:
-            ranked_items.append(item)
-
-    return ranked_items, {
-        "applied": True,
-        "model": RERANK_MODEL,
-        "input_count": len(items),
-        "ranked_count": len(ranked_rows),
-        "top_n": top_n,
-    }
-
 def _devops_headers():
     return {"Authorization": f"Basic {base64.b64encode(f':{DEVOPS_PAT}'.encode()).decode()}", "Content-Type": "application/json"}
 
 def _devops_url(path):
     return f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_apis/{path}"
-
-def _format_wi(item):
-    f = item.get("fields", {})
-    a = f.get("System.AssignedTo", {}); c = f.get("System.CreatedBy", {})
-    result = {
-        "id": item["id"], "type": f.get("System.WorkItemType",""),
-        "title": f.get("System.Title","").replace(" | "," — "), "state": f.get("System.State",""),
-        "area": f.get("System.AreaPath",""),
-        "assigned_to": a.get("displayName","") if isinstance(a,dict) else str(a),
-        "created_by": c.get("displayName","") if isinstance(c,dict) else str(c),
-        "created_date": f.get("System.CreatedDate",""),
-        "url": f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{item['id']}",
-    }
-    # Include extra fields when present (Description, AcceptanceCriteria, Tags)
-    desc = f.get("System.Description", "")
-    ac = f.get("Microsoft.VSTS.Common.AcceptanceCriteria", "")
-    tags = f.get("System.Tags", "")
-    if desc: result["description"] = (desc or "")[:3000]
-    if ac: result["acceptance_criteria"] = (ac or "")[:3000]
-    if tags: result["tags"] = tags
-    return result
-
-
-def _safe_wiql_literal(value: str, max_len: int = 200) -> str:
-    text = str(value or "").strip()
-    if max_len > 0:
-        text = text[:max_len]
-    return text.replace("'", "''")
-
-
-def _normalize_match_text(value: str) -> str:
-    lowered = str(value or "").lower()
-    deaccented = unicodedata.normalize("NFKD", lowered)
-    clean = "".join(ch for ch in deaccented if not unicodedata.combining(ch))
-    clean = clean.replace("|", " ").replace("—", " ").replace("-", " ").replace("_", " ")
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
-
-
-def _canonicalize_area_path(area_path: str) -> str:
-    raw = str(area_path or "").strip()
-    if not raw:
-        return ""
-    if "\\" in raw:
-        return raw
-    norm = _normalize_match_text(raw)
-    if not norm:
-        return raw
-    for known in DEVOPS_AREAS:
-        known_norm = _normalize_match_text(known)
-        if known_norm.endswith(norm) or norm in known_norm:
-            return known
-    return raw
-
-
-def _sanitize_wiql_where(wiql_where: str) -> str:
-    where = str(wiql_where or "").strip()
-    if where.lower().startswith("where "):
-        where = where[6:].strip()
-    if not where:
-        raise ValueError("wiql_where vazio")
-    if len(where) > 2000:
-        raise ValueError("wiql_where demasiado longo (max 2000 chars)")
-    if _WIQL_BLOCKLIST_RE.search(where):
-        raise ValueError("wiql_where contém tokens proibidos")
-    if where.count("'") % 2 != 0:
-        raise ValueError("wiql_where com aspas simples não balanceadas")
-    return where
-
-
-def _extract_json_object(text: str):
-    if not isinstance(text, str):
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    candidate = text[start:end + 1]
-    try:
-        data = json.loads(candidate)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _validate_workitem_type(value: str, default: str = "User Story") -> str:
-    candidate = str(value or default).strip().lower()
-    safe = _WORKITEM_TYPE_MAP.get(candidate)
-    if not safe:
-        raise ValueError(
-            f"Tipo de work item inválido: '{value}'. Permitidos: {', '.join(DEVOPS_WORKITEM_TYPES)}"
-        )
-    return safe
-
-
-async def _resolve_parent_id_by_title_hint(
-    client,
-    headers: dict,
-    *,
-    parent_type: str,
-    area_path: str = "",
-    title_hint: str = "",
-) -> tuple[Optional[int], dict]:
-    hint_raw = str(title_hint or "").strip()
-    hint_norm = _normalize_match_text(hint_raw)
-    score_terms = [t for t in hint_norm.split(" ") if t][:8]
-    wiql_terms_src = re.sub(r"[|—\\-_]", " ", hint_raw)
-    wiql_terms_src = re.sub(r"\s+", " ", wiql_terms_src).strip()
-    wiql_terms = [t for t in wiql_terms_src.split(" ") if t][:8]
-    if not wiql_terms:
-        wiql_terms = score_terms[:]
-    if not score_terms:
-        score_terms = [_normalize_match_text(t) for t in wiql_terms]
-        score_terms = [t for t in score_terms if t][:8]
-    if not score_terms:
-        return None, {"attempted": False}
-
-    parent_type_norm = str(parent_type or "").strip().lower()
-    apply_area_filter = bool(area_path and parent_type_norm != "epic")
-    base_conds = [
-        f"[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}'",
-        f"[System.WorkItemType] = '{_safe_wiql_literal(parent_type, 80)}'",
-    ]
-    if apply_area_filter:
-        base_conds.append(f"[System.AreaPath] UNDER '{_safe_wiql_literal(area_path, 300)}'")
-    strict_conds = list(base_conds)
-    for term in wiql_terms:
-        strict_conds.append(f"[System.Title] CONTAINS '{_safe_wiql_literal(term, 80)}'")
-
-    wiql = (
-        "SELECT [System.Id] FROM WorkItems "
-        f"WHERE {' AND '.join(strict_conds)} "
-        "ORDER BY [System.ChangedDate] DESC"
-    )
-    resp = await _devops_request_with_retry(
-        client,
-        "POST",
-        _devops_url("wit/wiql?api-version=7.1"),
-        headers,
-        {"query": wiql},
-    )
-    if "error" in resp:
-        return None, {
-            "attempted": True,
-            "area_filter_applied": apply_area_filter,
-            "error": resp.get("error", "resolve_parent_failed"),
-            "wiql_terms": wiql_terms,
-        }
-
-    ids = [wi.get("id") for wi in resp.get("workItems", []) if wi.get("id")]
-    fallback_broad_used = False
-    if not ids and wiql_terms:
-        fallback_wiql = (
-            "SELECT [System.Id] FROM WorkItems "
-            f"WHERE {' AND '.join(base_conds)} "
-            "ORDER BY [System.ChangedDate] DESC"
-        )
-        fallback_resp = await _devops_request_with_retry(
-            client,
-            "POST",
-            _devops_url("wit/wiql?api-version=7.1"),
-            headers,
-            {"query": fallback_wiql},
-        )
-        if "error" not in fallback_resp:
-            ids = [wi.get("id") for wi in fallback_resp.get("workItems", []) if wi.get("id")]
-            fallback_broad_used = True
-
-    if not ids:
-        return None, {
-            "attempted": True,
-            "area_filter_applied": apply_area_filter,
-            "matched_candidates": 0,
-            "wiql_terms": wiql_terms,
-            "fallback_broad_used": fallback_broad_used,
-        }
-
-    batch_ids = ids[: min(50, len(ids))]
-    det = await _devops_request_with_retry(
-        client,
-        "POST",
-        _devops_url("wit/workitemsbatch?api-version=7.1"),
-        headers,
-        {"ids": batch_ids, "fields": ["System.Id", "System.Title", "System.WorkItemType", "System.AreaPath"]},
-    )
-    if "error" in det:
-        return None, {
-            "attempted": True,
-            "area_filter_applied": apply_area_filter,
-            "matched_candidates": len(ids),
-            "error": det.get("error", "resolve_parent_batch_failed"),
-            "wiql_terms": wiql_terms,
-            "fallback_broad_used": fallback_broad_used,
-        }
-
-    best_id = None
-    best_score = -1
-    exact_hits = 0
-    exact_title_hits = 0
-    for it in det.get("value", []):
-        f = it.get("fields", {})
-        title_norm = _normalize_match_text(str(f.get("System.Title", "") or ""))
-        score = sum(1 for term in score_terms if term in title_norm)
-        if score_terms and score == len(score_terms):
-            exact_hits += 1
-        if hint_norm and title_norm == hint_norm:
-            exact_title_hits += 1
-            score += 100
-        elif hint_norm and title_norm.startswith(hint_norm):
-            score += 20
-        if score > best_score:
-            best_score = score
-            best_id = it.get("id")
-
-    if best_id is None:
-        return None, {
-            "attempted": True,
-            "area_filter_applied": apply_area_filter,
-            "matched_candidates": len(ids),
-            "scored_candidates": len(det.get("value", [])),
-            "wiql_terms": wiql_terms,
-            "fallback_broad_used": fallback_broad_used,
-        }
-    return int(best_id), {
-        "attempted": True,
-        "area_filter_applied": apply_area_filter,
-        "matched_candidates": len(ids),
-        "scored_candidates": len(det.get("value", [])),
-        "best_score": best_score,
-        "max_score": len(score_terms),
-        "exact_hits": exact_hits,
-        "exact_title_hits": exact_title_hits,
-        "wiql_terms": wiql_terms,
-        "fallback_broad_used": fallback_broad_used,
-    }
 
 async def get_embedding(text):
     try:
@@ -922,197 +242,6 @@ async def get_embedding(text):
     except Exception as e:
         logging.error("[Tools] get_embedding failed: %s", e)
         return None
-
-# =============================================================================
-# TOOL 1: query_workitems
-# =============================================================================
-async def tool_query_workitems(wiql_where, fields=None, top=200):
-    _log(f"query_workitems: top={top}, wiql={str(wiql_where)[:80]}...")
-    try:
-        safe_where = _sanitize_wiql_where(wiql_where)
-    except ValueError as e:
-        return {"error": f"WIQL inválido: {e}"}
-    use_fields = fields if fields and len(fields) > 0 else DEVOPS_FIELDS
-    wiql = (
-        "SELECT [System.Id] FROM WorkItems "
-        f"WHERE [System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}' "
-        f"AND {safe_where} ORDER BY [System.ChangedDate] DESC"
-    )
-    headers = _devops_headers()
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await _devops_request_with_retry(client, "POST", _devops_url("wit/wiql?api-version=7.1"), headers, {"query": wiql})
-        if "error" in resp: return resp
-        work_items = resp.get("workItems", [])
-        total_count = len(work_items)
-        if top == 0: return {"total_count": total_count, "items": []}
-        work_items = work_items[:min(top, 1000) if top > 0 else total_count]
-        if not work_items: return {"total_count": 0, "items": []}
-        await asyncio.sleep(0.5)
-        all_details, failed_ids, ids = [], [], [wi["id"] for wi in work_items]
-        for i in range(0, len(ids), 100):
-            batch = ids[i:i+100]
-            r = await _devops_request_with_retry(client, "POST", _devops_url("wit/workitemsbatch?api-version=7.1"), headers, {"ids": batch, "fields": use_fields})
-            if "error" in r: failed_ids.extend(batch); await asyncio.sleep(3); continue
-            all_details.extend(r.get("value",[])); await asyncio.sleep(0.5)
-        if failed_ids and len(failed_ids) <= 50:
-            await asyncio.sleep(2)
-            fl = ",".join(use_fields)
-            for fid in failed_ids[:]:
-                r = await _devops_request_with_retry(client, "GET", _devops_url(f"wit/workitems/{fid}?fields={fl}&api-version=7.1"), headers, max_retries=3)
-                if "error" not in r and "id" in r: all_details.append(r); failed_ids.remove(fid)
-                await asyncio.sleep(0.3)
-        items = [_format_wi(it) for it in all_details]
-        if failed_ids and not items:
-            items = [{"id":fid,"type":"","title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed_ids]
-        result = {"total_count": total_count, "items_returned": len(items), "items": items}
-        await _attach_auto_csv_export(result, title_hint=f"query_workitems_{datetime.now().strftime('%Y%m%d_%H%M')}")
-        if failed_ids: result["_partial"] = True; result["_failed_batch_count"] = len(failed_ids)
-        return result
-
-# =============================================================================
-# TOOL 2: search_workitems
-# =============================================================================
-async def tool_search_workitems(query, top=30, filter_expr=None):
-    emb = await get_embedding(query)
-    if not emb: return {"error": "Falha embedding"}
-    body = {"vectorQueries":[{"kind":"vector","vector":emb,"fields":"content_vector","k":top}],"select":"id,content,url,tag,status","top":top}
-    if filter_expr: body["filter"] = filter_expr
-    url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{DEVOPS_INDEX}/docs/search?api-version={API_VERSION_SEARCH}"
-    data = await _search_request_with_retry(
-        url=url,
-        headers={"api-key": SEARCH_KEY, "Content-Type": "application/json"},
-        json_body=body,
-        max_retries=3,
-    )
-    if "error" in data:
-        return {"error": data["error"]}
-    items = []
-    for d in data.get("value",[]):
-        ct = d.get("content","")
-        items.append({"id":d.get("id",""),"title":ct.split("]")[0].replace("[","") if "]" in ct else ct[:100],"content":ct[:500],"status":d.get("status",""),"url":d.get("url",""),"score":round(d.get("@search.score",0),4)})
-    items, rerank_meta = await _rerank_items_post_retrieval(query, items)
-    result = {"total_results": len(items), "items": items}
-    if rerank_meta.get("applied"):
-        result["_rerank"] = rerank_meta
-    return result
-
-# =============================================================================
-# TOOL 3: search_website
-# =============================================================================
-async def tool_search_website(query, top=10):
-    emb = await get_embedding(query)
-    if not emb: return {"error": "Falha embedding"}
-    body = {"vectorQueries":[{"kind":"vector","vector":emb,"fields":"content_vector","k":top}],"select":"id,content,url,tag","top":top}
-    url = f"https://{SEARCH_SERVICE}.search.windows.net/indexes/{OMNI_INDEX}/docs/search?api-version={API_VERSION_SEARCH}"
-    data = await _search_request_with_retry(
-        url=url,
-        headers={"api-key": SEARCH_KEY, "Content-Type": "application/json"},
-        json_body=body,
-        max_retries=3,
-    )
-    if "error" in data:
-        return {"error": data["error"]}
-    items = [
-        {
-            "id": d.get("id", ""),
-            "content": d.get("content", "")[:500],
-            "url": d.get("url", ""),
-            "tag": d.get("tag", ""),
-            "score": round(d.get("@search.score", 0), 4),
-        }
-        for d in data.get("value", [])
-    ]
-    items, rerank_meta = await _rerank_items_post_retrieval(query, items)
-    result = {"total_results": len(items), "items": items}
-    if rerank_meta.get("applied"):
-        result["_rerank"] = rerank_meta
-    return result
-
-
-def _cosine_similarity(vec_a, vec_b):
-    if not isinstance(vec_a, list) or not isinstance(vec_b, list):
-        return -1.0
-    if not vec_a or not vec_b:
-        return -1.0
-    size = min(len(vec_a), len(vec_b))
-    if size <= 0:
-        return -1.0
-    a = vec_a[:size]
-    b = vec_b[:size]
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return -1.0
-    return dot / (norm_a * norm_b)
-
-
-async def _load_indexed_chunks(conv_id: str, user_sub: str = ""):
-    safe_conv = str(conv_id or "").strip().replace("'", "''")
-    if not safe_conv:
-        return []
-    safe_user = str(user_sub or "").strip()
-    try:
-        rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
-    except Exception as e:
-        logging.error("[Tools] _load_indexed_chunks table query failed: %s", e)
-        rows = []
-    chunk_pool = []
-    for row in rows:
-        owner_sub = str(row.get("UserSub", "") or "")
-        if safe_user:
-            # Segurança: impedir leitura de chunks de outros utilizadores.
-            if not owner_sub or owner_sub != safe_user:
-                continue
-        has_chunks = str(row.get("HasChunks", "")).lower() in ("true", "1")
-        if not has_chunks:
-            continue
-        filename = str(row.get("Filename", "") or "")
-        chunk_ref = str(row.get("ChunksBlobRef", "") or "")
-        container, blob_name = parse_blob_ref(chunk_ref)
-        if not container or not blob_name:
-            continue
-        try:
-            payload = await blob_download_json(container, blob_name)
-        except Exception as e:
-            logging.warning("[Tools] _load_indexed_chunks blob read failed for %s: %s", chunk_ref, e)
-            continue
-        chunks = []
-        if isinstance(payload, dict):
-            chunks = payload.get("chunks", []) if isinstance(payload.get("chunks"), list) else []
-        if not chunks:
-            continue
-        for chunk in chunks:
-            if not isinstance(chunk, dict):
-                continue
-            chunk_pool.append((filename, chunk))
-    return chunk_pool
-
-
-def _resolve_uploaded_files_memory(conv_id: str = "", user_sub: str = ""):
-    try:
-        from agent import uploaded_files_store  # import lazy para evitar ciclo no import-time
-    except Exception as e:
-        logging.error("[Tools] search_uploaded_document cannot import uploaded_files_store: %s", e)
-        return None, []
-
-    requested = (conv_id or "").strip()
-    safe_user = str(user_sub or "").strip()
-    if requested:
-        raw = uploaded_files_store.get(requested)
-        if isinstance(raw, dict) and isinstance(raw.get("files"), list):
-            files = raw.get("files", [])
-            if safe_user:
-                files = [f for f in files if str((f or {}).get("user_sub", "") or "") == safe_user]
-            return requested, files
-        if isinstance(raw, dict) and raw:
-            files = [raw]
-            if safe_user:
-                files = [f for f in files if str((f or {}).get("user_sub", "") or "") == safe_user]
-            return requested, files
-        return requested, []
-    return None, []
-
 
 def _normalize_lookup_key(value: str) -> str:
     txt = unicodedata.normalize("NFKD", str(value or ""))
@@ -1176,6 +305,12 @@ def _infer_group_by_mode(query: str, group_by: str) -> str:
         return "year"
     if raw in ("month", "mes", "mês", "mensal"):
         return "month"
+    if raw in ("quarter", "trimestre", "trimestral", "q"):
+        return "quarter"
+    if raw in ("week", "semana", "semanal"):
+        return "week"
+    if raw in ("day", "dia", "diario", "diário"):
+        return "day"
     if raw in ("none", "raw", "sem"):
         return "none"
     q = _normalize_lookup_key(query or "")
@@ -1183,6 +318,12 @@ def _infer_group_by_mode(query: str, group_by: str) -> str:
         return "year"
     if re.search(r"\b(mes|mensal|month|monthly)\b", q):
         return "month"
+    if re.search(r"\b(quarter|trimestre|trimestral|q[1-4])\b", q):
+        return "quarter"
+    if re.search(r"\b(week|weekly|semana|semanal)\b", q):
+        return "week"
+    if re.search(r"\b(day|daily|dia|diario)\b", q):
+        return "day"
     return "none"
 
 
@@ -1210,6 +351,95 @@ def _infer_agg_mode(query: str, agg: str) -> str:
     if re.search(r"\b(count|quantidade|numero|número|contagem)\b", q):
         return "count"
     return "mean"
+
+
+def _normalize_metric_name(value: str) -> str:
+    raw = _normalize_lookup_key(value or "")
+    aliases = {
+        "avg": "mean",
+        "average": "mean",
+        "media": "mean",
+        "mediana": "median",
+        "stddev": "std",
+        "stdev": "std",
+        "desvio": "std",
+        "q1": "p25",
+        "q3": "p75",
+    }
+    return aliases.get(raw, raw)
+
+
+def _resolve_requested_metrics(metrics, fallback_agg: str) -> list[str]:
+    allowed = {"min", "max", "mean", "sum", "count", "std", "median", "p25", "p75"}
+    resolved = []
+    for m in (metrics or []):
+        name = _normalize_metric_name(str(m or ""))
+        if name in allowed and name not in resolved:
+            resolved.append(name)
+    if resolved:
+        return resolved
+    fallback = _normalize_metric_name(fallback_agg or "mean")
+    if fallback not in allowed:
+        fallback = "mean"
+    return [fallback]
+
+
+def _compute_metrics(vals: list[float], requested_metrics: list[str], count_override: Optional[int] = None) -> dict:
+    if not vals and not (requested_metrics == ["count"] and count_override is not None):
+        return {}
+    result = {}
+    sorted_vals = sorted(vals) if vals else []
+    n_vals = len(sorted_vals)
+    for metric in requested_metrics:
+        m = _normalize_metric_name(metric)
+        if m == "count":
+            result["count"] = int(count_override if count_override is not None else n_vals)
+        elif m == "sum" and n_vals:
+            result["sum"] = round(sum(sorted_vals), 6)
+        elif m == "mean" and n_vals:
+            result["mean"] = round(sum(sorted_vals) / n_vals, 6)
+        elif m == "min" and n_vals:
+            result["min"] = round(sorted_vals[0], 6)
+        elif m == "max" and n_vals:
+            result["max"] = round(sorted_vals[-1], 6)
+        elif m == "std":
+            result["std"] = round(statistics.stdev(sorted_vals), 6) if n_vals > 1 else 0.0
+        elif m == "median" and n_vals:
+            result["median"] = round(statistics.median(sorted_vals), 6)
+        elif m == "p25" and n_vals:
+            result["p25"] = round(sorted_vals[int((n_vals - 1) * 0.25)], 6)
+        elif m == "p75" and n_vals:
+            result["p75"] = round(sorted_vals[int((n_vals - 1) * 0.75)], 6)
+    return result
+
+
+def _infer_chart_metric(requested_metrics: list[str], groups: list[dict]) -> str:
+    for metric in requested_metrics:
+        norm = _normalize_metric_name(metric)
+        if any(isinstance(g.get("metrics"), dict) and norm in g.get("metrics", {}) for g in groups):
+            return norm
+    for fallback in ("mean", "sum", "count", "max", "min", "median", "std", "p25", "p75"):
+        if any(isinstance(g.get("metrics"), dict) and fallback in g.get("metrics", {}) for g in groups):
+            return fallback
+    return requested_metrics[0] if requested_metrics else "mean"
+
+
+def _match_period(dt: datetime, period_expr: str) -> bool:
+    expr = str(period_expr or "").strip()
+    if not expr:
+        return False
+    if re.fullmatch(r"\d{4}$", expr):
+        return f"{dt.year:04d}" == expr
+    if re.fullmatch(r"\d{4}-\d{2}$", expr):
+        return f"{dt.year:04d}-{dt.month:02d}" == expr
+    if re.fullmatch(r"\d{4}-Q[1-4]$", expr, flags=re.IGNORECASE):
+        return f"{dt.year:04d}-Q{((dt.month - 1) // 3) + 1}".upper() == expr.upper()
+    if re.fullmatch(r"\d{4}-W\d{2}$", expr, flags=re.IGNORECASE):
+        iso_year, iso_week, _ = dt.isocalendar()
+        return f"{iso_year:04d}-W{iso_week:02d}".upper() == expr.upper()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", expr):
+        return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}" == expr
+    return str(dt.date()).startswith(expr)
 
 
 def _match_column_name(requested: str, columns):
@@ -1302,6 +532,10 @@ async def tool_analyze_uploaded_table(
     group_by: str = "",
     agg: str = "mean",
     top: int = 500,
+    metrics: list = None,
+    top_n: int = 0,
+    compare_periods: dict = None,
+    full_points: bool = False,
 ):
     q = str(query or "").strip()
     safe_conv = str(conv_id or "").strip()
@@ -1412,29 +646,102 @@ async def tool_analyze_uploaded_table(
     matched_value_col = _match_column_name(value_column, columns) if value_column else ""
     group_mode = _infer_group_by_mode(q, group_by)
     agg_mode = _infer_agg_mode(q, agg)
+    requested_metrics = _resolve_requested_metrics(metrics, agg_mode)
+    q_norm = _normalize_lookup_key(q)
+    warnings_list = []
+    rows_total = len(records)
+    valid_data_points = 0
+    was_sampled = False
 
-    if not matched_date_col and group_mode in ("year", "month"):
+    if not matched_date_col and group_mode in ("year", "month", "quarter", "week", "day"):
         matched_date_col = _infer_date_column(q, columns, records)
-    if not matched_value_col and agg_mode != "count":
+    if not matched_value_col and requested_metrics != ["count"]:
         matched_value_col = _infer_value_column(q, columns, records, date_column=matched_date_col)
 
-    if group_mode in ("year", "month") and not matched_date_col:
+    if group_mode in ("year", "month", "quarter", "week", "day") and not matched_date_col:
         return {
             "error": "Não consegui inferir a coluna de data. Indica date_column explicitamente.",
             "columns": columns,
             "filename": selected_filename,
         }
-    if agg_mode != "count" and not matched_value_col:
+    if requested_metrics != ["count"] and not matched_value_col:
         return {
             "error": "Não consegui inferir a coluna numérica para agregação. Indica value_column explicitamente.",
             "columns": columns,
             "filename": selected_filename,
         }
 
-    top_n = max(1, min(int(top or 500), 5000))
+    chart_top = max(1, min(int(top or 500), 5000))
+    top_n_limit = max(0, min(int(top_n or 0), 5000))
     groups = []
+    chart_groups = []
 
-    if group_mode in ("year", "month"):
+    if isinstance(compare_periods, dict) and compare_periods:
+        period_col = _match_column_name(compare_periods.get("col", ""), columns) if compare_periods.get("col") else matched_date_col
+        if not period_col:
+            return {"error": "compare_periods requer coluna de data válida.", "filename": selected_filename}
+        period_1 = str(compare_periods.get("period1", "") or "").strip()
+        period_2 = str(compare_periods.get("period2", "") or "").strip()
+        if not period_1 or not period_2:
+            return {"error": "compare_periods requer period1 e period2.", "filename": selected_filename}
+
+        period_1_vals = []
+        period_2_vals = []
+        period_1_count = 0
+        period_2_count = 0
+        for row in records:
+            dt = _parse_datetime_value(row.get(period_col, ""))
+            if dt is None:
+                continue
+            if _match_period(dt, period_1):
+                period_1_count += 1
+                if requested_metrics != ["count"]:
+                    num = _parse_numeric_value(row.get(matched_value_col, ""))
+                    if num is not None:
+                        period_1_vals.append(num)
+            elif _match_period(dt, period_2):
+                period_2_count += 1
+                if requested_metrics != ["count"]:
+                    num = _parse_numeric_value(row.get(matched_value_col, ""))
+                    if num is not None:
+                        period_2_vals.append(num)
+
+        valid_data_points = len(period_1_vals) + len(period_2_vals) if requested_metrics != ["count"] else (period_1_count + period_2_count)
+        metrics_p1 = _compute_metrics(period_1_vals, requested_metrics, count_override=period_1_count)
+        metrics_p2 = _compute_metrics(period_2_vals, requested_metrics, count_override=period_2_count)
+        if not metrics_p1 and not metrics_p2:
+            return {"error": "Sem dados suficientes para comparar os períodos pedidos.", "filename": selected_filename}
+
+        delta = {}
+        for key in sorted(set(metrics_p1.keys()) | set(metrics_p2.keys())):
+            v1 = metrics_p1.get(key)
+            v2 = metrics_p2.get(key)
+            if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+                delta[key] = round(v2 - v1, 6)
+
+        return {
+            "source": "uploaded_table_raw_blob",
+            "comparison": True,
+            "conversation_id": safe_conv,
+            "filename": selected_filename,
+            "row_count": len(records),
+            "columns": columns,
+            "date_column": period_col,
+            "value_column": matched_value_col,
+            "requested_metrics": requested_metrics,
+            "period1": {"name": period_1, "metrics": metrics_p1, "count": period_1_count},
+            "period2": {"name": period_2, "metrics": metrics_p2, "count": period_2_count},
+            "delta": delta,
+            "analysis_quality": {
+                "coverage": round(valid_data_points / max(1, len(records)), 4),
+                "sampled": False,
+                "rows_processed": len(records),
+                "rows_total": rows_total,
+                "warnings": warnings_list,
+            },
+        }
+
+    if group_mode in ("year", "month", "quarter", "week", "day"):
         buckets = {}
         for row in records:
             dt = _parse_datetime_value(row.get(matched_date_col, ""))
@@ -1442,40 +749,45 @@ async def tool_analyze_uploaded_table(
                 continue
             if group_mode == "year":
                 key = f"{dt.year:04d}"
-            else:
+            elif group_mode == "month":
                 key = f"{dt.year:04d}-{dt.month:02d}"
+            elif group_mode == "quarter":
+                key = f"{dt.year:04d}-Q{((dt.month - 1) // 3) + 1}"
+            elif group_mode == "week":
+                iso_year, iso_week, _ = dt.isocalendar()
+                key = f"{iso_year:04d}-W{iso_week:02d}"
+            else:
+                key = f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
             bucket = buckets.setdefault(key, {"key": key, "values": [], "count": 0})
-            if agg_mode == "count":
-                bucket["count"] += 1
+            bucket["count"] += 1
+            if requested_metrics == ["count"]:
                 continue
             num = _parse_numeric_value(row.get(matched_value_col, ""))
             if num is None:
                 continue
             bucket["values"].append(num)
-            bucket["count"] += 1
+            valid_data_points += 1
 
         for key in sorted(buckets.keys()):
             bucket = buckets[key]
-            if agg_mode == "count":
-                value = float(bucket["count"])
+            metrics_map = _compute_metrics(
+                bucket["values"],
+                requested_metrics,
+                count_override=bucket["count"],
+            )
+            if not metrics_map:
+                continue
+            if metrics:
+                groups.append({"group": key, "metrics": metrics_map, "count": int(bucket["count"])})
             else:
-                vals = bucket["values"]
-                if not vals:
+                value = metrics_map.get(agg_mode)
+                if value is None:
                     continue
-                if agg_mode == "mean":
-                    value = sum(vals) / len(vals)
-                elif agg_mode == "sum":
-                    value = sum(vals)
-                elif agg_mode == "min":
-                    value = min(vals)
-                elif agg_mode == "max":
-                    value = max(vals)
-                else:
-                    value = sum(vals) / len(vals)
-            groups.append({"group": key, "value": round(value, 6), "count": int(bucket["count"])})
+                groups.append({"group": key, "value": round(float(value), 6), "count": int(bucket["count"])})
     else:
-        # Modo "none": se houver data+valor, devolve série temporal determinística.
-        if matched_date_col and matched_value_col:
+        series_intent = bool(re.search(r"\b(grafico|gráfico|chart|linha|line|evolucao|evolução|time series|serie temporal)\b", q_norm))
+        if matched_date_col and matched_value_col and series_intent:
+            # Modo "none" com pedido de gráfico temporal.
             series = []
             for row in records:
                 dt = _parse_datetime_value(row.get(matched_date_col, ""))
@@ -1486,11 +798,17 @@ async def tool_analyze_uploaded_table(
             series.sort(key=lambda x: x[0])
             if not series:
                 return {"error": "Sem dados numéricos/datas válidos para gerar série temporal.", "filename": selected_filename}
-            if len(series) > top_n:
-                step = max(1, len(series) // top_n)
-                sampled = [series[i] for i in range(0, len(series), step)][:top_n]
-            else:
+            if full_points:
                 sampled = series
+            else:
+                if len(series) > chart_top:
+                    step = max(1, len(series) // chart_top)
+                    sampled = [series[i] for i in range(0, len(series), step)][:chart_top]
+                    was_sampled = True
+                    warnings_list.append(f"Série temporal amostrada para {len(sampled)} de {len(series)} pontos.")
+                else:
+                    sampled = series
+            valid_data_points = len(series)
             groups = [
                 {"group": dt.isoformat(), "value": round(val, 6), "count": 1}
                 for dt, val in sampled
@@ -1501,31 +819,78 @@ async def tool_analyze_uploaded_table(
                 val = _parse_numeric_value(row.get(matched_value_col, ""))
                 if val is not None:
                     nums.append(val)
+            valid_data_points = len(nums)
             if not nums:
                 return {"error": "Sem dados numéricos válidos na coluna indicada.", "filename": selected_filename}
-            if agg_mode == "sum":
-                overall = sum(nums)
-            elif agg_mode == "min":
-                overall = min(nums)
-            elif agg_mode == "max":
-                overall = max(nums)
-            elif agg_mode == "count":
-                overall = float(len(nums))
+            metrics_map = _compute_metrics(nums, requested_metrics, count_override=len(nums))
+            if not metrics_map:
+                return {"error": "Sem métricas válidas para o conjunto de dados.", "filename": selected_filename}
+            if metrics:
+                groups = [{"group": "overall", "metrics": metrics_map, "count": len(nums)}]
             else:
-                overall = sum(nums) / len(nums)
-            groups = [{"group": "overall", "value": round(overall, 6), "count": len(nums)}]
+                overall = metrics_map.get(agg_mode)
+                if overall is None:
+                    return {"error": f"Métrica '{agg_mode}' indisponível para os dados.", "filename": selected_filename}
+                groups = [{"group": "overall", "value": round(float(overall), 6), "count": len(nums)}]
         else:
             return {"error": "Indica value_column para análise sem agrupamento.", "columns": columns, "filename": selected_filename}
 
     if not groups:
         return {"error": "Não foi possível produzir agregações com os filtros atuais.", "filename": selected_filename}
 
-    x_values = [g.get("group", "") for g in groups]
-    y_values = [g.get("value", 0) for g in groups]
-    chart_type = "bar" if group_mode in ("year", "month") else "line"
-    x_label = "Ano" if group_mode == "year" else ("Ano-Mês" if group_mode == "month" else (matched_date_col or "Grupo"))
-    metric_label = "count" if agg_mode == "count" else f"{agg_mode}({matched_value_col})"
-    chart_title = f"{metric_label} por {x_label.lower()}" if group_mode in ("year", "month") else f"{metric_label} - {selected_filename}"
+    if top_n_limit > 0 and len(groups) > top_n_limit:
+        if metrics:
+            sort_metric = _infer_chart_metric(requested_metrics, groups)
+            groups = sorted(
+                groups,
+                key=lambda g: float((g.get("metrics") or {}).get(sort_metric, float("-inf"))),
+                reverse=True,
+            )[:top_n_limit]
+            warnings_list.append(f"Resultado limitado aos top {top_n_limit} grupos por {sort_metric}.")
+        else:
+            groups = sorted(groups, key=lambda g: float(g.get("value", float("-inf"))), reverse=True)[:top_n_limit]
+            warnings_list.append(f"Resultado limitado aos top {top_n_limit} grupos.")
+
+    chart_groups = groups
+    if len(chart_groups) > CHART_MAX_POINTS:
+        step = max(1, len(chart_groups) // CHART_MAX_POINTS)
+        chart_groups = [chart_groups[i] for i in range(0, len(chart_groups), step)][:CHART_MAX_POINTS]
+        was_sampled = True
+        if full_points:
+            warnings_list.append(
+                f"chart_ready amostrado para {len(chart_groups)} de {len(groups)} pontos "
+                "(full_points=true: groups contém todos)."
+            )
+        else:
+            warnings_list.append(f"chart_ready limitado a {len(chart_groups)} de {len(groups)} grupos.")
+
+    x_values = [g.get("group", "") for g in chart_groups]
+    if metrics:
+        chart_metric = _infer_chart_metric(requested_metrics, chart_groups)
+        y_values = [float((g.get("metrics") or {}).get(chart_metric, 0)) for g in chart_groups]
+        metric_label = "count" if chart_metric == "count" else f"{chart_metric}({matched_value_col})"
+    else:
+        chart_metric = agg_mode
+        y_values = [float(g.get("value", 0)) for g in chart_groups]
+        metric_label = "count" if agg_mode == "count" else f"{agg_mode}({matched_value_col})"
+    chart_type = "bar" if group_mode in ("year", "month", "quarter", "week", "day") else "line"
+    if group_mode == "year":
+        x_label = "Ano"
+    elif group_mode == "month":
+        x_label = "Ano-Mês"
+    elif group_mode == "quarter":
+        x_label = "Ano-Trimestre"
+    elif group_mode == "week":
+        x_label = "Ano-Semana"
+    elif group_mode == "day":
+        x_label = "Dia"
+    else:
+        x_label = matched_date_col or "Grupo"
+    chart_title = (
+        f"{metric_label} por {x_label.lower()}"
+        if group_mode in ("year", "month", "quarter", "week", "day")
+        else f"{metric_label} - {selected_filename}"
+    )
 
     return {
         "source": "uploaded_table_raw_blob",
@@ -1535,6 +900,7 @@ async def tool_analyze_uploaded_table(
         "columns": columns,
         "group_by": group_mode,
         "agg": agg_mode,
+        "requested_metrics": requested_metrics,
         "date_column": matched_date_col,
         "value_column": matched_value_col,
         "groups": groups,
@@ -1543,6 +909,13 @@ async def tool_analyze_uploaded_table(
             f"Agrupamento={group_mode}, agregação={agg_mode}, "
             f"date_column={matched_date_col or '-'}, value_column={matched_value_col or '-'}."
         ),
+        "analysis_quality": {
+            "coverage": round(valid_data_points / max(1, len(records)), 4),
+            "sampled": was_sampled,
+            "rows_processed": len(records),
+            "rows_total": rows_total,
+            "warnings": warnings_list,
+        },
         "chart_ready": {
             "chart_type": chart_type,
             "title": chart_title,
@@ -1550,1266 +923,6 @@ async def tool_analyze_uploaded_table(
             "y_values": y_values,
             "x_label": x_label,
             "y_label": metric_label,
-        },
-    }
-
-
-async def tool_search_uploaded_document(query: str = "", conv_id: str = "", user_sub: str = ""):
-    q = (query or "").strip()
-    if not q:
-        return {"error": "query é obrigatório"}
-
-    resolved_conv_id = (conv_id or "").strip()
-    if not resolved_conv_id:
-        return {"error": "conv_id é obrigatório para pesquisa em documento carregado"}
-
-    safe_user = str(user_sub or "").strip()
-    chunk_pool = await _load_indexed_chunks(resolved_conv_id, user_sub=safe_user)
-
-    # Fallback retrocompatível: memória local (deploy antigo / jobs ainda sem indexação persistida).
-    source = "upload_index"
-    if not chunk_pool:
-        source = "memory_fallback"
-        _, files = _resolve_uploaded_files_memory(resolved_conv_id, user_sub=safe_user)
-        for file_data in files:
-            chunks = file_data.get("chunks")
-            if not isinstance(chunks, list) or not chunks:
-                continue
-            fname = file_data.get("filename", "")
-            for chunk in chunks:
-                chunk_pool.append((fname, chunk))
-
-    if not chunk_pool:
-        return {"error": "Nenhum documento com chunks semânticos indexados nesta conversa."}
-
-    query_embedding = await get_embedding(q)
-    if not query_embedding:
-        return {"error": "Falha ao calcular embedding da query"}
-
-    scored = []
-    for filename, chunk in chunk_pool:
-        chunk_embedding = chunk.get("embedding")
-        try:
-            score = _cosine_similarity(query_embedding, chunk_embedding)
-        except Exception as e:
-            logging.warning("[Tools] search_uploaded_document chunk score failed: %s", e)
-            continue
-        if score < 0:
-            continue
-        scored.append(
-            {
-                "filename": filename,
-                "chunk_index": chunk.get("index"),
-                "start": chunk.get("start"),
-                "end": chunk.get("end"),
-                "score": score,
-                "text": chunk.get("text", ""),
-            }
-        )
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top_chunks = scored[:5]
-    for item in top_chunks:
-        item["score"] = round(item["score"], 4)
-
-    return {
-        "source": source,
-        "conversation_id": resolved_conv_id,
-        "filenames": sorted(list({f for f, _ in chunk_pool if f})),
-        "query": q,
-        "total_chunks": len(chunk_pool),
-        "total_results": len(top_chunks),
-        "items": top_chunks,
-    }
-
-# =============================================================================
-# TOOL 4: analyze_patterns
-# =============================================================================
-async def tool_analyze_patterns(created_by=None, topic=None, work_item_type="User Story", area_path=None, sample_size=15):
-    try:
-        safe_type = _validate_workitem_type(work_item_type, "User Story")
-    except ValueError as e:
-        return {"error": str(e)}
-
-    conds = [f"[System.WorkItemType]='{_safe_wiql_literal(safe_type, 80)}'"]
-    if created_by:
-        conds.append(f"[System.CreatedBy] CONTAINS '{_safe_wiql_literal(created_by, 200)}'")
-    if topic:
-        conds.append(f"[System.Title] CONTAINS '{_safe_wiql_literal(topic, 200)}'")
-    if area_path:
-        conds.append(f"[System.AreaPath] UNDER '{_safe_wiql_literal(area_path, 300)}'")
-    else:
-        conds.append(
-            "(" + " OR ".join(
-                f"[System.AreaPath] UNDER '{_safe_wiql_literal(a, 300)}'" for a in DEVOPS_AREAS
-            ) + ")"
-        )
-    result = await tool_query_workitems(" AND ".join(conds), top=sample_size)
-    if "error" in result: return result
-    ids = [it.get("id") for it in result.get("items",[]) if it.get("id")]
-    samples = []
-    if ids:
-        det_fields = DEVOPS_FIELDS + ["System.Description","Microsoft.VSTS.Common.AcceptanceCriteria","System.Tags"]
-        async with httpx.AsyncClient(timeout=30) as c:
-            try:
-                r = await _devops_request_with_retry(c, "POST", _devops_url("wit/workitemsbatch?api-version=7.1"), _devops_headers(), {"ids":ids[:sample_size],"fields":det_fields})
-                if "error" not in r:
-                    for it in r.get("value",[]):
-                        f=it.get("fields",{}); cb=f.get("System.CreatedBy",{})
-                        samples.append({"id":it["id"],"title":f.get("System.Title","").replace(" | "," — "),"created_by":cb.get("displayName","") if isinstance(cb,dict) else str(cb),"description":(f.get("System.Description","") or "")[:1000],"acceptance_criteria":(f.get("Microsoft.VSTS.Common.AcceptanceCriteria","") or "")[:1000],"tags":f.get("System.Tags","")})
-            except Exception as e:
-                logging.error("[Tools] tool_analyze_patterns LLM block failed: %s", e)
-    if not samples: samples = [{"id":it.get("id"),"title":it.get("title","")} for it in result.get("items",[])]
-    return {"total_found": result.get("total_count",0), "samples_returned": len(samples), "analysis_data": samples}
-
-async def tool_analyze_patterns_with_llm(created_by=None, topic=None, work_item_type="User Story", area_path=None, sample_size=15, analysis_type="template"):
-    raw = await tool_analyze_patterns(created_by, topic, work_item_type, area_path, sample_size)
-    if "error" in raw or raw.get("samples_returned",0)==0: return raw
-    txt = ""
-    for i,s in enumerate(raw.get("analysis_data",[])[:15],1):
-        txt += f"\n--- Exemplo {i} (ID {s.get('id','?')}) ---\nTítulo: {s.get('title','')}\nCriado por: {s.get('created_by','')}\n"
-        if s.get("description"): txt += f"Descrição: {s['description'][:600]}\n"
-        if s.get("acceptance_criteria"): txt += f"Critérios: {s['acceptance_criteria'][:600]}\n"
-    prompts = {"template": f"Analisa {raw['samples_returned']} {work_item_type}s e extrai PADRÃO DE ESCRITA.\n\n{txt}\n\nExtrai: 1.Estrutura 2.Linguagem 3.Campos 4.Template 5.Observações\nPT-PT.", "author_style": f"Analisa estilo de '{created_by or 'autor'}' em:\n\n{txt}\n\nDescreve: estilo, estrutura, vocabulário, detalhe, template.\nPT-PT."}
-    fallback_prompt = f"Analisa:\n{txt}\nPT-PT."
-    try: analysis = await llm_simple(f"És analista de padrões de escrita.\n\n{prompts.get(analysis_type, fallback_prompt)}", tier="standard", max_tokens=2000)
-    except Exception as e:
-        logging.error("[Tools] tool_analyze_patterns_with_llm failed: %s", e)
-        analysis = f"Erro: {e}"
-    profile_saved = False
-    if analysis_type == "author_style" and created_by and isinstance(analysis, str) and not analysis.startswith("Erro:"):
-        profile_saved = await _save_writer_profile(
-            author_name=created_by,
-            analysis=analysis,
-            sample_ids=[s.get("id") for s in raw.get("analysis_data", []) if s.get("id")],
-            sample_count=raw.get("samples_returned", 0),
-            topic=topic or "",
-            work_item_type=work_item_type,
-        )
-
-    return {
-        "total_found": raw.get("total_found",0),
-        "samples_analyzed": raw.get("samples_returned",0),
-        "analysis_type": analysis_type,
-        "analysis": analysis,
-        "sample_ids": [s.get("id") for s in raw.get("analysis_data",[])],
-        "writer_profile_saved": profile_saved,
-    }
-
-
-def _normalize_text_ascii(value: str) -> str:
-    txt = unicodedata.normalize("NFKD", str(value or ""))
-    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
-    return txt.lower()
-
-
-def _unescape_html_if_needed(text):
-    raw = str(text or "")
-    if ("&lt;" not in raw and "&gt;" not in raw and "&amp;" not in raw and "&quot;" not in raw):
-        return raw
-    return (
-        raw.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&amp;", "&")
-    )
-
-
-def _split_generated_stories(text: str):
-    raw = str(text or "").strip()
-    if not raw:
-        return []
-
-    def _split_by_starts(starts):
-        parts = []
-        for idx, start in enumerate(starts):
-            end = starts[idx + 1] if idx + 1 < len(starts) else len(raw)
-            chunk = raw[start:end].strip()
-            if chunk:
-                parts.append(chunk)
-        return parts
-
-    marker_patterns = [
-        r"(?im)^(?:###|##)\s*User Story\s+\d+.*$",
-        r"(?im)^\s*(?:T[ií]tulo|Title)\s*:\s*MSE\s*\|",
-    ]
-    for pattern in marker_patterns:
-        starts = [m.start() for m in re.finditer(pattern, raw)]
-        if len(starts) >= 2:
-            return _split_by_starts(starts)
-
-    parts = [p.strip() for p in re.split(r"(?m)^\s*(?:---+|===+)\s*$", raw) if p.strip()]
-    if len(parts) >= 2:
-        return parts
-
-    return [raw]
-
-
-def _extract_story_title_and_ac(story_text: str):
-    txt = str(story_text or "")
-    title = ""
-
-    title_match = re.search(r"(?im)^\s*(?:T[ií]tulo|Title)\s*:\s*(.+)$", txt)
-    if title_match:
-        title = title_match.group(1).strip()
-    else:
-        inline_title = re.search(r"(?im)\bMSE\s*\|[^\n\r]+", txt)
-        if inline_title:
-            title = inline_title.group(0).strip()
-
-    ac_html = txt
-    ac_match = re.search(
-        r"(?is)(?:Crit[eé]rios?\s+de\s+Aceita[cç][aã]o|AC)\s*:?\s*(.+)$",
-        txt,
-    )
-    if ac_match:
-        ac_html = ac_match.group(1).strip()
-
-    return title, ac_html
-
-
-def _check_required_sections(ac_html):
-    text = str(ac_html or "")
-    normalized_text = _normalize_text_ascii(text)
-    if not normalized_text:
-        return {"missing": list(US_REQUIRED_SECTIONS), "out_of_order": []}
-
-    positions = {}
-    missing = []
-    for section in US_REQUIRED_SECTIONS:
-        target = _normalize_text_ascii(section)
-        bold_match = re.search(rf"<b>\s*{re.escape(target)}\s*</b>", normalized_text, flags=re.IGNORECASE)
-        plain_pos = normalized_text.find(target)
-        pos = bold_match.start() if bold_match else plain_pos
-        if pos < 0:
-            missing.append(section)
-        else:
-            positions[section] = pos
-
-    out_of_order = []
-    last_pos = -1
-    for section in US_REQUIRED_SECTIONS:
-        if section in missing:
-            continue
-        pos = positions.get(section, -1)
-        if pos < last_pos:
-            out_of_order.append(section)
-        else:
-            last_pos = pos
-
-    return {"missing": missing, "out_of_order": out_of_order}
-
-
-def _collect_quality_flags(title, ac_html):
-    title_txt = str(title or "").strip()
-    ac_txt = str(ac_html or "")
-    flags = []
-
-    if not title_txt.startswith("MSE |"):
-        flags.append("missing_mse_prefix")
-
-    segments = [seg.strip() for seg in title_txt.split(" | ") if seg.strip()]
-    if not (4 <= len(segments) <= 6):
-        flags.append("title_segment_count_invalid")
-
-    section_result = _check_required_sections(ac_txt)
-    for section in section_result.get("missing", []):
-        slug = US_SECTION_SLUGS.get(section, _normalize_text_ascii(section).replace(" ", "_"))
-        flags.append(f"missing_section_{slug}")
-    for section in section_result.get("out_of_order", []):
-        slug = US_SECTION_SLUGS.get(section, _normalize_text_ascii(section).replace(" ", "_"))
-        flags.append(f"section_out_of_order_{slug}")
-
-    combined = f"{title_txt}\n{ac_txt}"
-    if "&lt;" in combined or "&gt;" in combined:
-        flags.append("html_escaped")
-
-    return flags
-
-
-def _extract_user_template_request(context, topic):
-    keyword_patterns = [
-        "template",
-        "formato",
-        "estrutura",
-        "segue este padrao",
-        "usa este modelo",
-        "use this format",
-        "follow this structure",
-    ]
-    sources = [str(context or "").strip(), str(topic or "").strip()]
-
-    for source in sources:
-        if not source:
-            continue
-        normalized_source = _normalize_text_ascii(source)
-        has_keyword = any(k in normalized_source for k in keyword_patterns)
-        lines = [line.rstrip() for line in source.splitlines()]
-        structured_lines = [
-            line for line in lines
-            if line.strip() and (
-                ":" in line
-                or line.strip().startswith("#")
-                or line.strip().startswith("- ")
-                or line.strip().startswith("* ")
-                or "**" in line
-            )
-        ]
-        if has_keyword and len(structured_lines) >= 3:
-            return "\n".join(line.strip() for line in lines if line.strip())[:4000]
-
-    merged = "\n".join(part for part in sources if part).strip()
-    if not merged:
-        return None
-    normalized_merged = _normalize_text_ascii(merged)
-    has_keyword = any(k in normalized_merged for k in keyword_patterns)
-    lines = [line.rstrip() for line in merged.splitlines()]
-    structured_lines = [
-        line for line in lines
-        if line.strip() and (
-            ":" in line
-            or line.strip().startswith("#")
-            or line.strip().startswith("- ")
-            or line.strip().startswith("* ")
-            or "**" in line
-        )
-    ]
-    if has_keyword and len(structured_lines) >= 3:
-        return "\n".join(line.strip() for line in lines if line.strip())[:4000]
-    return None
-
-
-def _resolve_detail_policy(context, topic):
-    user_template = _extract_user_template_request(context, topic)
-    if user_template:
-        return {"policy": "user_template", "user_template": user_template}
-    return {"policy": "habitual", "user_template": None}
-
-
-def _extract_flow_context_json(context):
-    marker = "FLOW_CONTEXT_JSON:"
-    raw = str(context or "")
-    idx = raw.find(marker)
-    if idx < 0:
-        return None
-    payload = raw[idx + len(marker):].strip()
-    if not payload:
-        return None
-
-    parsed = None
-    try:
-        parsed = json.loads(payload)
-    except Exception:
-        parsed = _extract_json_object(payload)
-
-    if isinstance(parsed, dict) and isinstance(parsed.get("steps"), list):
-        return parsed
-    return None
-
-
-# =============================================================================
-# TOOL 5: generate_user_stories
-# =============================================================================
-async def tool_generate_user_stories(topic, context="", num_stories=3, reference_area=None, reference_author=None, reference_topic=None):
-    style_profile = None
-    if reference_author:
-        style_profile = await _load_writer_profile(reference_author)
-
-    raw = {"samples_returned": 0, "analysis_data": []}
-    reference_ids = []
-    style_hint = ""
-    ex = ""
-
-    if style_profile and style_profile.get("style_analysis"):
-        _log(f"generate_user_stories: using cached writer profile for '{reference_author}'")
-        reference_ids = style_profile.get("sample_ids", [])
-        style_hint = (
-            f"\nPERFIL DE ESCRITA CACHEADO ({style_profile.get('author_name', reference_author)}):\n"
-            f"{style_profile.get('style_analysis', '')[:3000]}\n"
-        )
-        ex = "(Perfil de autor carregado de WriterProfiles; não foi necessário reanalisar padrões.)"
-    else:
-        search_topic = reference_topic or topic
-        raw = await tool_analyze_patterns(
-            created_by=reference_author,
-            topic=(search_topic[:35] if len(search_topic) > 35 else search_topic) or None,
-            area_path=reference_area,
-            sample_size=20,
-        )
-        if raw.get("samples_returned", 0) < 5:
-            raw2 = await tool_analyze_patterns(
-                created_by=reference_author,
-                area_path=reference_area,
-                sample_size=20,
-            )
-            if raw2.get("samples_returned", 0) > raw.get("samples_returned", 0):
-                raw = raw2
-        for i, s in enumerate(raw.get("analysis_data", [])[:12], 1):
-            ex += f"\n{'='*50}\nEXEMPLO {i} (ID:{s.get('id','?')})\n{'='*50}\nTÍTULO: {s.get('title','')}\nCRIADOR: {s.get('created_by','')}\n"
-            if s.get("description"): ex += f"DESC:\n{s['description'][:800]}\n"
-            if s.get("acceptance_criteria"): ex += f"AC:\n{s['acceptance_criteria'][:800]}\n"
-        if not ex:
-            ex = "(Sem exemplos — usa boas práticas)"
-        reference_ids = [s.get("id") for s in raw.get("analysis_data", [])]
-
-    detail_policy = _resolve_detail_policy(context, topic)
-    policy = detail_policy.get("policy", "habitual")
-    user_template = detail_policy.get("user_template")
-    flow_context = _extract_flow_context_json(context)
-    flow_mode = isinstance(flow_context, dict)
-    flow_steps = flow_context.get("steps", []) if flow_mode else []
-    flow_branches = flow_context.get("branches", []) if flow_mode else []
-
-    try:
-        requested_num_stories = max(1, int(num_stories))
-    except Exception:
-        requested_num_stories = 1
-    effective_num_stories = requested_num_stories
-
-    preferred_vocab = ", ".join(US_PREFERRED_VOCAB)
-    canonical_template = (
-        "TEMPLATE CANÓNICO MSE (default):\n"
-        "Título: MSE | [Domínio] | [Jornada/Subárea] | [Fluxo/Step] | [Detalhe da Alteração]\n"
-        "- 4 a 6 segmentos obrigatórios separados por ' | '\n"
-        "- Se o domínio não for inferível, usar 'Transversal'\n\n"
-        "Descrição:\n"
-        "<div>Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para <b>[benefício de negócio/utilizador]</b>.</div>\n\n"
-        "Critérios de Aceitação (ordem obrigatória):\n"
-        "1) <b>Proveniência</b> + <ul><li>...</li></ul>\n"
-        "2) <b>Condições</b> + <ul><li>...</li></ul>\n"
-        "3) <b>Composição</b> + <ul><li>...</li></ul>\n"
-        "4) <b>Comportamento</b> + <ul><li>...</li></ul>\n"
-        "5) <b>Mockup</b> + <ul><li>Mockup a confirmar com UX.</li></ul>\n"
-    )
-    common_rules = (
-        "REGRAS OBRIGATÓRIAS:\n"
-        "- PT-PT sempre.\n"
-        "- Não usar Given/When/Then.\n"
-        "- Não inventar endpoints, APIs, serviços de backoffice nem arquitetura técnica sem evidência explícita.\n"
-        "- Quando faltar contexto de negócio, adicionar secção <b>Assunções</b> no final dos AC.\n"
-        "- Vocabulário preferencial: " + preferred_vocab + ".\n"
-        "- HTML limpo e não escapado (nunca produzir &lt;, &gt;, &amp; ou &quot;).\n"
-        "- Prioridade da estrutura: template aplicável > WriterProfile histórico.\n"
-    )
-
-    if policy == "user_template" and user_template:
-        policy_block = (
-            "POLÍTICA DE DETALHE: user_template\n"
-            "Seguir estritamente o formato pedido pelo utilizador abaixo.\n"
-            "Se o template do utilizador não definir secções de AC, usar fallback das 5 secções canónicas.\n"
-            "TEMPLATE DO UTILIZADOR:\n"
-            f"{user_template}\n"
-        )
-    else:
-        policy_block = (
-            "POLÍTICA DE DETALHE: habitual\n"
-            "Usar o template canónico MSE por defeito.\n\n"
-            f"{canonical_template}\n"
-        )
-
-    flow_context_block = ""
-    flow_story_map = []
-    flow_steps_detected = 0
-    context_clean = str(context or "")
-    if flow_mode:
-        flow_steps_clean = []
-        for raw_step in flow_steps:
-            if not isinstance(raw_step, dict):
-                continue
-            try:
-                step_idx = int(raw_step.get("step_index") or (len(flow_steps_clean) + 1))
-            except Exception:
-                step_idx = len(flow_steps_clean) + 1
-            flow_steps_clean.append(
-                {
-                    "step_index": step_idx,
-                    "node_id": str(raw_step.get("node_id", "") or "").strip(),
-                    "node_name": str(raw_step.get("node_name", "") or "").strip(),
-                    "ui_components": raw_step.get("ui_components", []) if isinstance(raw_step.get("ui_components", []), list) else [],
-                    "inferred_action": str(raw_step.get("inferred_action", "") or "").strip(),
-                }
-            )
-
-        flow_branches_clean = []
-        for raw_branch in flow_branches:
-            if not isinstance(raw_branch, dict):
-                continue
-            try:
-                triggered_from = int(raw_branch.get("triggered_from_step") or 0)
-            except Exception:
-                triggered_from = 0
-            flow_branches_clean.append(
-                {
-                    "node_id": str(raw_branch.get("node_id", "") or "").strip(),
-                    "node_name": str(raw_branch.get("node_name", "") or "").strip(),
-                    "branch_type": str(raw_branch.get("branch_type", "other") or "other").strip(),
-                    "triggered_from_step": triggered_from,
-                }
-            )
-
-        flow_steps_detected = len(flow_steps_clean)
-        effective_num_stories = max(1, flow_steps_detected + len(flow_branches_clean))
-        flow_story_map = [
-            {"step_index": step.get("step_index", idx + 1), "story_index": idx}
-            for idx, step in enumerate(flow_steps_clean)
-        ]
-
-        step_lines = []
-        for idx, step in enumerate(flow_steps_clean):
-            prev_label = "Início do fluxo"
-            if idx > 0:
-                prev = flow_steps_clean[idx - 1]
-                prev_label = f"Step {prev.get('step_index', idx)} - {prev.get('node_name', '')}"
-            comps = ", ".join(step.get("ui_components", [])[:8]) or "Sem componentes explícitos"
-            step_lines.append(
-                f"- Step {step.get('step_index')}: node_id={step.get('node_id')}, nome='{step.get('node_name')}', "
-                f"ação='{step.get('inferred_action') or 'n/a'}', componentes=[{comps}], proveniência_base='{prev_label}'"
-            )
-
-        branch_lines = []
-        for branch in flow_branches_clean:
-            branch_lines.append(
-                f"- Branch node_id={branch.get('node_id')}, nome='{branch.get('node_name')}', "
-                f"tipo={branch.get('branch_type')}, triggered_from_step={branch.get('triggered_from_step') or 'n/a'}"
-            )
-
-        flow_context_block = (
-            "MODO FLOW FIGMA ACTIVO:\n"
-            f"- Gerar exatamente {effective_num_stories} US(s): 1 por step e 1 por branch relevante.\n"
-            "- Para cada US de step: na secção Proveniência referir o step anterior.\n"
-            "- Para cada US (step/branch): na secção Mockup referir node_id Figma.\n"
-            "- Para branches: tratar como US separadas de exceção/fallback.\n"
-            "STEPS DETECTADOS:\n"
-            f"{chr(10).join(step_lines) if step_lines else '- Sem steps válidos'}\n"
-        )
-        if branch_lines:
-            flow_context_block += "BRANCHES DETECTADOS:\n" + "\n".join(branch_lines) + "\n"
-
-        marker_idx = context_clean.find("FLOW_CONTEXT_JSON:")
-        if marker_idx >= 0:
-            context_clean = context_clean[:marker_idx].strip()
-
-    prompt = (
-        f"Gerar {effective_num_stories} User Story(s) sobre: \"{topic}\"\n\n"
-        f"{policy_block}\n"
-        f"{common_rules}\n"
-        f"{flow_context_block}\n"
-        f"EXEMPLOS REAIS (few-shot):\n{ex}\n"
-        f"{style_hint}\n"
-        f"CONTEXTO ADICIONAL:\n{context_clean or 'Nenhum.'}\n\n"
-        "OUTPUT:\n"
-        "- Seguir o formato aplicável.\n"
-        "- Entregar conteúdo pronto para uso em DevOps.\n"
-        "- Não incluir explicações meta nem markdown extra fora do conteúdo da(s) US(s).\n"
-    )
-    sys_msg = (
-        "És PO Sénior MSE. Segue estritamente o template aplicável e evita invenções técnicas. "
-        "Prioriza consistência com backlog Revamp e exemplos reais. "
-        "HTML limpo e não escapado."
-    )
-    try:
-        gen = await llm_simple(f"{sys_msg}\n\n{prompt}", tier="standard", max_tokens=8000)
-    except Exception as e:
-        logging.error("[Tools] tool_generate_user_stories failed: %s", e)
-        gen = f"Erro: {e}"
-
-    gen_clean = _unescape_html_if_needed(gen)
-    quality_flags = []
-    if isinstance(gen_clean, str) and not gen_clean.startswith("Erro:"):
-        stories = _split_generated_stories(gen_clean)
-        if not stories:
-            stories = [gen_clean]
-        if effective_num_stories > 1:
-            for idx, story in enumerate(stories, 1):
-                title, ac_html = _extract_story_title_and_ac(story)
-                story_flags = _collect_quality_flags(title, ac_html)
-                quality_flags.extend([f"story_{idx}_{flag}" for flag in story_flags])
-        else:
-            title, ac_html = _extract_story_title_and_ac(stories[0])
-            quality_flags = _collect_quality_flags(title, ac_html)
-
-    result = {
-        "generated_user_stories": gen_clean,
-        "based_on_examples": raw.get("samples_returned", 0) if raw else 0,
-        "reference_ids": reference_ids,
-        "used_writer_profile": bool(style_profile),
-        "topic": topic,
-        "num_requested": num_stories,
-        "template_version": US_TEMPLATE_VERSION,
-        "quality_flags": quality_flags,
-        "detail_policy_applied": policy,
-        "flow_mode": flow_mode,
-        "flow_steps_detected": flow_steps_detected,
-    }
-    if flow_mode:
-        result["flow_story_map"] = flow_story_map
-    return result
-
-# =============================================================================
-# TOOL 6: query_hierarchy
-# =============================================================================
-async def tool_query_hierarchy(
-    parent_id=None,
-    parent_type="Epic",
-    child_type="User Story",
-    area_path=None,
-    title_contains=None,
-    parent_title_hint=None,
-):
-    try:
-        safe_parent_type = _validate_workitem_type(parent_type, "Epic")
-        safe_child_type = _validate_workitem_type(child_type, "User Story")
-    except ValueError as e:
-        return {"error": str(e)}
-
-    canonical_area = _canonicalize_area_path(area_path) if area_path else ""
-    safe_area = _safe_wiql_literal(canonical_area, 300) if canonical_area else ""
-    parent_hint = str(parent_title_hint or "").strip()
-    child_title_filter = str(title_contains or "").strip()
-
-    headers = _devops_headers()
-    async with httpx.AsyncClient(timeout=60) as client:
-        resolved_meta = {"attempted": False}
-        safe_parent_id = None
-        if parent_id:
-            try:
-                safe_parent_id = int(parent_id)
-            except (TypeError, ValueError):
-                return {"error": "parent_id inválido: deve ser inteiro positivo"}
-            if safe_parent_id <= 0:
-                return {"error": "parent_id inválido: deve ser inteiro positivo"}
-        elif parent_hint:
-            resolved_parent_id, resolved_meta = await _resolve_parent_id_by_title_hint(
-                client,
-                headers,
-                parent_type=safe_parent_type,
-                area_path=safe_area,
-                title_hint=parent_hint,
-            )
-            if not resolved_parent_id and safe_area:
-                fallback_id, fallback_meta = await _resolve_parent_id_by_title_hint(
-                    client,
-                    headers,
-                    parent_type=safe_parent_type,
-                    area_path="",
-                    title_hint=parent_hint,
-                )
-                resolved_meta["fallback_without_area_attempted"] = True
-                resolved_meta["fallback_without_area_meta"] = fallback_meta
-                if fallback_id:
-                    resolved_parent_id = fallback_id
-                    resolved_meta["fallback_without_area_used"] = True
-            if resolved_parent_id:
-                safe_parent_id = int(resolved_parent_id)
-                # Neste caminho, o hint foi usado para resolver o PAI e não para filtrar o TÍTULO dos filhos.
-                child_title_filter = ""
-            else:
-                return {
-                    "error": (
-                        f"Não foi possível identificar {safe_parent_type} com título '{parent_hint}'. "
-                        "Indica o ID do parent para resultado exato."
-                    ),
-                    "total_count": 0,
-                    "items_returned": 0,
-                    "items": [],
-                    "parent_id": parent_id,
-                    "parent_type": safe_parent_type,
-                    "child_type": safe_child_type,
-                    "title_contains": child_title_filter,
-                    "parent_title_hint": parent_hint,
-                    "_parent_resolve": resolved_meta,
-                }
-
-        if safe_parent_id:
-            af = f"AND ([Target].[System.AreaPath] UNDER '{safe_area}')" if safe_area else ""
-            wiql = (
-                "SELECT [System.Id] FROM WorkItemLinks WHERE "
-                f"([Source].[System.Id] = {safe_parent_id}) "
-                "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
-                f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
-                f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                f"{af} MODE (Recursive)"
-            )
-        else:
-            source_af = f"AND [Source].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
-            target_af = f"AND [Target].[System.AreaPath] UNDER '{safe_area}'" if safe_area else ""
-            wiql = (
-                "SELECT [System.Id] FROM WorkItemLinks WHERE "
-                f"([Source].[System.WorkItemType] = '{_safe_wiql_literal(safe_parent_type, 80)}' "
-                f"{source_af} AND [Source].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                "AND ([System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward') "
-                f"AND ([Target].[System.WorkItemType] = '{_safe_wiql_literal(safe_child_type, 80)}') "
-                f"AND ([Target].[System.TeamProject] = '{_safe_wiql_literal(DEVOPS_PROJECT, 120)}') "
-                f"{target_af} "
-                "MODE (Recursive)"
-            )
-
-        resp = await _devops_request_with_retry(client, "POST", _devops_url("wit/wiql?api-version=7.1"), headers, {"query": wiql})
-        if "error" in resp: return resp
-        rels = resp.get("workItemRelations",[])
-        tids = list(set(r["target"]["id"] for r in rels if r.get("target") and r.get("rel")))
-        if not tids: tids = [wi["id"] for wi in resp.get("workItems",[])]
-        total_raw = len(tids)
-        if not tids:
-            return {
-                "total_count": 0,
-                "total_raw_count": 0,
-                "items_returned": 0,
-                "items": [],
-                "parent_id": safe_parent_id if safe_parent_id else parent_id,
-                "parent_type": safe_parent_type,
-                "child_type": safe_child_type,
-                "title_contains": child_title_filter,
-                "parent_title_hint": parent_hint,
-            }
-        flds = DEVOPS_FIELDS + ["System.Parent"]
-        all_det, failed = [], []
-        for i in range(0,len(tids),100):
-            batch = tids[i:i+100]
-            r = await _devops_request_with_retry(client,"POST",_devops_url("wit/workitemsbatch?api-version=7.1"),headers,{"ids":batch,"fields":flds})
-            if "error" not in r: all_det.extend(r.get("value",[])) 
-            else: failed.extend(batch)
-            await asyncio.sleep(0.5)
-        items = []
-        for it in all_det:
-            fi = _format_wi(it); fi["parent_id"] = it.get("fields",{}).get("System.Parent"); items.append(fi)
-        # Filtro defensivo final: garante tipo e área pedidos, mesmo se WIQL trouxer ruído.
-        filtered_out = 0
-        if safe_child_type or safe_area:
-            expected_type = str(safe_child_type or "").strip().lower()
-            expected_area = str(safe_area or "").strip().lower()
-            filtered = []
-            for item in items:
-                item_type = str(item.get("type", "") or "").strip().lower()
-                item_area = str(item.get("area", "") or "").strip().lower()
-                type_ok = not expected_type or item_type == expected_type
-                area_ok = not expected_area or item_area.startswith(expected_area)
-                if type_ok and area_ok:
-                    filtered.append(item)
-                else:
-                    filtered_out += 1
-            items = filtered
-        title_filter = _normalize_match_text(child_title_filter)
-        if title_filter:
-            terms = [t for t in title_filter.split(" ") if t]
-            if terms:
-                by_title = []
-                for item in items:
-                    title_norm = _normalize_match_text(str(item.get("title", "") or ""))
-                    if all(term in title_norm for term in terms):
-                        by_title.append(item)
-                    else:
-                        filtered_out += 1
-                items = by_title
-
-        if failed and not items:
-            items = [{"id":fid,"type":child_type,"title":"(rate limited)","state":"","url":f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{fid}"} for fid in failed]
-        matched_count = len(items)
-        result = {
-            "total_count": matched_count,
-            "total_raw_count": total_raw,
-            "items_returned": matched_count,
-            "parent_id": safe_parent_id if safe_parent_id else parent_id,
-            "parent_type":safe_parent_type,
-            "child_type":safe_child_type,
-            "title_contains": child_title_filter,
-            "parent_title_hint": parent_hint,
-            "items":items,
-        }
-        await _attach_auto_csv_export(
-            result,
-            title_hint=f"hierarchy_{safe_parent_type}_{safe_child_type}_{(safe_parent_id if safe_parent_id else 'all')}",
-        )
-        if resolved_meta.get("attempted"):
-            result["_parent_resolve"] = resolved_meta
-        if filtered_out:
-            result["_post_filtered_out"] = filtered_out
-        if failed: result["_partial"]=True; result["_failed_batch_count"]=len(failed)
-        return result
-
-# =============================================================================
-# TOOL 7: compute_kpi
-# =============================================================================
-async def tool_compute_kpi(wiql_where, group_by=None, kpi_type="count"):
-    result = await tool_query_workitems(wiql_where=wiql_where, top=1000)
-    if "error" in result: return result
-    items = result.get("items",[]); total = result.get("total_count",len(items))
-    kpi = {"total_count": total, "items_analyzed": len(items)}
-    if group_by and items:
-        fm = {"state":"state","estado":"state","type":"type","tipo":"type","assigned_to":"assigned_to","assignee":"assigned_to","created_by":"created_by","criador":"created_by","autor":"created_by","area":"area","area_path":"area"}
-        fk = fm.get(group_by.lower(), group_by.lower())
-        grps = {}
-        for it in items: v=it.get(fk,"N/A") or "N/A"; grps[v]=grps.get(v,0)+1
-        kpi["group_by"]=group_by; kpi["groups"]=[{"value":k,"count":v} for k,v in sorted(grps.items(),key=lambda x:x[1],reverse=True)]; kpi["unique_values"]=len(grps)
-    if kpi_type=="timeline" and items:
-        m={}
-        for it in items:
-            d=it.get("created_date","")
-            if d: mo=d[:7]; m[mo]=m.get(mo,0)+1
-        kpi["timeline"]=sorted(m.items())
-    if kpi_type=="distribution" and items:
-        st,tp = {},{}
-        for it in items: s=it.get("state","?"); st[s]=st.get(s,0)+1; t=it.get("type","?"); tp[t]=tp.get(t,0)+1
-        kpi["state_distribution"]=st; kpi["type_distribution"]=tp
-    return kpi
-
-
-async def tool_create_workitem(
-    work_item_type: str = "User Story",
-    title: str = "",
-    description: str = "",
-    acceptance_criteria: str = "",
-    area_path: str = "",
-    assigned_to: str = "",
-    tags: str = "",
-    confirmed: bool = False,
-):
-    """Cria um Work Item no Azure DevOps via JSON Patch."""
-    normalized_type = (work_item_type or "User Story").strip().lower()
-    allowed_types = {
-        "user story": "User Story",
-        "bug": "Bug",
-        "task": "Task",
-        "feature": "Feature",
-    }
-    work_item_type = allowed_types.get(normalized_type, "User Story")
-
-    title = (title or "").strip()[:250]
-    description = (description or "").strip()[:12000]
-    acceptance_criteria = (acceptance_criteria or "").strip()[:12000]
-    area_path = (area_path or "").strip()[:300]
-    assigned_to = (assigned_to or "").strip()[:200]
-    tags = (tags or "").strip()[:500]
-
-    if not confirmed:
-        return {"error": "Confirmação explícita necessária (envia confirmed=true após 'confirmo')."}
-    if not title:
-        return {"error": "Título é obrigatório"}
-
-    _log(f"create_workitem: type={work_item_type}, title={title[:60]}...")
-
-    patch_doc = [
-        {"op": "add", "path": "/fields/System.Title", "value": title},
-    ]
-    if description:
-        patch_doc.append({"op": "add", "path": "/fields/System.Description", "value": description})
-    if acceptance_criteria:
-        patch_doc.append({"op": "add", "path": "/fields/Microsoft.VSTS.Common.AcceptanceCriteria", "value": acceptance_criteria})
-    if area_path:
-        patch_doc.append({"op": "add", "path": "/fields/System.AreaPath", "value": area_path})
-    if assigned_to:
-        patch_doc.append({"op": "add", "path": "/fields/System.AssignedTo", "value": assigned_to})
-    if tags:
-        patch_doc.append({"op": "add", "path": "/fields/System.Tags", "value": tags})
-
-    wi_type_encoded = quote(work_item_type, safe="")
-    url = _devops_url(f"wit/workitems/${wi_type_encoded}?api-version=7.1")
-    headers = _devops_headers()
-    headers["Content-Type"] = "application/json-patch+json"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    url,
-                    headers=headers,
-                    content=json.dumps(patch_doc),
-                )
-                if resp.status_code == 429:
-                    wait = min(int(resp.headers.get("Retry-After", 3 * (attempt + 1))), 30)
-                    _log(f"create_workitem 429, attempt {attempt+1}/3, wait {wait}s")
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                if resp.status_code >= 400:
-                    _log(f"create_workitem {resp.status_code}: {resp.text[:200]}")
-                    return {"error": f"DevOps {resp.status_code}: {resp.text[:200]}"}
-                data = resp.json()
-                break
-            except httpx.TimeoutException:
-                if attempt == 2:
-                    return {"error": "DevOps timeout ao criar work item"}
-                await asyncio.sleep(2 * (attempt + 1))
-            except httpx.RequestError as e:
-                if attempt == 2:
-                    return {"error": f"DevOps request error ao criar work item: {str(e)}"}
-                await asyncio.sleep(2 * (attempt + 1))
-            except Exception as e:
-                return {"error": f"Erro ao criar work item: {str(e)}"}
-        else:
-            return {"error": "Max retries ao criar work item"}
-
-    wi_id = data.get("id")
-    wi_url = data.get("_links", {}).get("html", {}).get("href", "")
-    if not wi_url and wi_id:
-        wi_url = f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{wi_id}"
-
-    return {
-        "created": True,
-        "id": wi_id,
-        "url": wi_url,
-        "title": title,
-        "work_item_type": work_item_type,
-        "area_path": area_path or "(default)",
-    }
-
-
-async def tool_refine_workitem(
-    work_item_id: int = 0,
-    refinement_request: str = "",
-):
-    """Refina uma US existente com base numa instrução curta, sem alterar DevOps."""
-    try:
-        safe_id = int(work_item_id)
-    except (TypeError, ValueError):
-        return {"error": "work_item_id inválido: deve ser inteiro positivo"}
-    if safe_id <= 0:
-        return {"error": "work_item_id inválido: deve ser inteiro positivo"}
-
-    req = (refinement_request or "").strip()
-    if not req:
-        return {"error": "refinement_request é obrigatório"}
-
-    fields = [
-        "System.Id",
-        "System.Title",
-        "System.State",
-        "System.WorkItemType",
-        "System.AreaPath",
-        "System.Description",
-        "Microsoft.VSTS.Common.AcceptanceCriteria",
-        "System.Tags",
-    ]
-    fields_param = ",".join(fields)
-    headers = _devops_headers()
-
-    async with httpx.AsyncClient(timeout=45) as client:
-        wi = await _devops_request_with_retry(
-            client,
-            "GET",
-            _devops_url(f"wit/workitems/{safe_id}?fields={fields_param}&api-version=7.1"),
-            headers,
-            max_retries=3,
-        )
-    if "error" in wi:
-        return wi
-    if not isinstance(wi, dict) or not wi.get("id"):
-        return {"error": "Work item não encontrado"}
-
-    f = wi.get("fields", {})
-    original = {
-        "id": wi.get("id"),
-        "title": f.get("System.Title", ""),
-        "state": f.get("System.State", ""),
-        "type": f.get("System.WorkItemType", ""),
-        "area": f.get("System.AreaPath", ""),
-        "description_html": f.get("System.Description", "") or "",
-        "acceptance_criteria_html": f.get("Microsoft.VSTS.Common.AcceptanceCriteria", "") or "",
-        "tags": f.get("System.Tags", "") or "",
-        "url": f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_workitems/edit/{safe_id}",
-    }
-
-    prompt = f"""És PO Sénior MSE.
-Recebeste uma User Story existente e um pedido de refinamento.
-
-US ORIGINAL:
-- ID: {original['id']}
-- Tipo: {original['type']}
-- Título: {original['title']}
-- Área: {original['area']}
-- Descrição HTML: {original['description_html'][:6000]}
-- AC HTML: {original['acceptance_criteria_html'][:6000]}
-- Tags: {original['tags']}
-
-PEDIDO DE REFINAMENTO:
-{req}
-
-Objetivo:
-- Devolver uma versão revista, mantendo estilo MSE e estrutura testável.
-- Aplicar apenas as mudanças pedidas.
-- PT-PT.
-- HTML limpo (div, b, ul, li, br).
-- Estrutura oficial de AC: Proveniência, Condições, Composição, Comportamento, Mockup.
-- Preservar a estrutura original e alterar apenas secções impactadas.
-- Se a US original não seguir o template oficial, NÃO reformatar; aplicar apenas o refinamento pedido.
-- NÃO forçar prefixo "MSE |" no título durante refino; manter título original salvo pedido explícito para mudar.
-- Em change_summary, indicar as secções alteradas.
-- Se o pedido referir Step/fluxo Figma, preservar referência ao Step na secção Proveniência e ao node_id na secção Mockup.
-
-Responde APENAS em JSON válido neste formato:
-{{
-  "title": "Título revisto",
-  "description_html": "<div>...</div>",
-  "acceptance_criteria_html": "<ul><li>...</li></ul>",
-  "change_summary": "Resumo curto das alterações"
-}}"""
-
-    try:
-        llm_output = await llm_simple(prompt, tier="standard", max_tokens=2600)
-    except Exception as e:
-        return {"error": f"Falha LLM ao refinar work item: {str(e)}"}
-
-    parsed = _extract_json_object(llm_output or "")
-    if not parsed:
-        return {
-            "work_item_id": safe_id,
-            "work_item_url": original["url"],
-            "refinement_request": req,
-            "original": original,
-            "ready_to_apply": False,
-            "error": "Não foi possível estruturar JSON da revisão. Repetir pedido com instrução mais objetiva.",
-            "refined_raw": (llm_output or "")[:12000],
-            "note": "Esta tool não altera o work item no DevOps; gera apenas proposta de revisão.",
-        }
-
-    refined = {
-        "title": str(parsed.get("title", "")).strip() or original["title"],
-        "description_html": _unescape_html_if_needed(str(parsed.get("description_html", "")).strip()),
-        "acceptance_criteria_html": _unescape_html_if_needed(str(parsed.get("acceptance_criteria_html", "")).strip()),
-        "change_summary": str(parsed.get("change_summary", "")).strip(),
-    }
-
-    return {
-        "work_item_id": safe_id,
-        "work_item_url": original["url"],
-        "refinement_request": req,
-        "original": original,
-        "refined": refined,
-        "ready_to_apply": True,
-        "note": "Esta tool não altera o work item no DevOps; gera proposta para revisão DRAFT->REVIEW->FINAL.",
-    }
-
-
-async def tool_generate_chart(
-    chart_type: str = "bar",
-    title: str = "Chart",
-    x_values: list = None,
-    y_values: list = None,
-    labels: list = None,
-    values: list = None,
-    series: list = None,
-    x_label: str = "",
-    y_label: str = "",
-):
-    """Gera um chart spec para Plotly.js. Retorna _chart no resultado."""
-    chart_type = (chart_type or "bar").lower().strip()
-    supported = ["bar", "pie", "line", "scatter", "histogram", "hbar"]
-    if chart_type not in supported:
-        chart_type = "bar"
-
-    def _normalize_list(value):
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        return []
-
-    def _is_non_empty_list(value):
-        return isinstance(value, list) and len(value) > 0
-
-    data = []
-    layout = {
-        "title": {"text": title, "font": {"size": 16}},
-        "font": {"family": "Montserrat, sans-serif"},
-    }
-
-    # Multi-series via 'series' param
-    if series and isinstance(series, list):
-        valid_series = []
-        for s in series:
-            if not isinstance(s, dict):
-                continue
-            trace = {"type": s.get("type", chart_type), "name": s.get("name", "")}
-            sx = _normalize_list(s.get("x"))
-            sy = _normalize_list(s.get("y"))
-            sl = _normalize_list(s.get("labels"))
-            sv = _normalize_list(s.get("values"))
-            stype = (trace.get("type") or chart_type).lower().strip()
-            if stype == "pie":
-                if not _is_non_empty_list(sl) or not _is_non_empty_list(sv) or len(sl) != len(sv):
-                    continue
-                trace["type"] = "pie"
-                trace["labels"] = sl
-                trace["values"] = sv
-            elif stype == "histogram":
-                src = sx or sy
-                if not _is_non_empty_list(src):
-                    continue
-                trace["type"] = "histogram"
-                trace["x"] = src
-            else:
-                if not _is_non_empty_list(sx) or not _is_non_empty_list(sy) or len(sx) != len(sy):
-                    continue
-                trace["type"] = stype if stype in supported else chart_type
-                trace["x"] = sx
-                trace["y"] = sy
-            valid_series.append(trace)
-        data.extend(valid_series)
-        if not data:
-            return {
-                "error": "generate_chart: input inválido. Fornece séries com dados válidos (x/y ou labels/values).",
-                "chart_generated": False,
-            }
-    elif chart_type == "pie":
-        pie_labels = _normalize_list(labels or x_values)
-        pie_values = _normalize_list(values or y_values)
-        if not _is_non_empty_list(pie_labels) or not _is_non_empty_list(pie_values) or len(pie_labels) != len(pie_values):
-            return {
-                "error": "generate_chart: pie requer labels e values não vazios e com o mesmo tamanho.",
-                "chart_generated": False,
-            }
-        data.append({
-            "type": "pie",
-            "labels": pie_labels,
-            "values": pie_values,
-            "textinfo": "label+percent",
-            "hole": 0.3,
-        })
-    elif chart_type == "hbar":
-        hx = _normalize_list(x_values)
-        hy = _normalize_list(y_values)
-        if not _is_non_empty_list(hx) or not _is_non_empty_list(hy) or len(hx) != len(hy):
-            return {
-                "error": "generate_chart: hbar requer x_values e y_values não vazios e com o mesmo tamanho.",
-                "chart_generated": False,
-            }
-        data.append({
-            "type": "bar",
-            "y": hx,
-            "x": hy,
-            "orientation": "h",
-            "name": title,
-        })
-        layout["yaxis"] = {"title": x_label, "automargin": True}
-        layout["xaxis"] = {"title": y_label}
-    elif chart_type == "histogram":
-        hist_values = _normalize_list(x_values or y_values)
-        if not _is_non_empty_list(hist_values):
-            return {
-                "error": "generate_chart: histogram requer x_values (ou y_values) com dados.",
-                "chart_generated": False,
-            }
-        data.append({
-            "type": "histogram",
-            "x": hist_values,
-            "name": title,
-        })
-        layout["xaxis"] = {"title": x_label}
-        layout["yaxis"] = {"title": y_label or "Frequência"}
-    else:
-        # bar, line, scatter
-        x_clean = _normalize_list(x_values)
-        y_clean = _normalize_list(y_values)
-        if not _is_non_empty_list(x_clean) or not _is_non_empty_list(y_clean) or len(x_clean) != len(y_clean):
-            return {
-                "error": "generate_chart: chart requer x_values e y_values não vazios e com o mesmo tamanho.",
-                "chart_generated": False,
-            }
-        data.append({
-            "type": chart_type if chart_type != "bar" else "bar",
-            "x": x_clean,
-            "y": y_clean,
-            "name": title,
-        })
-        if x_label: layout["xaxis"] = {"title": x_label}
-        if y_label: layout["yaxis"] = {"title": y_label}
-
-    chart_spec = {"data": data, "layout": layout, "config": {"responsive": True}}
-
-    return {
-        "chart_generated": True,
-        "chart_type": chart_type,
-        "title": title,
-        "data_points": len((x_values or labels or values or [])),
-        "_chart": chart_spec,
-    }
-
-
-async def tool_generate_file(
-    format: str = "csv",
-    title: str = "Export",
-    data: list = None,
-    columns: list = None,
-):
-    """Gera ficheiro em memória (CSV/XLSX/PDF) e devolve metadados de download."""
-    fmt = (format or "csv").strip().lower()
-    if fmt not in ("csv", "xlsx", "pdf"):
-        return {"error": "Formato inválido. Usa: csv, xlsx ou pdf"}
-
-    if not isinstance(data, list) or len(data) == 0:
-        return {"error": "Campo 'data' deve ser array com pelo menos uma linha"}
-
-    if columns is None:
-        first = data[0]
-        if isinstance(first, dict):
-            columns = list(first.keys())
-        elif isinstance(first, (list, tuple)):
-            columns = [f"col_{i+1}" for i in range(len(first))]
-        else:
-            return {"error": "Não foi possível inferir colunas. Envia 'columns' explicitamente."}
-
-    if not isinstance(columns, list) or len(columns) == 0:
-        return {"error": "Campo 'columns' deve ser array de strings"}
-
-    clean_columns = [str(c).strip() for c in columns if str(c).strip()]
-    if not clean_columns:
-        return {"error": "Sem colunas válidas para gerar ficheiro"}
-
-    items = []
-    for row in data[:5000]:
-        if isinstance(row, dict):
-            item = {c: row.get(c, "") for c in clean_columns}
-        elif isinstance(row, (list, tuple)):
-            item = {c: (row[idx] if idx < len(row) else "") for idx, c in enumerate(clean_columns)}
-        else:
-            continue
-        items.append(item)
-
-    if not items:
-        return {"error": "Sem linhas válidas para gerar ficheiro"}
-
-    payload = {"items": items, "total_count": len(items)}
-    safe_title = "".join(ch if ch.isalnum() or ch in " _-" else "_" for ch in (title or "Export")).strip()[:40] or "Export"
-
-    try:
-        if fmt == "csv":
-            mime_type = "text/csv"
-            buf = to_csv(payload)
-        elif fmt == "xlsx":
-            mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            buf = to_xlsx(payload, safe_title)
-        else:
-            mime_type = "application/pdf"
-            buf = to_pdf(payload, safe_title)
-    except Exception as e:
-        logging.error("[Tools] tool_generate_file failed (%s): %s", fmt, e)
-        return {"error": f"Erro ao gerar ficheiro {fmt}: {str(e)}"}
-
-    content = buf.getvalue()
-    if not content:
-        return {"error": "Ficheiro gerado está vazio"}
-
-    filename = f"{safe_title}.{fmt}"
-    download_id = await _store_generated_file(content, mime_type, filename, fmt)
-    if not download_id:
-        return {"error": "Ficheiro demasiado grande para armazenamento temporário no servidor"}
-
-    return {
-        "file_generated": True,
-        "format": fmt,
-        "title": safe_title,
-        "rows": len(items),
-        "columns": clean_columns,
-        "_file_download": {
-            "download_id": download_id,
-            "endpoint": f"/api/download/{download_id}",
-            "filename": filename,
-            "format": fmt,
-            "mime_type": mime_type,
-            "size_bytes": len(content),
-            "expires_in_seconds": _GENERATED_FILE_TTL_SECONDS,
         },
     }
 
@@ -2831,6 +944,94 @@ def truncate_tool_result(result_str):
         logging.warning("[Tools] truncate_tool_result fallback: %s", e)
     return result_str[:AGENT_TOOL_RESULT_MAX_SIZE] + "\n...(truncado)"
 
+
+async def tool_screenshot_to_us(
+    image_base64: str = "",
+    context: str = "",
+    author_style: str = "",
+) -> dict:
+    """Analisa screenshot de UI e gera User Stories estruturadas com modelo vision-capable."""
+    if not VISION_ENABLED:
+        return {"error": "Vision feature is disabled. Set VISION_ENABLED=true to enable."}
+
+    raw_b64 = str(image_base64 or "").strip()
+    if not raw_b64:
+        return {"error": "image_base64 e obrigatorio. Enviar screenshot em base64."}
+
+    if len(raw_b64) > 14_000_000:
+        return {"error": "Imagem demasiado grande para analise (max ~10MB)."}
+
+    content_type = "image/png"
+    b64_payload = raw_b64
+    if raw_b64.startswith("data:") and "," in raw_b64:
+        header, payload = raw_b64.split(",", 1)
+        b64_payload = payload.strip()
+        m = re.match(r"data:([^;]+);base64", header, flags=re.I)
+        if m:
+            content_type = m.group(1).strip().lower() or content_type
+
+    try:
+        base64.b64decode(b64_payload, validate=True)
+    except Exception:
+        return {"error": "image_base64 invalido (nao e base64 valido)."}
+
+    prompt_parts = [
+        "Analisa este screenshot de interface de utilizador.",
+        "Identifica elementos visiveis de UI (inputs, labels, CTAs, tabelas, modais, toasts, menus, validacoes).",
+        "Gera User Stories estruturadas no formato MSE com titulo, descricao e criterios de aceitacao testaveis.",
+        (
+            "Retorna JSON no formato: "
+            '{"stories":[{"title":"...","description":"...","acceptance_criteria":["..."]}]}.'
+        ),
+        "Nao inventes APIs/endpoints de backend sem evidencia visual ou contexto explicito.",
+    ]
+    ctx = str(context or "").strip()
+    if ctx:
+        prompt_parts.append(f"Contexto adicional: {ctx}")
+    style = str(author_style or "").strip()
+    if style:
+        prompt_parts.append(f"Estilo de escrita preferido: {style}")
+    vision_prompt = "\n".join(prompt_parts)
+
+    content_blocks = [
+        {"type": "text", "text": vision_prompt},
+        {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{b64_payload}"}},
+    ]
+
+    try:
+        llm_resp = await llm_with_fallback(
+            messages=[{"role": "user", "content": content_blocks}],
+            tier="vision",
+            max_tokens=4096,
+        )
+        answer = str(getattr(llm_resp, "content", "") or "")
+        if not answer and isinstance(llm_resp, dict):
+            answer = str(llm_resp.get("content", "") or "")
+
+        match = re.search(r"\{[\s\S]*\"stories\"[\s\S]*\}", answer)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                stories = parsed.get("stories")
+                if isinstance(stories, list):
+                    return {
+                        "stories": stories,
+                        "raw_analysis": answer[:2000],
+                        "source": "vision_llm",
+                    }
+            except Exception:
+                pass
+
+        return {
+            "stories": [],
+            "raw_analysis": answer[:4000],
+            "source": "vision_llm",
+            "note": "Resposta nao estruturada como JSON. Ver raw_analysis.",
+        }
+    except Exception as e:
+        logging.warning("[Tools] screenshot_to_us failed: %s", e)
+        return {"error": f"Analise de screenshot falhou: {str(e)[:200]}"}
+
 # =============================================================================
 # TOOL DEFINITIONS (formato OpenAI — traduzido auto para Anthropic pelo llm_provider)
 # =============================================================================
@@ -2838,16 +1039,55 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"query_workitems","description":"Query Azure DevOps via WIQL para contagens, listagens, filtros. Dados em TEMPO REAL.","parameters":{"type":"object","properties":{"wiql_where":{"type":"string","description":"WHERE WIQL. Ex: [System.WorkItemType]='User Story' AND [System.State]='Active'"},"fields":{"type":"array","items":{"type":"string"},"description":"Campos extra a retornar. Default: Id,Title,State,Type,AssignedTo,CreatedBy,AreaPath,CreatedDate. Adicionar 'System.Description' e 'Microsoft.VSTS.Common.AcceptanceCriteria' quando o user pedir detalhes/descrição/AC."},"top":{"type":"integer","description":"Max resultados. 0=só contagem."}},"required":["wiql_where"]}}},
     {"type":"function","function":{"name":"search_workitems","description":"Pesquisa semântica em work items indexados. Retorna AMOSTRA dos mais relevantes.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferências SPIN'"},"top":{"type":"integer","description":"Nº resultados. Default: 30."},"filter":{"type":"string","description":"Filtro OData."}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_website","description":"Pesquisa no site MSE. Usa para navegação, funcionalidades, operações.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto. Ex: 'transferência SEPA'"},"top":{"type":"integer","description":"Default: 10"}},"required":["query"]}}},
+    {"type":"function","function":{"name":"search_web","description":"Pesquisa na web via Brave Search. Usar para informação atual, dados externos, ou contexto que não está nos documentos internos. Só usar quando o utilizador pedir pesquisa web ou quando a informação não existir nas fontes internas.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Termos de pesquisa (max 200 chars)."},"top":{"type":"integer","description":"Número de resultados (max 5, default 5)."}},"required":["query"]}}},
     {"type":"function","function":{"name":"search_uploaded_document","description":"Pesquisa semântica no documento carregado pelo utilizador. Usar quando o utilizador perguntar sobre conteúdos específicos de um documento que fez upload e o documento é grande.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Texto a pesquisar semanticamente no documento carregado."},"conv_id":{"type":"string","description":"ID da conversa. Opcional; se vazio, tenta inferir automaticamente."}},"required":["query"]}}},
-    {"type":"function","function":{"name":"analyze_uploaded_table","description":"Analisa ficheiro CSV/Excel carregado (ficheiro completo via RawBlobRef), com agregações determinísticas (year/month, mean/sum/min/max/count) e output pronto para generate_chart.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Pedido do utilizador (ex: 'volume médio por ano')."},"conv_id":{"type":"string","description":"ID da conversa (autopreenchido pelo agente)."},"filename":{"type":"string","description":"Nome do ficheiro (opcional; por omissão usa o mais recente tabular)."},"value_column":{"type":"string","description":"Coluna numérica para agregação (opcional se inferível)."},"date_column":{"type":"string","description":"Coluna de data/hora para agrupamento (opcional se inferível)."},"group_by":{"type":"string","description":"Agrupamento: 'year','month','none'."},"agg":{"type":"string","description":"Agregação: 'mean','sum','min','max','count'."},"top":{"type":"integer","description":"Máximo de pontos para saída/chart (default 500)."}},"required":["query"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_uploaded_table",
+            "description": "Analisa ficheiro CSV/Excel carregado (ficheiro completo via RawBlobRef), com agregações determinísticas e output pronto para generate_chart.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Pedido do utilizador (ex: 'volume médio por ano')."},
+                    "conv_id": {"type": "string", "description": "ID da conversa (autopreenchido pelo agente)."},
+                    "filename": {"type": "string", "description": "Nome do ficheiro (opcional; por omissão usa o mais recente tabular)."},
+                    "value_column": {"type": "string", "description": "Coluna numérica para agregação (opcional se inferível)."},
+                    "date_column": {"type": "string", "description": "Coluna de data/hora para agrupamento (opcional se inferível)."},
+                    "group_by": {"type": "string", "description": "Agrupamento: 'year','month','quarter','week','day','none'."},
+                    "agg": {"type": "string", "description": "Agregação principal para retrocompatibilidade: 'mean','sum','min','max','count'."},
+                    "top": {"type": "integer", "description": "Máximo de pontos para saída/chart (default 500)."},
+                    "metrics": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["min", "max", "mean", "sum", "count", "std", "median", "p25", "p75"]},
+                        "description": "Lista de métricas a calcular. Se ausente, usa 'agg'.",
+                    },
+                    "top_n": {"type": "integer", "description": "Retorna apenas os top-N grupos ordenados por valor/métrica."},
+                    "compare_periods": {
+                        "type": "object",
+                        "properties": {"col": {"type": "string"}, "period1": {"type": "string"}, "period2": {"type": "string"}},
+                        "description": "Comparar métricas entre dois períodos (ex: {'col':'Date','period1':'2020','period2':'2024'}).",
+                    },
+                    "full_points": {
+                        "type": "boolean",
+                        "description": "Se true, retorna TODOS os data points nos groups (sem downsample). chart_ready aplica downsample controlado para render. Usar para exports completos.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {"type":"function","function":{"name":"analyze_patterns","description":"Analisa padrões de escrita de work items com LLM. Templates, estilo de autor.","parameters":{"type":"object","properties":{"created_by":{"type":"string"},"topic":{"type":"string"},"work_item_type":{"type":"string","description":"Default: 'User Story'"},"area_path":{"type":"string"},"sample_size":{"type":"integer","description":"Default: 50"},"analysis_type":{"type":"string","description":"'template','author_style','general'"}}}}},
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
+    {"type":"function","function":{"name":"get_writer_profile","description":"Carrega perfil de escrita de um autor para personalizar user stories. Usar quando o utilizador mencionar um autor específico.","parameters":{"type":"object","properties":{"author_name":{"type":"string","description":"Nome do autor (ex: 'Pedro Mousinho')."}},"required":["author_name"]}}},
+    {"type":"function","function":{"name":"save_writer_profile","description":"Guarda perfil de escrita após analisar padrões de um autor.","parameters":{"type":"object","properties":{"author_name":{"type":"string","description":"Nome do autor."},"analysis":{"type":"string","description":"Análise do estilo de escrita."},"preferred_vocabulary":{"type":"string","description":"Vocabulário preferido do autor."},"title_pattern":{"type":"string","description":"Padrão de títulos."},"ac_structure":{"type":"string","description":"Estrutura de critérios de aceitação."}},"required":["author_name","analysis"]}}},
+    {"type":"function","function":{"name":"screenshot_to_us","description":"Analisa screenshot de UI e gera User Stories estruturadas (titulo, descricao, criterios de aceitacao). Usar quando o utilizador enviar imagem/screenshot e pedir criação de user stories.","parameters":{"type":"object","properties":{"image_base64":{"type":"string","description":"Screenshot em base64."},"context":{"type":"string","description":"Contexto adicional (projeto, área funcional, requisitos)."},"author_style":{"type":"string","description":"Estilo de escrita a seguir (opcional)."}},"required":["image_base64"]}}},
     {"type":"function","function":{"name":"query_hierarchy","description":"Query hierárquica parent/child. OBRIGATÓRIO para 'Epic', 'dentro de', 'filhos de'.","parameters":{"type":"object","properties":{"parent_id":{"type":"integer","description":"ID do pai."},"parent_type":{"type":"string","description":"Default: 'Epic'."},"child_type":{"type":"string","description":"Default: 'User Story'."},"area_path":{"type":"string"},"title_contains":{"type":"string","description":"Filtro opcional por título (contains, case/accent-insensitive). Ex: 'Créditos Consultar Carteira'"},"parent_title_hint":{"type":"string","description":"(Interno) dica de título do parent para resolução quando parent_id não for fornecido."}}}}},
     {"type":"function","function":{"name":"compute_kpi","description":"Calcula KPIs (até 1000 items). OBRIGATÓRIO para rankings, distribuições, tendências.","parameters":{"type":"object","properties":{"wiql_where":{"type":"string"},"group_by":{"type":"string","description":"'state','type','assigned_to','created_by','area'"},"kpi_type":{"type":"string","description":"'count','timeline','distribution'"}},"required":["wiql_where"]}}},
     {"type":"function","function":{"name":"create_workitem","description":"Cria um Work Item no Azure DevOps. USA APENAS quando o utilizador CONFIRMAR explicitamente a criação. PERGUNTA SEMPRE antes de criar.","parameters":{"type":"object","properties":{"work_item_type":{"type":"string","description":"Tipo: 'User Story', 'Bug', 'Task', 'Feature'. Default: 'User Story'."},"title":{"type":"string","description":"Título do Work Item."},"description":{"type":"string","description":"Descrição em HTML. Usa formato MSE."},"acceptance_criteria":{"type":"string","description":"Critérios de aceitação em HTML."},"area_path":{"type":"string","description":"AreaPath. Ex: 'IT.DIT\\\\DIT\\\\ADMChannels\\\\DBKS\\\\AM24\\\\RevampFEE MVP2'"},"assigned_to":{"type":"string","description":"Nome completo da pessoa. Ex: 'Pedro Mousinho'"},"tags":{"type":"string","description":"Tags separadas por ';'. Ex: 'MVP2;FEE;Sprint23'"},"confirmed":{"type":"boolean","description":"true apenas após confirmação explícita do utilizador (ex: 'confirmo')."}},"required":["title"]}}},
     {"type":"function","function":{"name":"refine_workitem","description":"Refina uma User Story existente no DevOps a partir de uma instrução curta (sem alterar automaticamente o item). Usa quando o utilizador pedir ajustes numa US já criada, ex: 'na US 12345 adiciona validação de email'.","parameters":{"type":"object","properties":{"work_item_id":{"type":"integer","description":"ID do work item existente a refinar."},"refinement_request":{"type":"string","description":"Instrução objetiva do que mudar na US existente."}},"required":["work_item_id","refinement_request"]}}},
     {"type":"function","function":{"name":"generate_chart","description":"Gera gráfico interativo (bar, pie, line, scatter, histogram, hbar). USA SEMPRE que o utilizador pedir gráfico, chart, visualização ou distribuição visual. Extrai dados de tool_results anteriores ou de dados fornecidos.","parameters":{"type":"object","properties":{"chart_type":{"type":"string","description":"Tipo: 'bar','pie','line','scatter','histogram','hbar'. Default: 'bar'."},"title":{"type":"string","description":"Título do gráfico."},"x_values":{"type":"array","items":{"type":"string"},"description":"Valores eixo X (categorias ou datas). Ex: ['Active','Closed','New']"},"y_values":{"type":"array","items":{"type":"number"},"description":"Valores eixo Y (numéricos). Ex: [45, 30, 12]"},"labels":{"type":"array","items":{"type":"string"},"description":"Labels para pie chart. Ex: ['Bug','US','Task']"},"values":{"type":"array","items":{"type":"number"},"description":"Valores para pie chart. Ex: [20, 50, 30]"},"series":{"type":"array","items":{"type":"object"},"description":"Multi-series. Cada obj: {type,name,x,y,labels,values}"},"x_label":{"type":"string","description":"Label do eixo X"},"y_label":{"type":"string","description":"Label do eixo Y"}},"required":["title"]}}},
-    {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
+    {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF, DOCX, HTML) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf","docx","html"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
 ]
 
 _TOOL_DEFINITION_BY_NAME = {
@@ -2862,6 +1102,7 @@ def _tool_dispatch() -> dict:
         "query_workitems": lambda arguments: tool_query_workitems(arguments.get("wiql_where",""), arguments.get("fields"), arguments.get("top",200)),
         "search_workitems": lambda arguments: tool_search_workitems(arguments.get("query",""), arguments.get("top",30), arguments.get("filter")),
         "search_website": lambda arguments: tool_search_website(arguments.get("query",""), arguments.get("top",10)),
+        "search_web": lambda arguments: tool_search_web(arguments.get("query", ""), arguments.get("top", 5)),
         "search_uploaded_document": lambda arguments: tool_search_uploaded_document(
             arguments.get("query", ""),
             arguments.get("conv_id", ""),
@@ -2877,9 +1118,26 @@ def _tool_dispatch() -> dict:
             arguments.get("group_by", ""),
             arguments.get("agg", "mean"),
             arguments.get("top", 500),
+            arguments.get("metrics"),
+            arguments.get("top_n", 0),
+            arguments.get("compare_periods"),
+            arguments.get("full_points", False),
         ),
         "analyze_patterns": lambda arguments: tool_analyze_patterns_with_llm(arguments.get("created_by"), arguments.get("topic"), arguments.get("work_item_type","User Story"), arguments.get("area_path"), arguments.get("sample_size",50), arguments.get("analysis_type","template")),
         "generate_user_stories": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("context",""), arguments.get("num_stories",3), arguments.get("reference_area"), arguments.get("reference_author"), arguments.get("reference_topic")),
+        "get_writer_profile": lambda arguments: tool_get_writer_profile(arguments.get("author_name", "")),
+        "save_writer_profile": lambda arguments: tool_save_writer_profile(
+            arguments.get("author_name", ""),
+            arguments.get("analysis", ""),
+            arguments.get("preferred_vocabulary", ""),
+            arguments.get("title_pattern", ""),
+            arguments.get("ac_structure", ""),
+        ),
+        "screenshot_to_us": lambda arguments: tool_screenshot_to_us(
+            arguments.get("image_base64", ""),
+            arguments.get("context", ""),
+            arguments.get("author_style", ""),
+        ),
         "generate_workitem": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("requirements",""), reference_area=arguments.get("reference_area"), reference_author=arguments.get("reference_author")),
         "query_hierarchy": lambda arguments: tool_query_hierarchy(
             arguments.get("parent_id"),
@@ -3167,8 +1425,9 @@ def get_agent_system_prompt():
         "   Exemplos: \"mostra um grafico de bugs por estado\", \"chart de USs por mes\", \"visualiza a distribuicao\"\n"
         "   REGRA: Primeiro obtem os dados (query_workitems/compute_kpi), depois chama generate_chart com os valores extraidos.\n"
         "   REGRA: Podes chamar compute_kpi + generate_chart em sequencia (nao em paralelo - precisas dos dados primeiro).",
-        "11. Para GERAR ou DESCARREGAR ficheiros (Excel/CSV/PDF) com dados -> usa generate_file (OBRIGATORIO)\n"
-        "   Exemplos: \"gera um Excel com estes dados\", \"descarrega em CSV\", \"quero PDF da tabela\"\n"
+        "11. Para GERAR ou DESCARREGAR ficheiros (Excel/CSV/PDF/DOCX/HTML) com dados -> usa generate_file (OBRIGATORIO)\n"
+        "   FORMATOS SUPORTADOS: csv, xlsx, pdf, docx, html.\n"
+        "   Exemplos: \"gera um Excel com estes dados\", \"descarrega em CSV\", \"quero PDF da tabela\", \"gera em DOCX\", \"exporta HTML\"\n"
         "   REGRA: So usar quando o utilizador pedir EXPLICITAMENTE geracao/download de ficheiro.",
         "12. Para resultados extensos (muitas linhas) -> mostra PREVIEW no chat e indica que o ficheiro completo está disponível para download.\n"
         "   REGRA: Evita listar dezenas de linhas completas na resposta textual.",
@@ -3215,7 +1474,7 @@ def get_agent_system_prompt():
         "- \"Na US 912345 adiciona validacao de email\" -> refine_workitem",
         "- \"Mostra grafico de bugs por estado\" -> compute_kpi DEPOIS generate_chart",
         "- \"Visualiza distribuicao de USs\" -> compute_kpi DEPOIS generate_chart",
-        "- \"Gera um Excel/CSV/PDF com esta tabela\" -> generate_file",
+        "- \"Gera um Excel/CSV/PDF/DOCX/HTML com esta tabela\" -> generate_file",
     ]
     if uploaded_doc_enabled:
         usage_examples.extend(

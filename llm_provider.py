@@ -11,7 +11,7 @@ import uuid
 import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -21,7 +21,7 @@ from config import (
     ANTHROPIC_API_KEY, ANTHROPIC_API_BASE,
     ANTHROPIC_MODEL_OPUS, ANTHROPIC_MODEL_SONNET,
     ANTHROPIC_MODEL_HAIKU,
-    LLM_DEFAULT_TIER, LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO,
+    LLM_DEFAULT_TIER, LLM_TIER_FAST, LLM_TIER_STANDARD, LLM_TIER_PRO, LLM_TIER_VISION,
     LLM_FALLBACK, AGENT_MAX_TOKENS, AGENT_TEMPERATURE,
     MODEL_ROUTER_ENABLED, MODEL_ROUTER_SPEC, MODEL_ROUTER_TARGET_TIERS,
     MODEL_ROUTER_NON_PROD_ONLY, IS_PRODUCTION,
@@ -37,9 +37,14 @@ def get_debug_log() -> list:
     return list(_llm_debug_log)
 
 def _log(msg: str):
-    entry = {"ts": datetime.now().isoformat(), "msg": msg}
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg}
     _llm_debug_log.append(entry)
     logger.info("[LLM] %s", msg)
+
+
+def _is_gpt5_family(deployment: str) -> bool:
+    """Detect GPT-5 style Azure deployments."""
+    return "gpt-5" in (deployment or "").strip().lower()
 
 
 # =============================================================================
@@ -249,6 +254,10 @@ class LLMProvider:
         """Embeddings — default não implementado."""
         raise NotImplementedError
 
+    async def close(self) -> None:
+        """Optional provider cleanup."""
+        return None
+
 
 # =============================================================================
 # AZURE OPENAI PROVIDER
@@ -263,7 +272,17 @@ class AzureOpenAIProvider(LLMProvider):
         self.deployment = deployment or CHAT_DEPLOYMENT
         self.endpoint = AZURE_OPENAI_ENDPOINT
         self.api_key = AZURE_OPENAI_KEY
-    
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=180)
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+
     async def chat(
         self, messages, tools=None, temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
     ) -> LLMResponse:
@@ -271,45 +290,47 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{self.deployment}"
             f"/chat/completions?api-version={API_VERSION_CHAT}"
         )
-        body = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        body = {"messages": messages}
+        if _is_gpt5_family(self.deployment):
+            # GPT-5 family rejects max_tokens and non-default temperature values.
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            body["max_tokens"] = max_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
         
         max_retries = 5
-        async with httpx.AsyncClient(timeout=180) as client:
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.post(
-                        url, json=body,
-                        headers={"api-key": self.api_key, "Content-Type": "application/json"},
-                    )
-                    if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", 5 * (attempt + 1)))
-                        wait = min(retry_after, 30)
-                        _log(f"Azure OpenAI 429, attempt {attempt+1}/{max_retries}, wait {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    if resp.status_code >= 500:
-                        wait = 3 * (attempt + 1)
-                        _log(f"Azure OpenAI {resp.status_code}, attempt {attempt+1}/{max_retries}, wait {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    return _openai_response_to_normalized(resp.json(), self.name)
-                except httpx.TimeoutException:
-                    _log(f"Azure OpenAI timeout, attempt {attempt+1}/{max_retries}")
-                    if attempt == max_retries - 1:
-                        raise
-                    await asyncio.sleep(3 * (attempt + 1))
-                except httpx.HTTPStatusError as e:
-                    _log(f"Azure OpenAI HTTP {e.response.status_code}: {e.response.text[:200]}")
+        client = self._get_client()
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(
+                    url, json=body,
+                    headers={"api-key": self.api_key, "Content-Type": "application/json"},
+                )
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 5 * (attempt + 1)))
+                    wait = min(retry_after, 30)
+                    _log(f"Azure OpenAI 429, attempt {attempt+1}/{max_retries}, wait {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code >= 500:
+                    wait = 3 * (attempt + 1)
+                    _log(f"Azure OpenAI {resp.status_code}, attempt {attempt+1}/{max_retries}, wait {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return _openai_response_to_normalized(resp.json(), self.name)
+            except httpx.TimeoutException:
+                _log(f"Azure OpenAI timeout, attempt {attempt+1}/{max_retries}")
+                if attempt == max_retries - 1:
                     raise
-        
+                await asyncio.sleep(3 * (attempt + 1))
+            except httpx.HTTPStatusError as e:
+                _log(f"Azure OpenAI HTTP {e.response.status_code}: {e.response.text[:200]}")
+                raise
+
         raise RuntimeError("Azure OpenAI: max retries exceeded")
     
     async def chat_stream(
@@ -319,12 +340,12 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{self.deployment}"
             f"/chat/completions?api-version={API_VERSION_CHAT}"
         )
-        body = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
+        body = {"messages": messages, "stream": True}
+        if _is_gpt5_family(self.deployment):
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            body["max_tokens"] = max_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -342,46 +363,47 @@ class AzureOpenAIProvider(LLMProvider):
             return
         
         # Streaming puro (sem tools) — stream token a token
-        async with httpx.AsyncClient(timeout=180) as client:
-            async with client.stream(
-                "POST", url, json=body,
-                headers={"api-key": self.api_key, "Content-Type": "application/json"},
-            ) as resp:
-                full_content = ""
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        text = delta.get("content", "")
-                        if text:
-                            full_content += text
-                            yield StreamEvent(type="token", text=text)
-                    except json.JSONDecodeError:
-                        continue
-                
-                yield StreamEvent(type="done", data={
-                    "content": full_content,
-                    "model": self.deployment,
-                    "provider": self.name,
-                })
+        client = self._get_client()
+        async with client.stream(
+            "POST", url, json=body,
+            headers={"api-key": self.api_key, "Content-Type": "application/json"},
+        ) as resp:
+            full_content = ""
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    text = delta.get("content", "")
+                    if text:
+                        full_content += text
+                        yield StreamEvent(type="token", text=text)
+                except json.JSONDecodeError:
+                    continue
+
+            yield StreamEvent(type="done", data={
+                "content": full_content,
+                "model": self.deployment,
+                "provider": self.name,
+            })
     
     async def embed(self, text: str) -> List[float]:
         url = (
             f"{self.endpoint}/openai/deployments/{EMBEDDING_DEPLOYMENT}"
             f"/embeddings?api-version={API_VERSION_OPENAI}"
         )
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                url, json={"input": text},
-                headers={"api-key": self.api_key, "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
+        client = self._get_client()
+        resp = await client.post(
+            url, json={"input": text},
+            headers={"api-key": self.api_key, "Content-Type": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
 
 
 # =============================================================================
@@ -398,6 +420,16 @@ class AnthropicProvider(LLMProvider):
         self.model = model or ANTHROPIC_MODEL_SONNET
         self.api_key = ANTHROPIC_API_KEY
         self.api_url = ANTHROPIC_API_BASE  # Pode ser Foundry ou api.anthropic.com
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=180)
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
     
     def _headers(self) -> dict:
         return {
@@ -425,34 +457,34 @@ class AnthropicProvider(LLMProvider):
             body["tool_choice"] = {"type": "auto"}
         
         max_retries = 5
-        async with httpx.AsyncClient(timeout=180) as client:
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.post(
-                        self.api_url, json=body, headers=self._headers(),
-                    )
-                    if resp.status_code == 429:
-                        retry_after = int(resp.headers.get("retry-after", 5 * (attempt + 1)))
-                        wait = min(retry_after, 30)
-                        _log(f"Anthropic 429, attempt {attempt+1}/{max_retries}, wait {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    if resp.status_code >= 500:
-                        wait = 3 * (attempt + 1)
-                        _log(f"Anthropic {resp.status_code}, attempt {attempt+1}/{max_retries}, wait {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    return _anthropic_response_to_normalized(resp.json(), self.model)
-                except httpx.TimeoutException:
-                    _log(f"Anthropic timeout, attempt {attempt+1}/{max_retries}")
-                    if attempt == max_retries - 1:
-                        raise
-                    await asyncio.sleep(3 * (attempt + 1))
-                except httpx.HTTPStatusError as e:
-                    _log(f"Anthropic HTTP {e.response.status_code}: {e.response.text[:300]}")
+        client = self._get_client()
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(
+                    self.api_url, json=body, headers=self._headers(),
+                )
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("retry-after", 5 * (attempt + 1)))
+                    wait = min(retry_after, 30)
+                    _log(f"Anthropic 429, attempt {attempt+1}/{max_retries}, wait {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code >= 500:
+                    wait = 3 * (attempt + 1)
+                    _log(f"Anthropic {resp.status_code}, attempt {attempt+1}/{max_retries}, wait {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return _anthropic_response_to_normalized(resp.json(), self.model)
+            except httpx.TimeoutException:
+                _log(f"Anthropic timeout, attempt {attempt+1}/{max_retries}")
+                if attempt == max_retries - 1:
                     raise
-        
+                await asyncio.sleep(3 * (attempt + 1))
+            except httpx.HTTPStatusError as e:
+                _log(f"Anthropic HTTP {e.response.status_code}: {e.response.text[:300]}")
+                raise
+
         raise RuntimeError("Anthropic: max retries exceeded")
     
     async def chat_stream(
@@ -476,95 +508,102 @@ class AnthropicProvider(LLMProvider):
         # Com tools e streaming no Anthropic, tool_use events vêm inline
         # Precisamos de reconstruir os tool calls a partir dos deltas
         
-        async with httpx.AsyncClient(timeout=180) as client:
-            async with client.stream(
-                "POST", self.api_url, json=body, headers=self._headers(),
-            ) as resp:
-                if resp.status_code != 200:
-                    # Fallback to non-streaming
-                    body.pop("stream")
-                    response = await self.chat(messages, tools, temperature, max_tokens)
-                    if response.content:
-                        yield StreamEvent(type="token", text=response.content)
-                    yield StreamEvent(type="done", data=response.model_dump())
-                    return
-                
-                full_content = ""
-                current_tool_calls: List[dict] = []
-                current_tool: Optional[dict] = None
-                current_tool_json = ""
-                usage_data = {}
-                
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    
-                    try:
-                        event = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    
-                    event_type = event.get("type", "")
-                    
-                    if event_type == "content_block_start":
-                        block = event.get("content_block", {})
-                        if block.get("type") == "tool_use":
-                            current_tool = {
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                            }
-                            current_tool_json = ""
-                    
-                    elif event_type == "content_block_delta":
-                        delta = event.get("delta", {})
-                        delta_type = delta.get("type", "")
-                        
-                        if delta_type == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                full_content += text
-                                yield StreamEvent(type="token", text=text)
-                        
-                        elif delta_type == "input_json_delta":
-                            current_tool_json += delta.get("partial_json", "")
-                    
-                    elif event_type == "content_block_stop":
-                        if current_tool:
-                            try:
-                                args = json.loads(current_tool_json) if current_tool_json else {}
-                            except json.JSONDecodeError:
-                                args = {}
-                            current_tool_calls.append(LLMToolCall(
-                                id=current_tool["id"],
-                                name=current_tool["name"],
-                                arguments=args,
-                            ))
-                            current_tool = None
-                            current_tool_json = ""
-                    
-                    elif event_type == "message_delta":
-                        usage_data = event.get("usage", {})
-                    
-                    elif event_type == "message_start":
-                        msg_usage = event.get("message", {}).get("usage", {})
-                        if msg_usage:
-                            usage_data = msg_usage
-                
-                # Fim do stream
-                yield StreamEvent(type="done", data=LLMResponse(
-                    content=full_content if full_content else None,
-                    tool_calls=current_tool_calls if current_tool_calls else None,
-                    usage={
-                        "prompt_tokens": usage_data.get("input_tokens", 0),
-                        "completion_tokens": usage_data.get("output_tokens", 0),
-                        "total_tokens": usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0),
-                    },
-                    model=self.model,
-                    provider="anthropic",
-                ).model_dump())
+        client = self._get_client()
+        async with client.stream(
+            "POST", self.api_url, json=body, headers=self._headers(),
+        ) as resp:
+            if resp.status_code != 200:
+                body_bytes = await resp.aread()
+                body_preview = body_bytes[:500].decode("utf-8", errors="replace")
+                logger.warning(
+                    "Anthropic streaming failed (status=%d), falling back to non-streaming. Body: %s",
+                    resp.status_code,
+                    body_preview,
+                )
+                # Fallback to non-streaming
+                body.pop("stream")
+                response = await self.chat(messages, tools, temperature, max_tokens)
+                if response.content:
+                    yield StreamEvent(type="token", text=response.content)
+                yield StreamEvent(type="done", data=response.model_dump())
+                return
+
+            full_content = ""
+            current_tool_calls: List[dict] = []
+            current_tool: Optional[dict] = None
+            current_tool_json = ""
+            usage_data = {}
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        current_tool = {
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                        }
+                        current_tool_json = ""
+
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    delta_type = delta.get("type", "")
+
+                    if delta_type == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            full_content += text
+                            yield StreamEvent(type="token", text=text)
+
+                    elif delta_type == "input_json_delta":
+                        current_tool_json += delta.get("partial_json", "")
+
+                elif event_type == "content_block_stop":
+                    if current_tool:
+                        try:
+                            args = json.loads(current_tool_json) if current_tool_json else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        current_tool_calls.append(LLMToolCall(
+                            id=current_tool["id"],
+                            name=current_tool["name"],
+                            arguments=args,
+                        ))
+                        current_tool = None
+                        current_tool_json = ""
+
+                elif event_type == "message_delta":
+                    usage_data = event.get("usage", {})
+
+                elif event_type == "message_start":
+                    msg_usage = event.get("message", {}).get("usage", {})
+                    if msg_usage:
+                        usage_data = msg_usage
+
+            # Fim do stream
+            yield StreamEvent(type="done", data=LLMResponse(
+                content=full_content if full_content else None,
+                tool_calls=current_tool_calls if current_tool_calls else None,
+                usage={
+                    "prompt_tokens": usage_data.get("input_tokens", 0),
+                    "completion_tokens": usage_data.get("output_tokens", 0),
+                    "total_tokens": usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0),
+                },
+                model=self.model,
+                provider="anthropic",
+            ).model_dump())
 
 
 # =============================================================================
@@ -606,6 +645,8 @@ def make_assistant_message_from_response(response: LLMResponse) -> dict:
 # PROVIDER FACTORY
 # =============================================================================
 
+_PROVIDER_CACHE: Dict[str, LLMProvider] = {}
+
 def _parse_provider_spec(spec: str) -> tuple[str, str]:
     """Parse 'provider:model' → (provider_name, model_name)."""
     if ":" in spec:
@@ -615,6 +656,7 @@ def _parse_provider_spec(spec: str) -> tuple[str, str]:
 
 
 def _should_route_tier_with_model_router(tier: str) -> bool:
+    """Check if this tier should use the Model Router deployment."""
     if not MODEL_ROUTER_ENABLED:
         return False
     if MODEL_ROUTER_NON_PROD_ONLY and IS_PRODUCTION:
@@ -626,7 +668,7 @@ def _should_route_tier_with_model_router(tier: str) -> bool:
 def get_provider(tier: str = None) -> LLMProvider:
     """Retorna o provider para o tier pedido.
     
-    Tiers: "fast", "standard", "pro"
+    Tiers: "fast", "standard", "pro", "vision"
     Se tier=None, usa LLM_DEFAULT_TIER.
     """
     tier = (tier or LLM_DEFAULT_TIER or "standard").strip().lower()
@@ -635,25 +677,27 @@ def get_provider(tier: str = None) -> LLMProvider:
         "fast": LLM_TIER_FAST,
         "standard": LLM_TIER_STANDARD,
         "pro": LLM_TIER_PRO,
+        "vision": LLM_TIER_VISION,
     }
     
     spec = tier_map.get(tier, LLM_TIER_STANDARD)
     if _should_route_tier_with_model_router(tier):
         spec = MODEL_ROUTER_SPEC
     provider_name, model = _parse_provider_spec(spec)
-    
-    return _create_provider(provider_name, model)
+
+    return _get_cached_provider(provider_name, model)
 
 
 def get_fallback_provider() -> LLMProvider:
     """Retorna o provider de fallback."""
     provider_name, model = _parse_provider_spec(LLM_FALLBACK)
-    return _create_provider(provider_name, model)
+    return _get_cached_provider(provider_name, model)
 
 
 def get_embedding_provider() -> AzureOpenAIProvider:
     """Embeddings — sempre Azure OpenAI (temos os índices lá)."""
-    return AzureOpenAIProvider()
+    provider = _get_cached_provider("azure_openai", "")
+    return provider if isinstance(provider, AzureOpenAIProvider) else AzureOpenAIProvider()
 
 
 def _create_provider(provider_name: str, model: str) -> LLMProvider:
@@ -673,6 +717,23 @@ def _create_provider(provider_name: str, model: str) -> LLMProvider:
     
     _log(f"Provider desconhecido: {provider_name}, fallback para Azure OpenAI")
     return AzureOpenAIProvider()
+
+
+def _get_cached_provider(provider_name: str, model: str) -> LLMProvider:
+    cache_key = f"{provider_name}:{model or ''}"
+    provider = _PROVIDER_CACHE.get(cache_key)
+    if provider is None:
+        provider = _create_provider(provider_name, model)
+        _PROVIDER_CACHE[cache_key] = provider
+    return provider
+
+
+async def close_all_providers() -> None:
+    for provider in _PROVIDER_CACHE.values():
+        try:
+            await provider.close()
+        except Exception as e:
+            logger.warning("Failed to close provider %s: %s", getattr(provider, "name", "unknown"), e)
 
 
 # =============================================================================
@@ -696,11 +757,85 @@ async def llm_with_fallback(
     temperature: float = AGENT_TEMPERATURE,
     max_tokens: int = AGENT_MAX_TOKENS,
 ) -> LLMResponse:
-    """Chat com fallback automático se o provider primário falhar."""
+    """Chat com fallback automático e cadeia explícita de tentativas."""
+    fallback_chain: List[Dict[str, Any]] = []
+    primary = get_provider(tier)
+
+    try:
+        result = await primary.chat(messages, tools, temperature, max_tokens)
+        fallback_chain.append({"provider": primary.name, "status": "ok"})
+        result.fallback_chain = fallback_chain
+        return result
+    except Exception as e:
+        fallback_chain.append({"provider": primary.name, "status": "failed", "error": str(e)[:200]})
+        _log(f"Primary provider ({primary.name}) failed: {e}, trying fallback")
+
+    try:
+        fallback = get_fallback_provider()
+        result = await fallback.chat(messages, tools, temperature, max_tokens)
+        fallback_chain.append({"provider": fallback.name, "status": "ok"})
+        result.fallback_chain = fallback_chain
+        return result
+    except Exception as e:
+        fallback_chain.append({"provider": "fallback", "status": "failed", "error": str(e)[:200]})
+        _log(f"Fallback provider failed: {e}")
+
+    _log(f"ALL providers failed. Chain: {fallback_chain}")
+    return LLMResponse(
+        content=(
+            "Lamento, mas não consegui processar o teu pedido neste momento. "
+            "Os modelos AI estão temporariamente indisponíveis. "
+            "Tenta novamente em alguns segundos."
+        ),
+        tool_calls=None,
+        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        model="",
+        provider="",
+        fallback_chain=fallback_chain,
+    )
+
+
+async def llm_stream_with_fallback(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    tier: str = None,
+    temperature: float = AGENT_TEMPERATURE,
+    max_tokens: int = AGENT_MAX_TOKENS,
+) -> AsyncGenerator[StreamEvent, None]:
+    """Streaming com fallback automático. Yield StreamEvents."""
     primary = get_provider(tier)
     try:
-        return await primary.chat(messages, tools, temperature, max_tokens)
+        async for event in primary.chat_stream(messages, tools, temperature, max_tokens):
+            yield event
+        return
     except Exception as e:
-        _log(f"Primary provider ({primary.name}) failed: {e}, trying fallback")
+        _log(f"Primary streaming ({primary.name}) failed: {e}, trying fallback")
+
+    try:
         fallback = get_fallback_provider()
-        return await fallback.chat(messages, tools, temperature, max_tokens)
+        async for event in fallback.chat_stream(messages, tools, temperature, max_tokens):
+            yield event
+        return
+    except Exception as e2:
+        _log(f"Fallback streaming failed: {e2}")
+
+    yield StreamEvent(
+        type="token",
+        text=(
+            "Lamento, mas não consegui processar o teu pedido neste momento. "
+            "Os modelos AI estão temporariamente indisponíveis. "
+            "Tenta novamente em alguns segundos."
+        ),
+    )
+    yield StreamEvent(
+        type="done",
+        data={
+            "content": "",
+            "model": "",
+            "provider": "",
+            "fallback_chain": [
+                {"provider": primary.name, "status": "failed"},
+                {"provider": "fallback", "status": "failed"},
+            ],
+        },
+    )
