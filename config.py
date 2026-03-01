@@ -64,7 +64,7 @@ ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-2025
 # LLM PROVIDER CONFIG
 # =============================================================================
 # Tiers: "fast" (barato/rápido), "standard" (default), "pro" (melhor qualidade)
-LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "fast")
+LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "standard")
 
 # Mapping de tiers para providers+modelos
 # Formato: "provider:model" — o provider resolve internamente
@@ -212,10 +212,6 @@ ALLOWED_ORIGINS = _get_env(
         [
             "https://dbdeai.pt",
             "https://millennium-ai-assistant-epa7d7b4defabwbn.swedencentral-01.azurewebsites.net",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
         ]
     ),
 )

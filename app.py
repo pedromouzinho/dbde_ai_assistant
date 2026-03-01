@@ -147,7 +147,7 @@ from token_quota import TokenQuotaManager
 # =============================================================================
 
 security = HTTPBearer(auto_error=False)
-_allowed_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+_allowed_origins = [o.strip().rstrip("/") for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 _allowed_origins_set = set(_allowed_origins)
 _AUTH_EXEMPT_PATHS = {"/health", "/api/info", "/api/client-error", "/docs", "/openapi.json", "/redoc"}
 logger = logging.getLogger(__name__)
