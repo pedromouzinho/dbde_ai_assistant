@@ -28,6 +28,7 @@ from config import (
     DEBUG_LOG_SIZE,
 )
 from models import LLMResponse, LLMToolCall, StreamEvent
+from pii_shield import PIIMaskingContext, mask_messages, PII_ENABLED
 
 # Debug log ring buffer (shared across providers)
 _llm_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
@@ -760,10 +761,29 @@ async def llm_with_fallback(
     """Chat com fallback automático e cadeia explícita de tentativas."""
     fallback_chain: List[Dict[str, Any]] = []
     primary = get_provider(tier)
+    pii_context: Optional[PIIMaskingContext] = None
+    actual_messages = messages
+
+    # PII Shield: mascarar dados do utilizador antes de enviar ao LLM.
+    if PII_ENABLED:
+        pii_context = PIIMaskingContext()
+        actual_messages = await mask_messages(messages, pii_context)
+
+    def _unmask_response_if_needed(response: LLMResponse) -> LLMResponse:
+        if not pii_context or not pii_context.mappings:
+            return response
+        if response.content:
+            response.content = pii_context.unmask(response.content)
+        if response.tool_calls:
+            for tc in response.tool_calls:
+                if isinstance(tc.arguments, dict):
+                    tc.arguments = pii_context.unmask_any(tc.arguments)
+        return response
 
     try:
-        result = await primary.chat(messages, tools, temperature, max_tokens)
+        result = await primary.chat(actual_messages, tools, temperature, max_tokens)
         fallback_chain.append({"provider": primary.name, "status": "ok"})
+        result = _unmask_response_if_needed(result)
         result.fallback_chain = fallback_chain
         return result
     except Exception as e:
@@ -772,8 +792,9 @@ async def llm_with_fallback(
 
     try:
         fallback = get_fallback_provider()
-        result = await fallback.chat(messages, tools, temperature, max_tokens)
+        result = await fallback.chat(actual_messages, tools, temperature, max_tokens)
         fallback_chain.append({"provider": fallback.name, "status": "ok"})
+        result = _unmask_response_if_needed(result)
         result.fallback_chain = fallback_chain
         return result
     except Exception as e:
