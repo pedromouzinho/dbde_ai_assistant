@@ -3479,8 +3479,11 @@ async def debug_conversations(credentials: HTTPAuthorizationCredentials = Depend
 
 @app.get("/")
 async def root():
-    try:
-        with open("/home/site/wwwroot/static/index.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(content=f"<h1>{APP_TITLE} v{APP_VERSION}</h1><p>Frontend not deployed. Use /docs for API.</p>")
+    index_candidates = [
+        BASE_DIR / "static" / "index.html",
+        Path("/home/site/wwwroot/static/index.html"),
+    ]
+    for index_path in index_candidates:
+        if index_path.exists():
+            return HTMLResponse(content=index_path.read_text(encoding="utf-8", errors="replace"))
+    return HTMLResponse(content=f"<h1>{APP_TITLE} v{APP_VERSION}</h1><p>Frontend not deployed. Use /docs for API.</p>")

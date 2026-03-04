@@ -1,11 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /home/site/wwwroot
-export PYTHONPATH=/home/site/wwwroot:/home/site/wwwroot/antenv/lib/python3.12/site-packages:$PYTHONPATH
+# Resolve runtime app root (Oryx can run extracted app from /tmp/... instead of /home/site/wwwroot)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_ROOT="${APP_PATH:-$SCRIPT_DIR}"
+if [[ ! -f "$APP_ROOT/app.py" && -f "/home/site/wwwroot/app.py" ]]; then
+  APP_ROOT="/home/site/wwwroot"
+fi
+
+cd "$APP_ROOT"
+export PYTHONPATH="$APP_ROOT:$APP_ROOT/antenv/lib/python3.12/site-packages:${PYTHONPATH:-}"
 export UPLOAD_INLINE_WORKER_RUNTIME_ENABLED="${UPLOAD_INLINE_WORKER_RUNTIME_ENABLED:-false}"
 
-RUN_DIR="${WORKER_RUN_DIR:-/home/site/wwwroot/run}"
+RUN_DIR="${WORKER_RUN_DIR:-$APP_ROOT/run}"
 mkdir -p "$RUN_DIR" /home/LogFiles
 
 UPLOAD_PID_FILE="${UPLOAD_WORKER_PID_FILE:-$RUN_DIR/upload-worker.pid}"
