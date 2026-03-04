@@ -97,7 +97,7 @@ from config import (
     EXPORT_JOB_STALE_SECONDS, EXPORT_INLINE_WORKER_ENABLED, EXPORT_WORKER_POLL_SECONDS,
     EXPORT_WORKER_BATCH_SIZE,
     EXPORT_BRAND_COLOR, EXPORT_BRAND_NAME, EXPORT_AGENT_NAME,
-    STARTUP_FAIL_FAST, TOKEN_QUOTA_CONFIG,
+    STARTUP_FAIL_FAST, TOKEN_QUOTA_CONFIG, CHAT_BUDGET_PER_MINUTE,
 )
 from models import (
     AgentChatRequest, AgentChatResponse,
@@ -152,6 +152,7 @@ _allowed_origins_set = set(_allowed_origins)
 _AUTH_EXEMPT_PATHS = {"/health", "/api/info", "/api/client-error", "/docs", "/openapi.json", "/redoc"}
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
+_CHAT_BUDGET_LIMIT = f"{max(1, int(CHAT_BUDGET_PER_MINUTE or 10))}/minute"
 WORKER_RUN_DIR = os.getenv("WORKER_RUN_DIR", "/home/site/wwwroot/run")
 UPLOAD_WORKER_PID_FILE = os.getenv("UPLOAD_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/upload-worker.pid")
 EXPORT_WORKER_PID_FILE = os.getenv("EXPORT_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/export-worker.pid")
@@ -1146,7 +1147,7 @@ async def log_audit(user_id, action, question="", tools_used=None, tokens=None, 
 
 @app.post("/chat/agent", response_model=AgentChatResponse)
 @limiter.shared_limit(
-    "10/minute",
+    _CHAT_BUDGET_LIMIT,
     scope="chat_budget",
     key_func=_user_or_ip_rate_key,
 )
@@ -1164,7 +1165,7 @@ async def agent_chat_endpoint(request: Request, chat_request: AgentChatRequest, 
 
 @app.post("/chat/agent/stream")
 @limiter.shared_limit(
-    "10/minute",
+    _CHAT_BUDGET_LIMIT,
     scope="chat_budget",
     key_func=_user_or_ip_rate_key,
 )
@@ -1175,7 +1176,7 @@ async def agent_chat_stream_endpoint(request: Request, chat_request: AgentChatRe
 
 @app.post("/chat/file", response_model=AgentChatResponse)
 @limiter.shared_limit(
-    "10/minute",
+    _CHAT_BUDGET_LIMIT,
     scope="chat_budget",
     key_func=_user_or_ip_rate_key,
 )

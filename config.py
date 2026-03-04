@@ -225,6 +225,7 @@ AGENT_TEMPERATURE = float(_get_env("AGENT_TEMPERATURE", "0.3"))
 AGENT_HISTORY_LIMIT = int(_get_env("AGENT_HISTORY_LIMIT", "14"))
 AGENT_TOOL_RESULT_MAX_SIZE = int(_get_env("AGENT_TOOL_RESULT_MAX_SIZE", "30000"))
 AGENT_TOOL_RESULT_KEEP_ITEMS = int(_get_env("AGENT_TOOL_RESULT_KEEP_ITEMS", "100"))
+CHAT_BUDGET_PER_MINUTE = int(_get_env("CHAT_BUDGET_PER_MINUTE", "10"))
 
 # =============================================================================
 # UPLOAD CONFIG
