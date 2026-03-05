@@ -969,10 +969,7 @@ def _extract_forced_uploaded_table_calls(
     if not (file_hint or analysis_hint):
         return []
 
-    args: Dict[str, object] = {"query": question}
-    if re.search(r"\b(lista completa|completo|completa|todos os valores|integral|sem amostra|analisa tudo)\b", norm):
-        args["full_points"] = True
-        args["top"] = 5000
+    args: Dict[str, object] = {"query": question, "full_points": True, "top": 5000}
 
     return [
         LLMToolCall(
@@ -1155,6 +1152,10 @@ async def _execute_tool_calls(
             args["conv_id"] = conv_id
         if tc.name == "analyze_uploaded_table" and user_sub and not args.get("user_sub"):
             args["user_sub"] = user_sub
+        if tc.name == "analyze_uploaded_table" and "full_points" not in args:
+            args["full_points"] = True
+        if tc.name == "analyze_uploaded_table" and "top" not in args:
+            args["top"] = 5000
         if tc.name == "run_code" and not args.get("conv_id"):
             args["conv_id"] = conv_id
         if tc.name == "run_code" and user_sub and not args.get("user_sub"):

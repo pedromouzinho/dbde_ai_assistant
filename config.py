@@ -235,7 +235,7 @@ ALLOWED_ORIGINS = _get_env(
 # =============================================================================
 # AGENT CONFIG
 # =============================================================================
-AGENT_MAX_ITERATIONS = int(_get_env("AGENT_MAX_ITERATIONS", "5"))
+AGENT_MAX_ITERATIONS = int(_get_env("AGENT_MAX_ITERATIONS", "7"))
 AGENT_MAX_TOKENS = int(_get_env("AGENT_MAX_TOKENS", "8000"))
 AGENT_TEMPERATURE = float(_get_env("AGENT_TEMPERATURE", "0.3"))
 AGENT_HISTORY_LIMIT = int(_get_env("AGENT_HISTORY_LIMIT", "14"))
@@ -246,7 +246,7 @@ CHAT_BUDGET_PER_MINUTE = int(_get_env("CHAT_BUDGET_PER_MINUTE", "10"))
 # =============================================================================
 # CODE INTERPRETER CONFIG
 # =============================================================================
-CODE_INTERPRETER_TIMEOUT = int(_get_env("CODE_INTERPRETER_TIMEOUT", "30"))
+CODE_INTERPRETER_TIMEOUT = int(_get_env("CODE_INTERPRETER_TIMEOUT", "240"))
 CODE_INTERPRETER_MAX_OUTPUT = int(_get_env("CODE_INTERPRETER_MAX_OUTPUT", "50000"))
 CODE_INTERPRETER_ENABLED = _get_env("CODE_INTERPRETER_ENABLED", "true").lower() == "true"
 
