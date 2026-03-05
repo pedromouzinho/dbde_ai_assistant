@@ -21,6 +21,7 @@ from config import (
     CODE_INTERPRETER_TIMEOUT,
     CODE_INTERPRETER_MAX_OUTPUT,
     CODE_INTERPRETER_ENABLED,
+    CODE_INTERPRETER_MAX_INPUT_FILE_BYTES,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 RESULT_MARKER = "__CODE_RESULT__:"
 MAX_CODE_CHARS = 20000
 MAX_RETURN_FILE_BYTES = 10_000_000
-MAX_UPLOADED_FILE_BYTES = 10_000_000
+MAX_UPLOADED_FILE_BYTES = CODE_INTERPRETER_MAX_INPUT_FILE_BYTES
 
 # Imports seguros permitidos.
 ALLOWED_IMPORTS = {
@@ -163,17 +164,44 @@ def _runner_script(tmpdir: str, code_b64: str) -> str:
         import io
         import json
         import base64
+        import shutil
         import traceback
         import contextlib
         import builtins
 
         TMPDIR = {tmpdir!r}
         os.chdir(TMPDIR)
+        os.makedirs(os.path.join(TMPDIR, "mnt", "data"), exist_ok=True)
+        for _name in list(os.listdir(TMPDIR)):
+            _src = os.path.join(TMPDIR, _name)
+            if not os.path.isfile(_src) or _name.startswith("_"):
+                continue
+            _dst = os.path.join(TMPDIR, "mnt", "data", _name)
+            try:
+                os.symlink(_src, _dst)
+            except Exception:
+                try:
+                    shutil.copy2(_src, _dst)
+                except Exception:
+                    pass
         _before = set(os.listdir(TMPDIR))
         _generated_plot_files = []
 
+        def _remap_data_path(path_like):
+            try:
+                s = os.fspath(path_like)
+            except Exception:
+                return path_like
+            s = str(s)
+            if s == "/mnt/data":
+                return os.path.join("mnt", "data")
+            if s.startswith("/mnt/data/"):
+                return os.path.join("mnt", "data", s[len("/mnt/data/"):])
+            return path_like
+
         def _safe_path(path_like):
-            p = os.path.realpath(os.path.join(TMPDIR, str(path_like)))
+            remapped = _remap_data_path(path_like)
+            p = os.path.realpath(os.path.join(TMPDIR, str(remapped)))
             root = os.path.realpath(TMPDIR)
             if not (p == root or p.startswith(root + os.sep)):
                 raise PermissionError("Acesso fora do sandbox nao permitido.")
@@ -183,6 +211,20 @@ def _runner_script(tmpdir: str, code_b64: str) -> str:
         def _safe_open(file, *args, **kwargs):
             return _orig_open(_safe_path(file), *args, **kwargs)
         builtins.open = _safe_open
+
+        try:
+            import pandas as _pd
+            def _patch_reader(_fn_name):
+                _fn = getattr(_pd, _fn_name, None)
+                if not callable(_fn):
+                    return
+                def _wrapped(path_or_buf, *args, **kwargs):
+                    return _fn(_remap_data_path(path_or_buf), *args, **kwargs)
+                setattr(_pd, _fn_name, _wrapped)
+            for _reader in ("read_csv", "read_excel", "read_table", "read_parquet", "read_feather"):
+                _patch_reader(_reader)
+        except Exception:
+            pass
 
         try:
             import matplotlib
@@ -206,7 +248,16 @@ def _runner_script(tmpdir: str, code_b64: str) -> str:
         success = True
         error = None
 
-        glb = {{"__name__": "__main__"}}
+        _uploaded_files = [
+            _n for _n in sorted(os.listdir(TMPDIR))
+            if os.path.isfile(os.path.join(TMPDIR, _n)) and not _n.startswith("_")
+        ]
+        glb = {{
+            "__name__": "__main__",
+            "UPLOADED_FILES": _uploaded_files,
+            "DEFAULT_FILE": (_uploaded_files[0] if _uploaded_files else ""),
+            "DATA_DIR": os.path.join(TMPDIR, "mnt", "data"),
+        }}
         loc = {{}}
         with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
             try:
@@ -367,4 +418,3 @@ async def execute_code(code: str, uploaded_files: Optional[Dict[str, bytes]] = N
             return {"success": False, "error": f"Timeout: codigo excedeu {CODE_INTERPRETER_TIMEOUT} segundos."}
         except Exception as e:
             return {"success": False, "error": f"Erro de execucao: {str(e)}"}
-

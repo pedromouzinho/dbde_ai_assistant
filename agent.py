@@ -1074,6 +1074,34 @@ async def _execute_tool_calls(
             if isinstance(chart_ready, dict) and chart_ready:
                 return chart_ready
         return {}
+
+    def _looks_like_run_code_refusal(result: dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        has_artifacts = bool(
+            result.get("files")
+            or result.get("images")
+            or result.get("generated_artifacts")
+            or result.get("items")
+        )
+        if has_artifacts:
+            return False
+        raw = " ".join(
+            str(result.get(k, "") or "")
+            for k in ("stdout", "stderr", "error", "output_text")
+        )
+        norm = _normalize_request_text(raw)
+        refusal_markers = (
+            "nao consigo",
+            "nao foi possivel",
+            "nao e possivel",
+            "limitac",
+            "restric",
+            "nao posso",
+            "nao permite",
+            "falta",
+        )
+        return any(marker in norm for marker in refusal_markers)
     
     async def _run(tc: LLMToolCall):
         started = time.perf_counter()
@@ -1258,7 +1286,11 @@ async def _execute_tool_calls(
         try:
             result = await execute_tool(tc.name, args)
             if tc.name == "run_code":
-                failed = bool(result.get("error")) or not bool(result.get("success", False))
+                failed = (
+                    bool(result.get("error"))
+                    or not bool(result.get("success", False))
+                    or _looks_like_run_code_refusal(result)
+                )
                 if failed:
                     logger.info(
                         "[Agent] run_code falhou; a executar fallback analyze_uploaded_table (conv=%s)",
@@ -1275,7 +1307,13 @@ async def _execute_tool_calls(
                     fallback = await execute_tool("analyze_uploaded_table", fallback_args)
                     if isinstance(fallback, dict):
                         fallback["_fallback_from"] = "run_code"
-                        fallback["_run_code_error"] = str(result.get("error") or result.get("stderr") or "")[:500]
+                        fallback["_run_code_error"] = str(
+                            result.get("error")
+                            or result.get("stderr")
+                            or result.get("stdout")
+                            or result.get("output_text")
+                            or ""
+                        )[:500]
                         result = fallback
             if isinstance(result, dict) and "error" in result:
                 status = "tool_error"

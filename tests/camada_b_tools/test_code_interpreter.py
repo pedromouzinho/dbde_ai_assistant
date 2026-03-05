@@ -52,3 +52,17 @@ async def test_timeout(monkeypatch):
     result = await execute_code("import time; time.sleep(60)")
     assert not result["success"]
     assert "Timeout" in str(result.get("error", ""))
+
+
+@pytest.mark.asyncio
+async def test_mnt_data_path_remap_for_pandas():
+    pytest.importorskip("pandas")
+    csv_bytes = b"a,b\n1,2\n3,4\n"
+    code = """
+import pandas as pd
+df = pd.read_csv('/mnt/data/sample.csv')
+print(int(df['a'].sum()))
+"""
+    result = await execute_code(code, uploaded_files={"sample.csv": csv_bytes})
+    assert result["success"]
+    assert "4" in (result.get("stdout") or "")

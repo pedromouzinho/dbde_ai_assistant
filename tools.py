@@ -20,6 +20,7 @@ from config import (
     RERANK_TOP_N, RERANK_TIMEOUT_SECONDS, RERANK_AUTH_MODE,
     UPLOAD_INDEX_TOP, GENERATED_FILES_BLOB_CONTAINER,
     VISION_ENABLED,
+    CODE_INTERPRETER_MAX_MOUNT_BYTES,
 )
 from llm_provider import get_embedding_provider, llm_simple, llm_with_fallback
 from export_engine import to_csv, to_xlsx, to_pdf
@@ -1206,7 +1207,7 @@ async def _load_uploaded_files_for_code(
     user_sub: str = "",
     filename: str = "",
     max_files: int = 3,
-    max_total_bytes: int = 25_000_000,
+    max_total_bytes: int = CODE_INTERPRETER_MAX_MOUNT_BYTES,
 ) -> dict:
     safe_conv = str(conv_id or "").strip()
     safe_user = str(user_sub or "").strip()
@@ -1901,6 +1902,8 @@ def get_agent_system_prompt():
         "   Exemplos: \"calcula correlação de colunas\", \"gera ficheiro Excel com duas folhas\", \"faz análise estatística custom\".\n"
         "   REGRA: Em CSV/Excel, run_code é a PRIMEIRA TENTATIVA por defeito (mesmo para pedidos simples).\n"
         "   REGRA: Se o pedido exigir análise EXAUSTIVA (ficheiro todo, sem amostra, lista completa, todos os valores, top N por linha, correlação/scatter, validação exata), usa run_code.\n"
+        "   REGRA: NÃO responder com pedidos de confirmação em análises read-only. Executa diretamente.\n"
+        "   REGRA: NÃO responder com \"não consigo\" sem tentar código real; só usar essa frase se houver erro técnico concreto no output da tool.\n"
         "   REGRA: Não pedir confirmação extra para pedidos read-only de análise; executa diretamente.\n"
         "   REGRA: Usa analyze_uploaded_table apenas como fallback quando run_code falhar/timeout.",
     ]
@@ -1920,6 +1923,7 @@ def get_agent_system_prompt():
             "   REGRA: NUNCA usar query_workitems para dados de ficheiro carregado.\n"
             "   REGRA: Em pedidos read-only (analisar, resumir, listar, validar), executa diretamente sem pedir confirmação adicional.\n"
             "   REGRA: Assume análise completa por defeito; só usa amostragem quando o utilizador pedir explicitamente.\n"
+            "   REGRA: Se o utilizador pedir gráfico completo com muitos pontos, gera ficheiro descarregável (HTML/CSV/XLSX) automaticamente na mesma resposta, e mostra preview no chat.\n"
             "   REGRA: Se run_code falhar/timeout, usa analyze_uploaded_table automaticamente como fallback.\n"
             "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
         )
