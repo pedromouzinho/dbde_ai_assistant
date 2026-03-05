@@ -233,6 +233,13 @@ AGENT_TOOL_RESULT_KEEP_ITEMS = int(_get_env("AGENT_TOOL_RESULT_KEEP_ITEMS", "100
 CHAT_BUDGET_PER_MINUTE = int(_get_env("CHAT_BUDGET_PER_MINUTE", "10"))
 
 # =============================================================================
+# CODE INTERPRETER CONFIG
+# =============================================================================
+CODE_INTERPRETER_TIMEOUT = int(_get_env("CODE_INTERPRETER_TIMEOUT", "30"))
+CODE_INTERPRETER_MAX_OUTPUT = int(_get_env("CODE_INTERPRETER_MAX_OUTPUT", "50000"))
+CODE_INTERPRETER_ENABLED = _get_env("CODE_INTERPRETER_ENABLED", "true").lower() == "true"
+
+# =============================================================================
 # UPLOAD CONFIG
 # =============================================================================
 UPLOAD_MAX_FILES_PER_CONVERSATION = int(_get_env("UPLOAD_MAX_FILES_PER_CONVERSATION", "10"))

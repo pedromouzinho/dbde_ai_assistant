@@ -926,6 +926,183 @@ async def tool_analyze_uploaded_table(
         },
     }
 
+
+async def _load_uploaded_files_for_code(
+    conv_id: str,
+    user_sub: str = "",
+    filename: str = "",
+    max_files: int = 3,
+    max_total_bytes: int = 25_000_000,
+) -> dict:
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    if not safe_conv:
+        return {}
+
+    odata_conv = safe_conv.replace("'", "''")
+    try:
+        rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
+    except Exception as e:
+        logging.warning("[Tools] run_code UploadIndex query failed: %s", e)
+        return {}
+
+    if not rows:
+        return {}
+
+    wanted_filename = _normalize_lookup_key(filename)
+    candidates = []
+    for row in rows:
+        owner_sub = str(row.get("UserSub", "") or "")
+        if safe_user and owner_sub and owner_sub != safe_user:
+            continue
+        fname = str(row.get("Filename", "") or "")
+        raw_ref = str(row.get("RawBlobRef", "") or "")
+        if not fname or not raw_ref:
+            continue
+        norm = _normalize_lookup_key(fname)
+        if wanted_filename and wanted_filename not in norm and norm != wanted_filename:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda r: str(r.get("UploadedAt", "")), reverse=True)
+    selected = candidates[: max(1, min(max_files, 10))]
+
+    uploaded_files: dict = {}
+    total = 0
+    for row in selected:
+        fname = str(row.get("Filename", "") or "").strip()
+        safe_name = fname.replace("\\", "_").replace("/", "_")
+        raw_blob_ref = str(row.get("RawBlobRef", "") or "")
+        container, blob_name = parse_blob_ref(raw_blob_ref)
+        if not container or not blob_name:
+            continue
+        try:
+            raw_bytes = await blob_download_bytes(container, blob_name)
+        except Exception as e:
+            logging.warning("[Tools] run_code failed to download upload %s: %s", safe_name, e)
+            continue
+        if not raw_bytes:
+            continue
+        if total + len(raw_bytes) > max_total_bytes:
+            break
+        uploaded_files[safe_name] = raw_bytes
+        total += len(raw_bytes)
+    return uploaded_files
+
+
+async def tool_run_code(
+    code: str = "",
+    description: str = "",
+    conv_id: str = "",
+    user_sub: str = "",
+    filename: str = "",
+):
+    from code_interpreter import execute_code
+
+    safe_code = str(code or "")
+    safe_desc = str(description or "").strip()
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    safe_filename = str(filename or "").strip()
+
+    mounted_files = {}
+    if safe_conv:
+        mounted_files = await _load_uploaded_files_for_code(
+            safe_conv,
+            user_sub=safe_user,
+            filename=safe_filename,
+        )
+
+    result = await execute_code(
+        code=safe_code,
+        uploaded_files=mounted_files or None,
+    )
+
+    artifacts = []
+    for img in (result.get("images") or []):
+        fname = str(img.get("filename", "") or "").strip()
+        b64 = str(img.get("data", "") or "")
+        if not fname or not b64:
+            continue
+        try:
+            content = base64.b64decode(b64)
+        except Exception:
+            continue
+        fmt = fname.rsplit(".", 1)[-1].lower() if "." in fname else "bin"
+        download_id = await _store_generated_file(content, str(img.get("mime_type", "") or "application/octet-stream"), fname, fmt)
+        artifacts.append(
+            {
+                "type": "image",
+                "filename": fname,
+                "size": int(img.get("size", len(content)) or len(content)),
+                "download_id": download_id,
+                "url": f"/api/download/{download_id}" if download_id else "",
+            }
+        )
+
+    for file_obj in (result.get("files") or []):
+        fname = str(file_obj.get("filename", "") or "").strip()
+        b64 = str(file_obj.get("data", "") or "")
+        if not fname or not b64:
+            continue
+        try:
+            content = base64.b64decode(b64)
+        except Exception:
+            continue
+        fmt = fname.rsplit(".", 1)[-1].lower() if "." in fname else "bin"
+        download_id = await _store_generated_file(content, str(file_obj.get("mime_type", "") or "application/octet-stream"), fname, fmt)
+        artifacts.append(
+            {
+                "type": "file",
+                "filename": fname,
+                "size": int(file_obj.get("size", len(content)) or len(content)),
+                "download_id": download_id,
+                "url": f"/api/download/{download_id}" if download_id else "",
+            }
+        )
+
+    stdout = str(result.get("stdout", "") or "")
+    stderr = str(result.get("stderr", "") or "")
+    error = str(result.get("error", "") or "")
+
+    output_parts = []
+    if safe_desc:
+        output_parts.append(f"Descrição: {safe_desc}")
+    if stdout:
+        output_parts.append(f"STDOUT:\n{stdout}")
+    if stderr:
+        output_parts.append(f"STDERR:\n{stderr}")
+    if error:
+        output_parts.append(f"ERROR: {error}")
+    if mounted_files:
+        output_parts.append(f"Ficheiros montados no sandbox: {', '.join(sorted(mounted_files.keys()))}")
+    if artifacts:
+        names = [a.get("filename", "") for a in artifacts if a.get("filename")]
+        output_parts.append(f"Ficheiros gerados: {', '.join(names)}")
+    if not output_parts:
+        output_parts.append("Código executado sem output.")
+
+    payload = {
+        "source": "code_interpreter",
+        "success": bool(result.get("success", False)),
+        "description": safe_desc,
+        "stdout": stdout,
+        "stderr": stderr or None,
+        "error": error or None,
+        "return_code": result.get("return_code"),
+        "mounted_files": sorted(mounted_files.keys()),
+        "generated_artifacts": artifacts,
+        "items": artifacts,
+        "total_count": len(artifacts),
+        "output_text": "\n\n".join(output_parts)[:12000],
+    }
+    if not payload["success"] and not payload.get("error"):
+        payload["error"] = "Falha na execução do código."
+    return payload
+
 # =============================================================================
 # TOOL RESULT TRUNCATION
 # =============================================================================
@@ -1087,6 +1264,7 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"create_workitem","description":"Cria um Work Item no Azure DevOps. USA APENAS quando o utilizador CONFIRMAR explicitamente a criação. PERGUNTA SEMPRE antes de criar.","parameters":{"type":"object","properties":{"work_item_type":{"type":"string","description":"Tipo: 'User Story', 'Bug', 'Task', 'Feature'. Default: 'User Story'."},"title":{"type":"string","description":"Título do Work Item."},"description":{"type":"string","description":"Descrição em HTML. Usa formato MSE."},"acceptance_criteria":{"type":"string","description":"Critérios de aceitação em HTML."},"area_path":{"type":"string","description":"AreaPath. Ex: 'IT.DIT\\\\DIT\\\\ADMChannels\\\\DBKS\\\\AM24\\\\RevampFEE MVP2'"},"assigned_to":{"type":"string","description":"Nome completo da pessoa. Ex: 'Pedro Mousinho'"},"tags":{"type":"string","description":"Tags separadas por ';'. Ex: 'MVP2;FEE;Sprint23'"},"confirmed":{"type":"boolean","description":"true apenas após confirmação explícita do utilizador (ex: 'confirmo')."}},"required":["title"]}}},
     {"type":"function","function":{"name":"refine_workitem","description":"Refina uma User Story existente no DevOps a partir de uma instrução curta (sem alterar automaticamente o item). Usa quando o utilizador pedir ajustes numa US já criada, ex: 'na US 12345 adiciona validação de email'.","parameters":{"type":"object","properties":{"work_item_id":{"type":"integer","description":"ID do work item existente a refinar."},"refinement_request":{"type":"string","description":"Instrução objetiva do que mudar na US existente."}},"required":["work_item_id","refinement_request"]}}},
     {"type":"function","function":{"name":"generate_chart","description":"Gera gráfico interativo (bar, pie, line, scatter, histogram, hbar). USA SEMPRE que o utilizador pedir gráfico, chart, visualização ou distribuição visual. Extrai dados de tool_results anteriores ou de dados fornecidos.","parameters":{"type":"object","properties":{"chart_type":{"type":"string","description":"Tipo: 'bar','pie','line','scatter','histogram','hbar'. Default: 'bar'."},"title":{"type":"string","description":"Título do gráfico."},"x_values":{"type":"array","items":{"type":"string"},"description":"Valores eixo X (categorias ou datas). Ex: ['Active','Closed','New']"},"y_values":{"type":"array","items":{"type":"number"},"description":"Valores eixo Y (numéricos). Ex: [45, 30, 12]"},"labels":{"type":"array","items":{"type":"string"},"description":"Labels para pie chart. Ex: ['Bug','US','Task']"},"values":{"type":"array","items":{"type":"number"},"description":"Valores para pie chart. Ex: [20, 50, 30]"},"series":{"type":"array","items":{"type":"object"},"description":"Multi-series. Cada obj: {type,name,x,y,labels,values}"},"x_label":{"type":"string","description":"Label do eixo X"},"y_label":{"type":"string","description":"Label do eixo Y"}},"required":["title"]}}},
+    {"type":"function","function":{"name":"run_code","description":"Executa código Python em sandbox seguro para cálculos, análise de dados, manipulação de CSV/Excel e geração de gráficos/ficheiros. Usa quando o pedido exigir computação programática que outras tools não cobrem.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Código Python a executar. Usa print() para output textual. Para gráficos matplotlib, usa plt.show(). Ficheiros guardados no diretório atual serão devolvidos para download."},"description":{"type":"string","description":"Descrição breve do objetivo do código (auditoria/log)."},"filename":{"type":"string","description":"Nome do ficheiro carregado a montar no sandbox (opcional; por omissão usa os mais recentes da conversa)."},"conv_id":{"type":"string","description":"ID da conversa (preenchido automaticamente pelo agente)."},"user_sub":{"type":"string","description":"Sub do utilizador para filtrar uploads da conversa (interno)."}},"required":["code"]}}},
     {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF, DOCX, HTML) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf","docx","html"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
 ]
 
@@ -1172,6 +1350,13 @@ def _tool_dispatch() -> dict:
             arguments.get("series"),
             arguments.get("x_label", ""),
             arguments.get("y_label", ""),
+        ),
+        "run_code": lambda arguments: tool_run_code(
+            arguments.get("code", ""),
+            arguments.get("description", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
         ),
         "generate_file": lambda arguments: tool_generate_file(
             arguments.get("format", "csv"),
@@ -1431,8 +1616,11 @@ def get_agent_system_prompt():
         "   REGRA: So usar quando o utilizador pedir EXPLICITAMENTE geracao/download de ficheiro.",
         "12. Para resultados extensos (muitas linhas) -> mostra PREVIEW no chat e indica que o ficheiro completo está disponível para download.\n"
         "   REGRA: Evita listar dezenas de linhas completas na resposta textual.",
+        "13. Para CÁLCULOS AVANÇADOS, SCRIPT PYTHON, transformação customizada de dados, ou geração programática de ficheiros/gráficos -> usa run_code.\n"
+        "   Exemplos: \"calcula correlação de colunas\", \"gera ficheiro Excel com duas folhas\", \"faz análise estatística custom\".\n"
+        "   REGRA: Prefere tools determinísticas (analyze_uploaded_table, compute_kpi, generate_chart, generate_file) quando suficientes; usa run_code quando for necessária lógica Python custom.",
     ]
-    next_rule = 13
+    next_rule = 14
     if uploaded_doc_enabled:
         routing_rules.append(
             f"{next_rule}. Para PERGUNTAS SOBRE DOCUMENTO CARREGADO (sobretudo PDF grande) -> usa search_uploaded_document (OBRIGATORIO)\n"
@@ -1475,6 +1663,8 @@ def get_agent_system_prompt():
         "- \"Mostra grafico de bugs por estado\" -> compute_kpi DEPOIS generate_chart",
         "- \"Visualiza distribuicao de USs\" -> compute_kpi DEPOIS generate_chart",
         "- \"Gera um Excel/CSV/PDF/DOCX/HTML com esta tabela\" -> generate_file",
+        "- \"Calcula correlação entre colunas do CSV\" -> run_code",
+        "- \"Transforma estes dados e gera XLSX com múltiplas folhas\" -> run_code",
     ]
     if uploaded_doc_enabled:
         usage_examples.extend(

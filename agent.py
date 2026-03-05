@@ -1112,6 +1112,10 @@ async def _execute_tool_calls(
             args["conv_id"] = conv_id
         if tc.name == "analyze_uploaded_table" and user_sub and not args.get("user_sub"):
             args["user_sub"] = user_sub
+        if tc.name == "run_code" and not args.get("conv_id"):
+            args["conv_id"] = conv_id
+        if tc.name == "run_code" and user_sub and not args.get("user_sub"):
+            args["user_sub"] = user_sub
         if tc.name == "generate_chart":
             has_explicit_data = bool(
                 args.get("series")
