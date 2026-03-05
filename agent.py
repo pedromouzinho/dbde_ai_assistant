@@ -955,7 +955,8 @@ def _extract_forced_uploaded_table_calls(
 ) -> List[LLMToolCall]:
     if not _has_tabular_uploads(conv_id):
         return []
-    if "analyze_uploaded_table" in set(already_used or []):
+    used = set(already_used or [])
+    if "analyze_uploaded_table" in used or "run_code" in used:
         return []
 
     norm = _normalize_request_text(question)
@@ -967,6 +968,18 @@ def _extract_forced_uploaded_table_calls(
         )
     )
     if not (file_hint or analysis_hint):
+        return []
+
+    run_code_hint = bool(
+        re.search(
+            r"\b(analisa tudo|analisa o ficheiro todo|ficheiro completo|sem amostra|lista completa|todos os valores|valores distintos|"
+            r"correlacao|scatter|top\s*\d+|amplitude|maior queda|ranking completo|todas as linhas|registos completos|exaustiv)\b",
+            norm,
+        )
+    )
+    if run_code_hint:
+        # Para pedidos exaustivos/row-level, evita forçar a tool agregada.
+        # Deixa o LLM escolher run_code (preferencial via prompt).
         return []
 
     args: Dict[str, object] = {"query": question, "full_points": True, "top": 5000}
@@ -1127,8 +1140,9 @@ async def _execute_tool_calls(
                 return tc, {
                     "error": (
                         "Existem ficheiros carregados nesta conversa. "
-                        "Para analisar dados do ficheiro, usa analyze_uploaded_table. "
-                        "Para gerar graficos, usa generate_chart com os dados da analise. "
+                        "Para análises rápidas/agregadas, usa analyze_uploaded_table. "
+                        "Para análise completa/linha-a-linha, lista completa, correlação ou lógica custom, usa run_code. "
+                        "Para gerar gráficos, usa generate_chart com os dados da análise. "
                         "query_workitems/search_workitems sao para Azure DevOps, nao para ficheiros carregados."
                     )
                 }

@@ -1834,7 +1834,7 @@ def get_agent_system_prompt():
         )
     if uploaded_table_enabled:
         gate_priority_hints.append(
-            "- Se o utilizador pedir análise de CSV/Excel carregado (média por ano/mês, agregações, gráficos), usa analyze_uploaded_table e NÃO query_workitems."
+            "- Se o utilizador pedir análise de CSV/Excel carregado, escolhe a tool certa: analyze_uploaded_table para agregações simples e run_code para análise completa/linha-a-linha/lista completa/lógica custom."
         )
     if figma_enabled:
         gate_priority_hints.append(
@@ -1899,8 +1899,9 @@ def get_agent_system_prompt():
         "   REGRA: Evita listar dezenas de linhas completas na resposta textual.",
         "13. Para CÁLCULOS AVANÇADOS, SCRIPT PYTHON, transformação customizada de dados, ou geração programática de ficheiros/gráficos -> usa run_code.\n"
         "   Exemplos: \"calcula correlação de colunas\", \"gera ficheiro Excel com duas folhas\", \"faz análise estatística custom\".\n"
-        "   REGRA: Prefere tools determinísticas (analyze_uploaded_table, compute_kpi, generate_chart, generate_file) quando suficientes; usa run_code quando for necessária lógica Python custom.\n"
-        "   REGRA: Se o utilizador pedir validação exata de coluna textual, lista completa de valores distintos ou lógica não coberta pelas tools, usa run_code.",
+        "   REGRA: Se o pedido exigir análise EXAUSTIVA (ficheiro todo, sem amostra, lista completa, todos os valores, top N por linha, correlação/scatter, validação exata), usa run_code.\n"
+        "   REGRA: Não pedir confirmação extra para pedidos read-only de análise; executa diretamente.\n"
+        "   REGRA: Prefere analyze_uploaded_table apenas para agregações simples quando cobre totalmente o pedido.",
     ]
     next_rule = 14
     if uploaded_doc_enabled:
@@ -1912,11 +1913,13 @@ def get_agent_system_prompt():
         next_rule += 1
     if uploaded_table_enabled:
         routing_rules.append(
-            f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> usa analyze_uploaded_table (OBRIGATORIO)\n"
-            "   Exemplos: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\"\n"
+            f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> decide entre analyze_uploaded_table e run_code\n"
+            "   Exemplos simples: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\" -> analyze_uploaded_table\n"
+            "   Exemplos exaustivos/custom: \"analisa tudo\", \"lista completa\", \"correlação\", \"scatter\", \"top 10 por amplitude\" -> run_code\n"
             "   REGRA: NUNCA usar query_workitems para dados de ficheiro carregado.\n"
             "   REGRA: Em pedidos read-only (analisar, resumir, listar, validar), executa diretamente sem pedir confirmação adicional.\n"
             "   REGRA: Assume análise completa por defeito; só usa amostragem quando o utilizador pedir explicitamente.\n"
+            "   REGRA: Se começares com analyze_uploaded_table e faltar detalhe para cumprir o pedido, chama run_code na mesma resposta (sem perguntar ao utilizador).\n"
             "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
         )
         next_rule += 1
@@ -1962,6 +1965,9 @@ def get_agent_system_prompt():
             [
                 "- \"Faz bar chart com volume médio por ano do CSV\" -> analyze_uploaded_table DEPOIS generate_chart",
                 "- \"Qual o min/max do Close no ficheiro?\" -> analyze_uploaded_table",
+                "- \"Analisa o ficheiro todo sem amostra\" -> run_code",
+                "- \"Lista completa de valores distintos da coluna X\" -> run_code",
+                "- \"Mostra top 10 candles com maior amplitude\" -> run_code",
             ]
         )
     if figma_enabled:
