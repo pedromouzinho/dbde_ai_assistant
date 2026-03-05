@@ -16,7 +16,6 @@ venv/
 
 # Build / dependencies
 node_modules/
-static/dist/
 .tmp_wheels/
 
 # Claude Code
