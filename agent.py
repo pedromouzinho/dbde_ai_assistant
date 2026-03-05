@@ -955,42 +955,11 @@ def _extract_forced_uploaded_table_calls(
 ) -> List[LLMToolCall]:
     if not _has_tabular_uploads(conv_id):
         return []
-    used = set(already_used or [])
-    if "analyze_uploaded_table" in used or "run_code" in used:
-        return []
-
-    norm = _normalize_request_text(question)
-    file_hint = bool(re.search(r"\b(ficheiro|arquivo|csv|excel|xlsx|tabela|dados|coluna|linhas|registos?)\b", norm))
-    analysis_hint = bool(
-        re.search(
-            r"\b(analisa|analisar|resumo|estatistic|minimo|maximo|media|desvio|grafico|chart|lista completa|valores distintos|sempre|frequencia|correlacao)\b",
-            norm,
-        )
-    )
-    if not (file_hint or analysis_hint):
-        return []
-
-    run_code_hint = bool(
-        re.search(
-            r"\b(analisa tudo|analisa o ficheiro todo|ficheiro completo|sem amostra|lista completa|todos os valores|valores distintos|"
-            r"correlacao|scatter|top\s*\d+|amplitude|maior queda|ranking completo|todas as linhas|registos completos|exaustiv)\b",
-            norm,
-        )
-    )
-    if run_code_hint:
-        # Para pedidos exaustivos/row-level, evita forçar a tool agregada.
-        # Deixa o LLM escolher run_code (preferencial via prompt).
-        return []
-
-    args: Dict[str, object] = {"query": question, "full_points": True, "top": 5000}
-
-    return [
-        LLMToolCall(
-            id=f"forced_uat_{uuid.uuid4().hex[:8]}",
-            name="analyze_uploaded_table",
-            arguments=args,
-        )
-    ]
+    # Modo agressivo: não forçar analyze_uploaded_table.
+    # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
+    # O fallback para analyze_uploaded_table é tratado no handler de run_code
+    # quando houver erro/timeout.
+    return []
 
 
 async def _persist_conversation(conv_id: str, partition_key: str) -> None:
@@ -1112,6 +1081,14 @@ async def _execute_tool_calls(
         error_msg = ""
         args = tc.arguments
         user_text = _latest_user_text()
+        norm_user = _normalize_request_text(user_text)
+        file_analysis_intent = bool(
+            re.search(
+                r"\b(ficheiro|arquivo|csv|excel|xlsx|tabela|dados|coluna|linhas|registos?|analisa|analisar|resumo|"
+                r"estatistic|minimo|maximo|media|desvio|grafico|chart|correlacao|scatter|lista completa|valores distintos)\b",
+                norm_user,
+            )
+        )
         # --- Routing guardrail: CSV/Excel uploaded -> never query DevOps ---
         files = _get_uploaded_files(conv_id)
         if files and tc.name in ("query_workitems", "search_workitems", "compute_kpi", "query_hierarchy"):
@@ -1140,12 +1117,43 @@ async def _execute_tool_calls(
                 return tc, {
                     "error": (
                         "Existem ficheiros carregados nesta conversa. "
-                        "Para análises rápidas/agregadas, usa analyze_uploaded_table. "
-                        "Para análise completa/linha-a-linha, lista completa, correlação ou lógica custom, usa run_code. "
+                        "Para análise de ficheiro carregado, usa run_code como primeira tentativa. "
+                        "Se run_code falhar, usa analyze_uploaded_table como fallback. "
                         "Para gerar gráficos, usa generate_chart com os dados da análise. "
                         "query_workitems/search_workitems sao para Azure DevOps, nao para ficheiros carregados."
                     )
                 }
+        # Modo agressivo para tabular uploads: run_code primeiro, analyze_uploaded_table só fallback.
+        if (
+            files
+            and tc.name == "analyze_uploaded_table"
+            and file_analysis_intent
+            and not args.get("_fallback_from_run_code")
+        ):
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "[ToolCallEvent] %s",
+                json.dumps(
+                    {
+                        "event": "tool_call_execution",
+                        "conv_id": conv_id,
+                        "user_sub": user_sub or "anon",
+                        "tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "status": "blocked",
+                        "duration_ms": elapsed_ms,
+                        "reason": "run_code_first_policy",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            tool_metrics.record(tc.name, elapsed_ms, "blocked")
+            return tc, {
+                "error": (
+                    "Política ativa: para análise de CSV/Excel, usa run_code como primeira tentativa. "
+                    "analyze_uploaded_table é fallback automático quando run_code falhar."
+                )
+            }
         # Auto-inject file context for US generation
         if tc.name == "generate_user_stories" and files and not args.get("context"):
             context_blocks = []
@@ -1249,6 +1257,26 @@ async def _execute_tool_calls(
                 return tc, result
         try:
             result = await execute_tool(tc.name, args)
+            if tc.name == "run_code":
+                failed = bool(result.get("error")) or not bool(result.get("success", False))
+                if failed:
+                    logger.info(
+                        "[Agent] run_code falhou; a executar fallback analyze_uploaded_table (conv=%s)",
+                        conv_id,
+                    )
+                    fallback_args: Dict[str, object] = {
+                        "query": user_text,
+                        "conv_id": conv_id,
+                        "user_sub": user_sub,
+                        "full_points": True,
+                        "top": 5000,
+                        "_fallback_from_run_code": True,
+                    }
+                    fallback = await execute_tool("analyze_uploaded_table", fallback_args)
+                    if isinstance(fallback, dict):
+                        fallback["_fallback_from"] = "run_code"
+                        fallback["_run_code_error"] = str(result.get("error") or result.get("stderr") or "")[:500]
+                        result = fallback
             if isinstance(result, dict) and "error" in result:
                 status = "tool_error"
             return tc, result

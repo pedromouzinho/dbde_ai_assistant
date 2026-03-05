@@ -1834,7 +1834,7 @@ def get_agent_system_prompt():
         )
     if uploaded_table_enabled:
         gate_priority_hints.append(
-            "- Se o utilizador pedir análise de CSV/Excel carregado, escolhe a tool certa: analyze_uploaded_table para agregações simples e run_code para análise completa/linha-a-linha/lista completa/lógica custom."
+            "- Se o utilizador pedir análise de CSV/Excel carregado, usa run_code como primeira tentativa. Usa analyze_uploaded_table apenas se run_code falhar ou timeout."
         )
     if figma_enabled:
         gate_priority_hints.append(
@@ -1899,9 +1899,10 @@ def get_agent_system_prompt():
         "   REGRA: Evita listar dezenas de linhas completas na resposta textual.",
         "13. Para CÁLCULOS AVANÇADOS, SCRIPT PYTHON, transformação customizada de dados, ou geração programática de ficheiros/gráficos -> usa run_code.\n"
         "   Exemplos: \"calcula correlação de colunas\", \"gera ficheiro Excel com duas folhas\", \"faz análise estatística custom\".\n"
+        "   REGRA: Em CSV/Excel, run_code é a PRIMEIRA TENTATIVA por defeito (mesmo para pedidos simples).\n"
         "   REGRA: Se o pedido exigir análise EXAUSTIVA (ficheiro todo, sem amostra, lista completa, todos os valores, top N por linha, correlação/scatter, validação exata), usa run_code.\n"
         "   REGRA: Não pedir confirmação extra para pedidos read-only de análise; executa diretamente.\n"
-        "   REGRA: Prefere analyze_uploaded_table apenas para agregações simples quando cobre totalmente o pedido.",
+        "   REGRA: Usa analyze_uploaded_table apenas como fallback quando run_code falhar/timeout.",
     ]
     next_rule = 14
     if uploaded_doc_enabled:
@@ -1913,13 +1914,13 @@ def get_agent_system_prompt():
         next_rule += 1
     if uploaded_table_enabled:
         routing_rules.append(
-            f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> decide entre analyze_uploaded_table e run_code\n"
-            "   Exemplos simples: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\" -> analyze_uploaded_table\n"
+            f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> run_code primeiro, analyze_uploaded_table como fallback\n"
+            "   Exemplos simples: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\" -> run_code\n"
             "   Exemplos exaustivos/custom: \"analisa tudo\", \"lista completa\", \"correlação\", \"scatter\", \"top 10 por amplitude\" -> run_code\n"
             "   REGRA: NUNCA usar query_workitems para dados de ficheiro carregado.\n"
             "   REGRA: Em pedidos read-only (analisar, resumir, listar, validar), executa diretamente sem pedir confirmação adicional.\n"
             "   REGRA: Assume análise completa por defeito; só usa amostragem quando o utilizador pedir explicitamente.\n"
-            "   REGRA: Se começares com analyze_uploaded_table e faltar detalhe para cumprir o pedido, chama run_code na mesma resposta (sem perguntar ao utilizador).\n"
+            "   REGRA: Se run_code falhar/timeout, usa analyze_uploaded_table automaticamente como fallback.\n"
             "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
         )
         next_rule += 1
@@ -1963,8 +1964,8 @@ def get_agent_system_prompt():
     if uploaded_table_enabled:
         usage_examples.extend(
             [
-                "- \"Faz bar chart com volume médio por ano do CSV\" -> analyze_uploaded_table DEPOIS generate_chart",
-                "- \"Qual o min/max do Close no ficheiro?\" -> analyze_uploaded_table",
+                "- \"Faz bar chart com volume médio por ano do CSV\" -> run_code (fallback: analyze_uploaded_table) DEPOIS generate_chart",
+                "- \"Qual o min/max do Close no ficheiro?\" -> run_code (fallback: analyze_uploaded_table)",
                 "- \"Analisa o ficheiro todo sem amostra\" -> run_code",
                 "- \"Lista completa de valores distintos da coluna X\" -> run_code",
                 "- \"Mostra top 10 candles com maior amplitude\" -> run_code",
