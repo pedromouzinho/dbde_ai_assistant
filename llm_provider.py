@@ -914,8 +914,15 @@ async def llm_stream_with_fallback(
     response_format: Optional[dict] = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Streaming com fallback automático. Yield StreamEvents."""
+    pii_context: Optional[PIIMaskingContext] = None
+    actual_messages = messages
+
+    if PII_ENABLED:
+        pii_context = PIIMaskingContext()
+        actual_messages = await mask_messages(messages, pii_context)
+
     if PROMPT_SHIELD_ENABLED:
-        shield_result = await check_messages(messages)
+        shield_result = await check_messages(actual_messages)
         if shield_result.is_blocked:
             blocked_text = (
                 "Pedido bloqueado por seguranca: "
@@ -939,15 +946,43 @@ async def llm_stream_with_fallback(
             )
             return
 
+    suppress_token_stream = bool(pii_context and pii_context.mappings)
+    masked_chunks: List[str] = []
+
+    def _finalize_done_event(done_data: Any) -> tuple[Optional[str], Any]:
+        if not pii_context:
+            return None, done_data
+        base_data = done_data if isinstance(done_data, dict) else {}
+        if not masked_chunks:
+            content_in_done = base_data.get("content", "")
+            if isinstance(content_in_done, str) and content_in_done:
+                masked_chunks.append(content_in_done)
+        masked_text = "".join(masked_chunks).strip()
+        unmasked_text = pii_context.unmask(masked_text) if masked_text else ""
+        safe_data = pii_context.unmask_any(base_data) if base_data else {}
+        if isinstance(safe_data, dict) and unmasked_text:
+            safe_data["content"] = unmasked_text
+        return (unmasked_text or None), (safe_data if safe_data else done_data)
+
     primary = get_provider(tier)
     try:
         async for event in primary.chat_stream(
-            messages,
+            actual_messages,
             tools,
             temperature,
             max_tokens,
             response_format=response_format,
         ):
+            if suppress_token_stream and event.type == "token":
+                if event.text:
+                    masked_chunks.append(event.text)
+                continue
+            if suppress_token_stream and event.type == "done":
+                final_text, final_data = _finalize_done_event(event.data)
+                if final_text:
+                    yield StreamEvent(type="token", text=final_text)
+                yield StreamEvent(type="done", data=final_data)
+                return
             yield event
         return
     except Exception as e:
@@ -955,13 +990,25 @@ async def llm_stream_with_fallback(
 
     try:
         fallback = get_fallback_provider()
+        if suppress_token_stream:
+            masked_chunks.clear()
         async for event in fallback.chat_stream(
-            messages,
+            actual_messages,
             tools,
             temperature,
             max_tokens,
             response_format=response_format,
         ):
+            if suppress_token_stream and event.type == "token":
+                if event.text:
+                    masked_chunks.append(event.text)
+                continue
+            if suppress_token_stream and event.type == "done":
+                final_text, final_data = _finalize_done_event(event.data)
+                if final_text:
+                    yield StreamEvent(type="token", text=final_text)
+                yield StreamEvent(type="done", data=final_data)
+                return
             yield event
         return
     except Exception as e2:
