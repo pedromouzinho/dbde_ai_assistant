@@ -235,6 +235,8 @@ class LLMProvider:
         tools: Optional[List[dict]] = None,
         temperature: float = AGENT_TEMPERATURE,
         max_tokens: int = AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> LLMResponse:
         raise NotImplementedError
     
@@ -244,9 +246,18 @@ class LLMProvider:
         tools: Optional[List[dict]] = None,
         temperature: float = AGENT_TEMPERATURE,
         max_tokens: int = AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Streaming — yield StreamEvents. Default: fallback to non-streaming."""
-        response = await self.chat(messages, tools, temperature, max_tokens)
+        response = await self.chat(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            response_format=response_format,
+            **kwargs,
+        )
         if response.content:
             yield StreamEvent(type="token", text=response.content)
         yield StreamEvent(type="done", data=response.model_dump())
@@ -285,7 +296,13 @@ class AzureOpenAIProvider(LLMProvider):
             await self._http_client.aclose()
 
     async def chat(
-        self, messages, tools=None, temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+        self,
+        messages,
+        tools=None,
+        temperature=AGENT_TEMPERATURE,
+        max_tokens=AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> LLMResponse:
         url = (
             f"{self.endpoint}/openai/deployments/{self.deployment}"
@@ -301,6 +318,9 @@ class AzureOpenAIProvider(LLMProvider):
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        elif response_format:
+            # Structured outputs: compatível quando não há tool calling na mesma chamada.
+            body["response_format"] = response_format
         
         max_retries = 5
         client = self._get_client()
@@ -335,7 +355,13 @@ class AzureOpenAIProvider(LLMProvider):
         raise RuntimeError("Azure OpenAI: max retries exceeded")
     
     async def chat_stream(
-        self, messages, tools=None, temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+        self,
+        messages,
+        tools=None,
+        temperature=AGENT_TEMPERATURE,
+        max_tokens=AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> AsyncGenerator[StreamEvent, None]:
         url = (
             f"{self.endpoint}/openai/deployments/{self.deployment}"
@@ -354,7 +380,13 @@ class AzureOpenAIProvider(LLMProvider):
         # Streaming com tools é complexo no OpenAI — se há tools, fallback para non-stream
         # (tool calls vêm em chunks parciais que precisam de ser reassemblados)
         if tools:
-            response = await self.chat(messages, tools, temperature, max_tokens)
+            response = await self.chat(
+                messages,
+                tools,
+                temperature,
+                max_tokens,
+                response_format=response_format,
+            )
             if response.tool_calls:
                 yield StreamEvent(type="done", data=response.model_dump())
                 return
@@ -363,6 +395,9 @@ class AzureOpenAIProvider(LLMProvider):
             yield StreamEvent(type="done", data=response.model_dump())
             return
         
+        if response_format:
+            body["response_format"] = response_format
+
         # Streaming puro (sem tools) — stream token a token
         client = self._get_client()
         async with client.stream(
@@ -440,7 +475,13 @@ class AnthropicProvider(LLMProvider):
         }
     
     async def chat(
-        self, messages, tools=None, temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+        self,
+        messages,
+        tools=None,
+        temperature=AGENT_TEMPERATURE,
+        max_tokens=AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> LLMResponse:
         # Traduzir mensagens e tools para formato Anthropic
         system_prompt, anthropic_msgs = _openai_messages_to_anthropic(messages)
@@ -489,7 +530,13 @@ class AnthropicProvider(LLMProvider):
         raise RuntimeError("Anthropic: max retries exceeded")
     
     async def chat_stream(
-        self, messages, tools=None, temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+        self,
+        messages,
+        tools=None,
+        temperature=AGENT_TEMPERATURE,
+        max_tokens=AGENT_MAX_TOKENS,
+        response_format: Optional[dict] = None,
+        **kwargs,
     ) -> AsyncGenerator[StreamEvent, None]:
         system_prompt, anthropic_msgs = _openai_messages_to_anthropic(messages)
         
@@ -741,12 +788,18 @@ async def close_all_providers() -> None:
 # UTILITY: Chat simples sem tools (para análise interna, classificação, etc.)
 # =============================================================================
 
-async def llm_simple(prompt: str, tier: str = "fast", max_tokens: int = 2000) -> str:
+async def llm_simple(
+    prompt: str,
+    tier: str = "fast",
+    max_tokens: int = 2000,
+    response_format: Optional[dict] = None,
+) -> str:
     """Chamada simples ao LLM sem tools. Usa tier 'fast' por default."""
     provider = get_provider(tier)
     response = await provider.chat(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
+        response_format=response_format,
     )
     return response.content or ""
 
@@ -757,6 +810,7 @@ async def llm_with_fallback(
     tier: str = None,
     temperature: float = AGENT_TEMPERATURE,
     max_tokens: int = AGENT_MAX_TOKENS,
+    response_format: Optional[dict] = None,
 ) -> LLMResponse:
     """Chat com fallback automático e cadeia explícita de tentativas."""
     fallback_chain: List[Dict[str, Any]] = []
@@ -781,7 +835,13 @@ async def llm_with_fallback(
         return response
 
     try:
-        result = await primary.chat(actual_messages, tools, temperature, max_tokens)
+        result = await primary.chat(
+            actual_messages,
+            tools,
+            temperature,
+            max_tokens,
+            response_format=response_format,
+        )
         fallback_chain.append({"provider": primary.name, "status": "ok"})
         result = _unmask_response_if_needed(result)
         result.fallback_chain = fallback_chain
@@ -792,7 +852,13 @@ async def llm_with_fallback(
 
     try:
         fallback = get_fallback_provider()
-        result = await fallback.chat(actual_messages, tools, temperature, max_tokens)
+        result = await fallback.chat(
+            actual_messages,
+            tools,
+            temperature,
+            max_tokens,
+            response_format=response_format,
+        )
         fallback_chain.append({"provider": fallback.name, "status": "ok"})
         result = _unmask_response_if_needed(result)
         result.fallback_chain = fallback_chain
@@ -822,11 +888,18 @@ async def llm_stream_with_fallback(
     tier: str = None,
     temperature: float = AGENT_TEMPERATURE,
     max_tokens: int = AGENT_MAX_TOKENS,
+    response_format: Optional[dict] = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Streaming com fallback automático. Yield StreamEvents."""
     primary = get_provider(tier)
     try:
-        async for event in primary.chat_stream(messages, tools, temperature, max_tokens):
+        async for event in primary.chat_stream(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            response_format=response_format,
+        ):
             yield event
         return
     except Exception as e:
@@ -834,7 +907,13 @@ async def llm_stream_with_fallback(
 
     try:
         fallback = get_fallback_provider()
-        async for event in fallback.chat_stream(messages, tools, temperature, max_tokens):
+        async for event in fallback.chat_stream(
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+            response_format=response_format,
+        ):
             yield event
         return
     except Exception as e2:

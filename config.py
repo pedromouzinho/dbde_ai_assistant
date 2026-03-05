@@ -38,7 +38,7 @@ AZURE_OPENAI_ENDPOINT = _get_env(
 AZURE_OPENAI_KEY = _get_env("AZURE_OPENAI_KEY", "")
 CHAT_DEPLOYMENT = _get_env("CHAT_DEPLOYMENT", "dbde_access_chatbot")
 EMBEDDING_DEPLOYMENT = _get_env("EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
-API_VERSION_CHAT = _get_env("API_VERSION_CHAT", "2024-02-15-preview")
+API_VERSION_CHAT = _get_env("API_VERSION_CHAT", "2024-10-21")
 API_VERSION_OPENAI = _get_env("API_VERSION_OPENAI", "2023-05-15")
 
 # =============================================================================

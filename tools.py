@@ -52,6 +52,7 @@ from tools_knowledge import tool_search_workitems, tool_search_website, tool_sea
 from tools_upload import tool_search_uploaded_document
 from tools_export import tool_generate_chart, tool_generate_file
 from tools_learning import tool_get_writer_profile, tool_save_writer_profile
+from structured_schemas import SCREENSHOT_USER_STORIES_SCHEMA
 
 _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
@@ -1180,24 +1181,31 @@ async def tool_screenshot_to_us(
             messages=[{"role": "user", "content": content_blocks}],
             tier="vision",
             max_tokens=4096,
+            response_format=SCREENSHOT_USER_STORIES_SCHEMA,
         )
         answer = str(getattr(llm_resp, "content", "") or "")
         if not answer and isinstance(llm_resp, dict):
             answer = str(llm_resp.get("content", "") or "")
 
-        match = re.search(r"\{[\s\S]*\"stories\"[\s\S]*\}", answer)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                stories = parsed.get("stories")
-                if isinstance(stories, list):
-                    return {
-                        "stories": stories,
-                        "raw_analysis": answer[:2000],
-                        "source": "vision_llm",
-                    }
-            except Exception:
-                pass
+        parsed = None
+        try:
+            parsed = json.loads(answer)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\"stories\"[\s\S]*\}", answer)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = None
+
+        if isinstance(parsed, dict):
+            stories = parsed.get("stories")
+            if isinstance(stories, list):
+                return {
+                    "stories": stories,
+                    "raw_analysis": answer[:2000],
+                    "source": "vision_llm",
+                }
 
         return {
             "stories": [],
