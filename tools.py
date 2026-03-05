@@ -4,7 +4,7 @@
 
 import json, base64, asyncio, logging, uuid, re, math, unicodedata, io, csv, statistics
 from datetime import datetime, timezone
-from collections import deque
+from collections import deque, Counter
 from urllib.parse import quote
 from typing import Optional
 import httpx
@@ -385,6 +385,134 @@ def _resolve_requested_metrics(metrics, fallback_agg: str) -> list[str]:
     return [fallback]
 
 
+def _extract_metric_requests_from_query(query: str) -> list[str]:
+    q = _normalize_lookup_key(query or "")
+    ordered = []
+    metric_patterns = [
+        ("min", r"\b(min|minimo|mínimo|minimum|menor)\b"),
+        ("max", r"\b(max|maximo|máximo|maximum|maior)\b"),
+        ("mean", r"\b(media|média|mean|average|medio|médio)\b"),
+        ("std", r"\b(std|desvio|desvio padrao|desvio padrão|stdev|stddev)\b"),
+        ("median", r"\b(median|mediana)\b"),
+        ("sum", r"\b(sum|soma|total)\b"),
+        ("count", r"\b(count|contagem|quantidade|numero|número)\b"),
+        ("p25", r"\b(p25|q1|percentil 25)\b"),
+        ("p75", r"\b(p75|q3|percentil 75)\b"),
+    ]
+    for metric, pattern in metric_patterns:
+        if re.search(pattern, q) and metric not in ordered:
+            ordered.append(metric)
+    return ordered
+
+
+def _infer_text_column(query: str, columns, date_column: str = "", records: Optional[list[dict]] = None) -> str:
+    q = _normalize_lookup_key(query or "")
+    token_candidates = [
+        _normalize_lookup_key(t)
+        for t in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{3,}\b", str(query or ""))
+        if any(ch.isdigit() for ch in t)
+    ]
+    if token_candidates and records:
+        best_by_value = ("", 0)
+        sample_rows = records[:3000]
+        for c in columns or []:
+            if c == date_column:
+                continue
+            hits = 0
+            for row in sample_rows:
+                cell = _normalize_lookup_key((row or {}).get(c, ""))
+                if not cell:
+                    continue
+                if any(tok == cell or tok in cell for tok in token_candidates):
+                    hits += 1
+            if hits > best_by_value[1]:
+                best_by_value = (c, hits)
+        if best_by_value[1] > 0:
+            return best_by_value[0]
+
+    best = ("", -1)
+    for c in columns or []:
+        if c == date_column:
+            continue
+        n = _normalize_lookup_key(c)
+        score = 0
+        if n and n in q:
+            score += 10
+        tokens = [t for t in re.split(r"[^a-z0-9]+", n) if len(t) >= 3]
+        score += sum(1 for t in tokens if t in q)
+        if score > best[1]:
+            best = (c, score)
+    if best[1] > 0:
+        return best[0]
+    for c in columns or []:
+        if c != date_column:
+            return c
+    return ""
+
+
+def _column_numeric_ratio(records: list[dict], column: str, sample_limit: int = 5000) -> float:
+    if not column:
+        return 0.0
+    inspected = 0
+    numeric = 0
+    for row in records[: max(1, sample_limit)]:
+        val = str((row or {}).get(column, "") or "").strip()
+        if not val:
+            continue
+        inspected += 1
+        if _parse_numeric_value(val) is not None:
+            numeric += 1
+    if inspected == 0:
+        return 0.0
+    return numeric / inspected
+
+
+def _build_column_profiles(records: list[dict], columns: list[str], max_columns: int = 80) -> list[dict]:
+    profiles = []
+    limited_columns = list(columns or [])[: max(1, max_columns)]
+    for c in limited_columns:
+        raw_vals = [str((row or {}).get(c, "") or "").strip() for row in records]
+        non_empty_vals = [v for v in raw_vals if v]
+        empty_count = len(raw_vals) - len(non_empty_vals)
+        numeric_vals = []
+        dt_hits = 0
+        for v in non_empty_vals[:20000]:
+            num = _parse_numeric_value(v)
+            if num is not None:
+                numeric_vals.append(num)
+            if _parse_datetime_value(v) is not None:
+                dt_hits += 1
+        ratio = len(numeric_vals) / max(1, min(len(non_empty_vals), 20000))
+        type_hint = "numeric" if ratio >= 0.8 and numeric_vals else "text"
+        if type_hint == "text" and dt_hits >= max(5, int(0.6 * max(1, min(len(non_empty_vals), 20000)))):
+            type_hint = "datetime"
+        profile = {
+            "name": c,
+            "non_empty": len(non_empty_vals),
+            "empty": empty_count,
+            "type": type_hint,
+            "sample": non_empty_vals[:5],
+        }
+        if type_hint == "numeric" and numeric_vals:
+            profile.update(
+                {
+                    "min": round(min(numeric_vals), 6),
+                    "max": round(max(numeric_vals), 6),
+                    "mean": round(sum(numeric_vals) / len(numeric_vals), 6),
+                    "std": round(statistics.stdev(numeric_vals), 6) if len(numeric_vals) > 1 else 0.0,
+                }
+            )
+        else:
+            value_counter = Counter(non_empty_vals[:50000])
+            profile["distinct_count"] = len(value_counter)
+            profile["top_values"] = [
+                {"value": value, "count": count}
+                for value, count in value_counter.most_common(5)
+            ]
+        profiles.append(profile)
+    return profiles
+
+
 def _compute_metrics(vals: list[float], requested_metrics: list[str], count_override: Optional[int] = None) -> dict:
     if not vals and not (requested_metrics == ["count"] and count_override is not None):
         return {}
@@ -648,7 +776,24 @@ async def tool_analyze_uploaded_table(
     group_mode = _infer_group_by_mode(q, group_by)
     agg_mode = _infer_agg_mode(q, agg)
     requested_metrics = _resolve_requested_metrics(metrics, agg_mode)
+    query_metrics = _extract_metric_requests_from_query(q)
+    if not metrics and query_metrics:
+        requested_metrics = query_metrics
+        if agg_mode not in requested_metrics:
+            agg_mode = requested_metrics[0]
     q_norm = _normalize_lookup_key(q)
+    full_list_intent = bool(
+        re.search(r"\b(lista completa|completo|completa|todos os valores|sem amostra|integral|analisa tudo)\b", q_norm)
+    )
+    schema_profile_intent = bool(
+        re.search(r"\b(o que contem|o que contém|estrutura|schema|colunas|campos|significado|dicionario|dicionário)\b", q_norm)
+    )
+    categorical_intent = bool(
+        re.search(
+            r"\b(distint|unic|únic|valores|moda|mais comum|frequencia|frequência|sempre|cont[eé]m|apenas)\b",
+            q_norm,
+        )
+    )
     warnings_list = []
     rows_total = len(records)
     valid_data_points = 0
@@ -658,6 +803,31 @@ async def tool_analyze_uploaded_table(
         matched_date_col = _infer_date_column(q, columns, records)
     if not matched_value_col and requested_metrics != ["count"]:
         matched_value_col = _infer_value_column(q, columns, records, date_column=matched_date_col)
+    if not matched_value_col and (categorical_intent or requested_metrics == ["count"]):
+        matched_value_col = _infer_text_column(q, columns, date_column=matched_date_col, records=records)
+
+    if group_mode == "none" and (schema_profile_intent or not matched_value_col):
+        column_profiles = _build_column_profiles(records, columns)
+        return {
+            "source": "uploaded_table_raw_blob",
+            "conversation_id": safe_conv,
+            "filename": selected_filename,
+            "row_count": len(records),
+            "columns": columns,
+            "column_profiles": column_profiles[:40],
+            "total_columns_profiled": len(column_profiles),
+            "summary": (
+                f"Perfil completo de '{selected_filename}' ({len(records)} linhas, {len(columns)} colunas). "
+                "Usa estes perfis para responder sem assumir amostras."
+            ),
+            "analysis_quality": {
+                "coverage": 1.0,
+                "sampled": False,
+                "rows_processed": len(records),
+                "rows_total": rows_total,
+                "warnings": warnings_list,
+            },
+        }
 
     if group_mode in ("year", "month", "quarter", "week", "day") and not matched_date_col:
         return {
@@ -665,12 +835,14 @@ async def tool_analyze_uploaded_table(
             "columns": columns,
             "filename": selected_filename,
         }
-    if requested_metrics != ["count"] and not matched_value_col:
+    if not matched_value_col:
         return {
-            "error": "Não consegui inferir a coluna numérica para agregação. Indica value_column explicitamente.",
+            "error": "Não consegui inferir a coluna para análise. Indica value_column explicitamente.",
             "columns": columns,
             "filename": selected_filename,
         }
+
+    value_numeric_ratio = _column_numeric_ratio(records, matched_value_col)
 
     chart_top = max(1, min(int(top or 500), 5000))
     top_n_limit = max(0, min(int(top_n or 0), 5000))
@@ -814,6 +986,107 @@ async def tool_analyze_uploaded_table(
                 {"group": dt.isoformat(), "value": round(val, 6), "count": 1}
                 for dt, val in sampled
             ]
+        elif matched_value_col and (categorical_intent or value_numeric_ratio < 0.35):
+            # Modo categórico/textual: contagem exata de valores na coluna.
+            vals = [str((row or {}).get(matched_value_col, "") or "").strip() for row in records]
+            non_empty_vals = [v for v in vals if v]
+            empty_count = len(vals) - len(non_empty_vals)
+            valid_data_points = len(non_empty_vals)
+            if not non_empty_vals:
+                return {"error": "Sem dados válidos na coluna indicada.", "filename": selected_filename}
+
+            counter = Counter(non_empty_vals)
+            distinct_count = len(counter)
+            sorted_values = counter.most_common()
+            group_payload = sorted_values
+            if not full_points:
+                limit = top_n_limit if top_n_limit > 0 else max(10, min(chart_top, 200))
+                group_payload = sorted_values[:limit]
+                if len(sorted_values) > len(group_payload):
+                    warnings_list.append(
+                        f"Mostrados top {len(group_payload)} valores de {len(sorted_values)} distintos."
+                    )
+            elif len(group_payload) > 10000:
+                group_payload = group_payload[:10000]
+                was_sampled = True
+                warnings_list.append("Lista de valores distintos limitada a 10.000 para resposta.")
+
+            groups = [
+                {
+                    "group": value,
+                    "value": int(count),
+                    "count": int(count),
+                    "ratio": round(count / max(1, len(non_empty_vals)), 6),
+                }
+                for value, count in group_payload
+            ]
+
+            all_values = None
+            all_values_truncated = False
+            if full_list_intent:
+                all_limit = 2000
+                sliced = sorted_values[:all_limit]
+                all_values = [
+                    {
+                        "value": value,
+                        "count": int(count),
+                        "ratio": round(count / max(1, len(non_empty_vals)), 6),
+                    }
+                    for value, count in sliced
+                ]
+                all_values_truncated = len(sorted_values) > all_limit
+                if all_values_truncated:
+                    warnings_list.append(
+                        f"Lista completa truncada a {all_limit} valores distintos; pede export para total."
+                    )
+
+            chart_groups = groups
+            if len(chart_groups) > CHART_MAX_POINTS:
+                step = max(1, len(chart_groups) // CHART_MAX_POINTS)
+                chart_groups = [chart_groups[i] for i in range(0, len(chart_groups), step)][:CHART_MAX_POINTS]
+                was_sampled = True
+                warnings_list.append(f"chart_ready limitado a {len(chart_groups)} de {len(groups)} categorias.")
+
+            return {
+                "source": "uploaded_table_raw_blob",
+                "conversation_id": safe_conv,
+                "filename": selected_filename,
+                "row_count": len(records),
+                "columns": columns,
+                "group_by": "none",
+                "agg": "count",
+                "requested_metrics": ["count"],
+                "date_column": matched_date_col,
+                "value_column": matched_value_col,
+                "categorical": True,
+                "distinct_count": distinct_count,
+                "non_empty_count": len(non_empty_vals),
+                "empty_count": empty_count,
+                "is_constant": distinct_count == 1,
+                "constant_value": sorted_values[0][0] if distinct_count == 1 else None,
+                "groups": groups,
+                "all_values": all_values,
+                "all_values_truncated": all_values_truncated,
+                "summary": (
+                    f"Análise categórica completa de '{selected_filename}' ({len(records)} linhas) "
+                    f"na coluna '{matched_value_col}': {distinct_count} valor(es) distinto(s)."
+                ),
+                "analysis_quality": {
+                    "coverage": round(valid_data_points / max(1, len(records)), 4),
+                    "sampled": was_sampled,
+                    "rows_processed": len(records),
+                    "rows_total": rows_total,
+                    "warnings": warnings_list,
+                },
+                "chart_ready": {
+                    "chart_type": "bar",
+                    "title": f"Frequência de {matched_value_col}",
+                    "x_values": [g.get("group", "") for g in chart_groups],
+                    "y_values": [int(g.get("value", 0)) for g in chart_groups],
+                    "x_label": matched_value_col,
+                    "y_label": f"count({matched_value_col})",
+                },
+            }
         elif matched_value_col:
             nums = []
             for row in records:
@@ -1626,7 +1899,8 @@ def get_agent_system_prompt():
         "   REGRA: Evita listar dezenas de linhas completas na resposta textual.",
         "13. Para CÁLCULOS AVANÇADOS, SCRIPT PYTHON, transformação customizada de dados, ou geração programática de ficheiros/gráficos -> usa run_code.\n"
         "   Exemplos: \"calcula correlação de colunas\", \"gera ficheiro Excel com duas folhas\", \"faz análise estatística custom\".\n"
-        "   REGRA: Prefere tools determinísticas (analyze_uploaded_table, compute_kpi, generate_chart, generate_file) quando suficientes; usa run_code quando for necessária lógica Python custom.",
+        "   REGRA: Prefere tools determinísticas (analyze_uploaded_table, compute_kpi, generate_chart, generate_file) quando suficientes; usa run_code quando for necessária lógica Python custom.\n"
+        "   REGRA: Se o utilizador pedir validação exata de coluna textual, lista completa de valores distintos ou lógica não coberta pelas tools, usa run_code.",
     ]
     next_rule = 14
     if uploaded_doc_enabled:
@@ -1641,6 +1915,8 @@ def get_agent_system_prompt():
             f"{next_rule}. Para ANALISE DE CSV/EXCEL CARREGADO -> usa analyze_uploaded_table (OBRIGATORIO)\n"
             "   Exemplos: \"volume medio por ano\", \"min/max do Close\", \"agrega por mês\"\n"
             "   REGRA: NUNCA usar query_workitems para dados de ficheiro carregado.\n"
+            "   REGRA: Em pedidos read-only (analisar, resumir, listar, validar), executa diretamente sem pedir confirmação adicional.\n"
+            "   REGRA: Assume análise completa por defeito; só usa amostragem quando o utilizador pedir explicitamente.\n"
             "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
         )
         next_rule += 1

@@ -940,6 +940,49 @@ async def _run_forced_dual_hierarchy(
     return await _execute_tool_calls(forced_calls, conv_id, user_sub=user_sub)
 
 
+def _has_tabular_uploads(conv_id: str) -> bool:
+    for file_data in _get_uploaded_files(conv_id):
+        name = str(file_data.get("filename", "") or "").lower()
+        if name.endswith((".csv", ".xlsx", ".xls")):
+            return True
+    return False
+
+
+def _extract_forced_uploaded_table_calls(
+    question: str,
+    conv_id: str,
+    already_used: Optional[List[str]] = None,
+) -> List[LLMToolCall]:
+    if not _has_tabular_uploads(conv_id):
+        return []
+    if "analyze_uploaded_table" in set(already_used or []):
+        return []
+
+    norm = _normalize_request_text(question)
+    file_hint = bool(re.search(r"\b(ficheiro|arquivo|csv|excel|xlsx|tabela|dados|coluna|linhas|registos?)\b", norm))
+    analysis_hint = bool(
+        re.search(
+            r"\b(analisa|analisar|resumo|estatistic|minimo|maximo|media|desvio|grafico|chart|lista completa|valores distintos|sempre|frequencia|correlacao)\b",
+            norm,
+        )
+    )
+    if not (file_hint or analysis_hint):
+        return []
+
+    args: Dict[str, object] = {"query": question}
+    if re.search(r"\b(lista completa|completo|completa|todos os valores|integral|sem amostra|analisa tudo)\b", norm):
+        args["full_points"] = True
+        args["top"] = 5000
+
+    return [
+        LLMToolCall(
+            id=f"forced_uat_{uuid.uuid4().hex[:8]}",
+            name="analyze_uploaded_table",
+            arguments=args,
+        )
+    ]
+
+
 async def _persist_conversation(conv_id: str, partition_key: str) -> None:
     """Persiste conversa na tabela ChatHistory (fire-and-forget)."""
     try:
@@ -1338,17 +1381,37 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                 total_usage = response.usage
 
                 iteration = 0
-                while response.tool_calls and iteration < AGENT_MAX_ITERATIONS:
+                while iteration < AGENT_MAX_ITERATIONS:
+                    current_calls = list(response.tool_calls or [])
+                    forced_uploaded_table = False
+                    if not current_calls:
+                        forced_calls = _extract_forced_uploaded_table_calls(
+                            request.question,
+                            conv_id,
+                            already_used=tools_used,
+                        )
+                        if forced_calls:
+                            forced_uploaded_table = True
+                            current_calls = forced_calls
+                            logger.info(
+                                "[Agent] forcing analyze_uploaded_table for uploaded tabular intent (conv=%s)",
+                                conv_id,
+                            )
+                            conversations[conv_id].append(_make_tool_calls_assistant_message(current_calls))
+                        else:
+                            break
+
                     iteration += 1
 
                     # Add assistant message with tool calls to history
-                    conversations[conv_id].append(
-                        make_assistant_message_from_response(response)
-                    )
+                    if not forced_uploaded_table:
+                        conversations[conv_id].append(
+                            make_assistant_message_from_response(response)
+                        )
 
                     # Execute tools
                     tu, td = await _execute_tool_calls(
-                        response.tool_calls,
+                        current_calls,
                         conv_id,
                         user_sub=str((user or {}).get("sub", "") or ""),
                     )
@@ -1509,19 +1572,38 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                     if isinstance(v, (int, float)):
                         total_usage[k] = total_usage.get(k, 0) + v
 
-                if response.tool_calls:
-                    # Add assistant msg with tool calls
-                    conversations[conv_id].append(
-                        make_assistant_message_from_response(response)
+                current_calls = list(response.tool_calls or [])
+                forced_uploaded_table = False
+                if not current_calls:
+                    forced_calls = _extract_forced_uploaded_table_calls(
+                        request.question,
+                        conv_id,
+                        already_used=tools_used,
                     )
+                    if forced_calls:
+                        forced_uploaded_table = True
+                        current_calls = forced_calls
+                        logger.info(
+                            "[Agent] forcing analyze_uploaded_table for uploaded tabular intent (stream conv=%s)",
+                            conv_id,
+                        )
+                        conversations[conv_id].append(_make_tool_calls_assistant_message(current_calls))
+
+                if current_calls:
+                    # Add assistant msg with tool calls
+                    if not forced_uploaded_table:
+                        conversations[conv_id].append(
+                            make_assistant_message_from_response(response)
+                        )
 
                     # Signal tool execution
-                    for tc in response.tool_calls:
-                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
+                    for tc in current_calls:
+                        suffix = " (forced)" if forced_uploaded_table else ""
+                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}{suffix}..."})
 
                     # Execute tools
                     tu, td = await _execute_tool_calls(
-                        response.tool_calls,
+                        current_calls,
                         conv_id,
                         user_sub=str((user or {}).get("sub", "") or ""),
                     )
