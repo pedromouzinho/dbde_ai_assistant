@@ -92,6 +92,7 @@ from config import (
     UPLOAD_BLOB_CONTAINER_RAW, UPLOAD_BLOB_CONTAINER_TEXT, UPLOAD_BLOB_CONTAINER_CHUNKS,
     UPLOAD_INDEX_TOP, UPLOAD_INLINE_WORKER_ENABLED, UPLOAD_WORKER_POLL_SECONDS,
     UPLOAD_WORKER_BATCH_SIZE,
+    DOC_INTEL_ENABLED, DOC_INTEL_MODEL,
     CHAT_TOOLRESULT_BLOB_CONTAINER,
     EXPORT_AUTO_ASYNC_ENABLED, EXPORT_ASYNC_THRESHOLD_ROWS, EXPORT_MAX_CONCURRENT_JOBS,
     EXPORT_JOB_STALE_SECONDS, EXPORT_INLINE_WORKER_ENABLED, EXPORT_WORKER_POLL_SECONDS,
@@ -139,6 +140,7 @@ from rate_limit_storage import TableStorageRateLimit
 from job_store import PersistentJobStore
 from utils import odata_escape, safe_blob_component, create_logged_task
 from tool_metrics import tool_metrics
+from document_intelligence import analyze_document, tables_to_markdown
 import token_quota as _tq_module
 from token_quota import TokenQuotaManager
 
@@ -1727,6 +1729,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     data_text, row_count, col_names, truncated = "", 0, [], False
     semantic_chunks = None
     col_analysis = []
+    doc_intel_meta = {}
     image_base64 = None
     image_content_type = None
     detected_delimiter = ","
@@ -1790,21 +1793,61 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         data_text = text
         detected_delimiter = sep
     elif filename_lower.endswith(".pdf"):
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            from PyPDF2 import PdfReader
-        reader = PdfReader(io.BytesIO(content))
-        pages = [
-            f"[Pág {i+1}]\n{p.extract_text() or ''}"
-            for i, p in enumerate(reader.pages)
-            if (p.extract_text() or "").strip()
-        ]
-        data_text = "\n\n".join(pages)
-        row_count = len(reader.pages)
-        col_names = [f"páginas ({row_count})"]
-        if not data_text.strip():
-            raise HTTPException(400, "PDF sem texto")
+        used_doc_intel = False
+        if DOC_INTEL_ENABLED:
+            di_result = await analyze_document(content, filename, model_id=DOC_INTEL_MODEL)
+            extracted_text = (di_result.get("text") or "").strip()
+            if extracted_text:
+                data_text = extracted_text
+                table_md = tables_to_markdown(di_result.get("tables") or [])
+                if table_md:
+                    data_text += "\n\n" + table_md
+                key_values = di_result.get("key_values") or []
+                if key_values:
+                    kv_lines = ["Campos extraidos:"]
+                    for kv in key_values[:100]:
+                        key = str((kv or {}).get("key") or "").strip()
+                        value = str((kv or {}).get("value") or "").strip()
+                        if key:
+                            kv_lines.append(f"- {key}: {value}")
+                    if len(kv_lines) > 1:
+                        data_text += "\n\n" + "\n".join(kv_lines)
+
+                row_count = int(di_result.get("page_count") or 0)
+                col_names = [f"páginas ({row_count})"] if row_count > 0 else ["páginas"]
+                doc_intel_meta = {
+                    "enabled": True,
+                    "used": True,
+                    "model": DOC_INTEL_MODEL,
+                    "page_count": int(di_result.get("page_count") or 0),
+                    "table_count": int(di_result.get("table_count") or 0),
+                    "key_values": len(key_values),
+                }
+                used_doc_intel = True
+            else:
+                doc_intel_meta = {
+                    "enabled": True,
+                    "used": False,
+                    "model": DOC_INTEL_MODEL,
+                    "error": str(di_result.get("error") or "empty_text"),
+                }
+
+        if not used_doc_intel:
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            pages = [
+                f"[Pág {i+1}]\n{p.extract_text() or ''}"
+                for i, p in enumerate(reader.pages)
+                if (p.extract_text() or "").strip()
+            ]
+            data_text = "\n\n".join(pages)
+            row_count = len(reader.pages)
+            col_names = [f"páginas ({row_count})"]
+            if not data_text.strip():
+                raise HTTPException(400, "PDF sem texto")
     elif filename_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")) or is_image_mime:
         if is_image_mime:
             image_content_type = content_type
@@ -1882,6 +1925,8 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         store_entry["image_content_type"] = image_content_type or "image/png"
     if semantic_chunks is not None:
         store_entry["chunks"] = semantic_chunks
+    if doc_intel_meta:
+        store_entry["document_intelligence"] = doc_intel_meta
     if filename_lower.endswith((".xlsx", ".xls", ".csv")):
         sample_lines = data_text.split("\n")[1:11]
         for ci, cname in enumerate(col_names):
@@ -1913,6 +1958,8 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         "preview": "\n".join(data_text.split("\n")[:6]),
         "col_analysis": col_analysis if col_analysis else None,
     }
+    if doc_intel_meta:
+        response_payload["document_intelligence"] = doc_intel_meta
     return store_entry, response_payload
 
 

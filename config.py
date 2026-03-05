@@ -79,6 +79,17 @@ PII_ENDPOINT = _get_env("PII_ENDPOINT", "")
 PII_API_KEY = _get_env("PII_API_KEY", "")
 PII_ENABLED = _get_env("PII_ENABLED", "false").lower() == "true"
 
+# Prompt Shield (Azure AI Content Safety)
+CONTENT_SAFETY_ENDPOINT = _get_env("CONTENT_SAFETY_ENDPOINT", "")
+CONTENT_SAFETY_KEY = _get_env("CONTENT_SAFETY_KEY", "")
+PROMPT_SHIELD_ENABLED = _get_env("PROMPT_SHIELD_ENABLED", "false").lower() == "true"
+
+# Document Intelligence (Azure AI Document Intelligence / Form Recognizer)
+DOC_INTEL_ENDPOINT = _get_env("DOC_INTEL_ENDPOINT", "")
+DOC_INTEL_KEY = _get_env("DOC_INTEL_KEY", "")
+DOC_INTEL_ENABLED = _get_env("DOC_INTEL_ENABLED", "false").lower() == "true"
+DOC_INTEL_MODEL = _get_env("DOC_INTEL_MODEL", "prebuilt-layout")
+
 # Fallback provider (se o primário falhar)
 LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:gpt-4.1-mini")
 

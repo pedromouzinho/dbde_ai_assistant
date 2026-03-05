@@ -29,6 +29,7 @@ from config import (
 )
 from models import LLMResponse, LLMToolCall, StreamEvent
 from pii_shield import PIIMaskingContext, mask_messages, PII_ENABLED
+from prompt_shield import check_messages, PROMPT_SHIELD_ENABLED
 
 # Debug log ring buffer (shared across providers)
 _llm_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
@@ -823,6 +824,28 @@ async def llm_with_fallback(
         pii_context = PIIMaskingContext()
         actual_messages = await mask_messages(messages, pii_context)
 
+    # Prompt Shield: deteta prompt injection/jailbreak antes da chamada ao provider.
+    if PROMPT_SHIELD_ENABLED:
+        shield_result = await check_messages(actual_messages)
+        if shield_result.is_blocked:
+            return LLMResponse(
+                content=(
+                    "Pedido bloqueado por seguranca: "
+                    + (shield_result.details or "Tentativa de manipulacao detectada.")
+                ),
+                tool_calls=None,
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                model="prompt_shield",
+                provider="prompt_shield",
+                fallback_chain=[
+                    {
+                        "provider": "prompt_shield",
+                        "status": "blocked",
+                        "attack_type": shield_result.attack_type,
+                    }
+                ],
+            )
+
     def _unmask_response_if_needed(response: LLMResponse) -> LLMResponse:
         if not pii_context or not pii_context.mappings:
             return response
@@ -891,6 +914,31 @@ async def llm_stream_with_fallback(
     response_format: Optional[dict] = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Streaming com fallback automático. Yield StreamEvents."""
+    if PROMPT_SHIELD_ENABLED:
+        shield_result = await check_messages(messages)
+        if shield_result.is_blocked:
+            blocked_text = (
+                "Pedido bloqueado por seguranca: "
+                + (shield_result.details or "Tentativa de manipulacao detectada.")
+            )
+            yield StreamEvent(type="token", text=blocked_text)
+            yield StreamEvent(
+                type="done",
+                data={
+                    "content": blocked_text,
+                    "model": "prompt_shield",
+                    "provider": "prompt_shield",
+                    "fallback_chain": [
+                        {
+                            "provider": "prompt_shield",
+                            "status": "blocked",
+                            "attack_type": shield_result.attack_type,
+                        }
+                    ],
+                },
+            )
+            return
+
     primary = get_provider(tier)
     try:
         async for event in primary.chat_stream(
