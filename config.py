@@ -56,8 +56,8 @@ if ANTHROPIC_FOUNDRY_RESOURCE:
 else:
     ANTHROPIC_API_BASE = _get_env("ANTHROPIC_API_BASE", "https://api.anthropic.com/v1/messages")
 
-ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-5-20251101")
-ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-5-20250929")
+ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-6")
+ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6")
 ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
 # =============================================================================
@@ -77,17 +77,17 @@ VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"
 # PII Shield (Azure AI Language)
 PII_ENDPOINT = _get_env("PII_ENDPOINT", "")
 PII_API_KEY = _get_env("PII_API_KEY", "")
-PII_ENABLED = _get_env("PII_ENABLED", "false").lower() == "true"
+PII_ENABLED = _get_env("PII_ENABLED", "true").lower() == "true"
 
 # Prompt Shield (Azure AI Content Safety)
 CONTENT_SAFETY_ENDPOINT = _get_env("CONTENT_SAFETY_ENDPOINT", "")
 CONTENT_SAFETY_KEY = _get_env("CONTENT_SAFETY_KEY", "")
-PROMPT_SHIELD_ENABLED = _get_env("PROMPT_SHIELD_ENABLED", "false").lower() == "true"
+PROMPT_SHIELD_ENABLED = _get_env("PROMPT_SHIELD_ENABLED", "true").lower() == "true"
 
 # Document Intelligence (Azure AI Document Intelligence / Form Recognizer)
 DOC_INTEL_ENDPOINT = _get_env("DOC_INTEL_ENDPOINT", "")
 DOC_INTEL_KEY = _get_env("DOC_INTEL_KEY", "")
-DOC_INTEL_ENABLED = _get_env("DOC_INTEL_ENABLED", "false").lower() == "true"
+DOC_INTEL_ENABLED = _get_env("DOC_INTEL_ENABLED", "true").lower() == "true"
 DOC_INTEL_MODEL = _get_env("DOC_INTEL_MODEL", "prebuilt-layout")
 
 # Fallback provider (se o primário falhar)
@@ -138,12 +138,12 @@ RERANK_AUTH_MODE = _get_env("RERANK_AUTH_MODE", "api-key").lower()
 # =============================================================================
 # WEB SEARCH (Brave Search API)
 # =============================================================================
-WEB_SEARCH_ENABLED = _get_env("WEB_SEARCH_ENABLED", "false").lower() == "true"
+WEB_SEARCH_ENABLED = _get_env("WEB_SEARCH_ENABLED", "true").lower() == "true"
 WEB_SEARCH_API_KEY = _get_env("WEB_SEARCH_API_KEY", "")
 WEB_SEARCH_ENDPOINT = _get_env("WEB_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search")
 WEB_SEARCH_MAX_RESULTS = int(_get_env("WEB_SEARCH_MAX_RESULTS", "5"))
 WEB_SEARCH_MARKET = _get_env("WEB_SEARCH_MARKET", "pt-PT")
-WEB_ANSWERS_ENABLED = _get_env("WEB_ANSWERS_ENABLED", "false").lower() == "true"
+WEB_ANSWERS_ENABLED = _get_env("WEB_ANSWERS_ENABLED", "true").lower() == "true"
 WEB_ANSWERS_API_KEY = _get_env("WEB_ANSWERS_API_KEY", "")
 WEB_ANSWERS_ENDPOINT = _get_env("WEB_ANSWERS_ENDPOINT", "https://api.search.brave.com/res/v1/chat/completions")
 WEB_ANSWERS_MODEL = _get_env("WEB_ANSWERS_MODEL", "brave")
