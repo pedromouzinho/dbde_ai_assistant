@@ -35,6 +35,7 @@ from config import (
 )
 from llm_provider import get_embedding_provider
 from http_helpers import search_request_with_retry
+from pii_shield import PIIMaskingContext, _regex_pre_mask
 
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -239,6 +240,15 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
     if not query:
         return {"error": "Query de pesquisa vazia."}
 
+    original_query = query
+    pii_ctx = PIIMaskingContext()
+    query = _regex_pre_mask(query, pii_ctx)
+    if pii_ctx.mappings:
+        logging.warning(
+            "[WebSearch] PII stripped from query before Brave API: %d patterns masked",
+            len(pii_ctx.mappings),
+        )
+
     safe_max = max(1, int(WEB_SEARCH_MAX_RESULTS or 5))
     top = min(max(1, int(top or 5)), safe_max)
     logging.info(
@@ -298,7 +308,7 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
         )
 
     result = {
-        "query": query,
+        "query": original_query,
         "total_estimated": len(web_results),
         "results": results,
         "results_count": len(results),
