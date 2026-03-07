@@ -56,8 +56,8 @@ if ANTHROPIC_FOUNDRY_RESOURCE:
 else:
     ANTHROPIC_API_BASE = _get_env("ANTHROPIC_API_BASE", "https://api.anthropic.com/v1/messages")
 
-ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-5-20251101")
-ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-5-20250929")
+ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-6")
+ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6")
 ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
 # =============================================================================
@@ -67,31 +67,34 @@ ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-2025
 LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "standard")
 
 # Mapping de tiers para providers+modelos
-# Formato: "provider:model" — o provider resolve internamente
-LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4.1-mini")
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-4.1")
-LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.1")
-LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4.1")
+# Formato: "provider:deployment_name" — o provider resolve internamente
+# DataZone deployments (*-dz): dados ficam na EU (Sweden Central) + Abuse Monitoring Opt-Out activo
+# GlobalStandard (gpt-5.3-chat): melhor modelo, opt-out cobre, PII Shield mascara antes de enviar
+# NOTA: Claude (anthropic:*) NÃO recomendado para dados confidenciais — sem opt-out específico
+LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4-1-mini-dz")      # DataZone, 229 TPM
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-4-1-dz")   # DataZone, 87 TPM
+LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.3-chat")           # GlobalStandard, 1000 TPM
+LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4-1-dz")      # DataZone, multimodal
 VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"
 
 # PII Shield (Azure AI Language)
 PII_ENDPOINT = _get_env("PII_ENDPOINT", "")
 PII_API_KEY = _get_env("PII_API_KEY", "")
-PII_ENABLED = _get_env("PII_ENABLED", "false").lower() == "true"
+PII_ENABLED = _get_env("PII_ENABLED", "true").lower() == "true"
 
 # Prompt Shield (Azure AI Content Safety)
 CONTENT_SAFETY_ENDPOINT = _get_env("CONTENT_SAFETY_ENDPOINT", "")
 CONTENT_SAFETY_KEY = _get_env("CONTENT_SAFETY_KEY", "")
-PROMPT_SHIELD_ENABLED = _get_env("PROMPT_SHIELD_ENABLED", "false").lower() == "true"
+PROMPT_SHIELD_ENABLED = _get_env("PROMPT_SHIELD_ENABLED", "true").lower() == "true"
 
 # Document Intelligence (Azure AI Document Intelligence / Form Recognizer)
 DOC_INTEL_ENDPOINT = _get_env("DOC_INTEL_ENDPOINT", "")
 DOC_INTEL_KEY = _get_env("DOC_INTEL_KEY", "")
-DOC_INTEL_ENABLED = _get_env("DOC_INTEL_ENABLED", "false").lower() == "true"
+DOC_INTEL_ENABLED = _get_env("DOC_INTEL_ENABLED", "true").lower() == "true"
 DOC_INTEL_MODEL = _get_env("DOC_INTEL_MODEL", "prebuilt-layout")
 
-# Fallback provider (se o primário falhar)
-LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:gpt-4.1-mini")
+# Fallback provider (se o primário falhar) — DataZone para máxima segurança
+LLM_FALLBACK = _get_env("LLM_FALLBACK", "azure_openai:gpt-4-1-mini-dz")
 
 # Model Router — feature flag para routing inteligente entre modelos.
 # Desactivado em produção por omissão. Para activar:
@@ -351,7 +354,7 @@ TOKEN_QUOTA_CONFIG = {
 
 DEBUG_LOG_SIZE = int(_get_env("DEBUG_LOG_SIZE", "50"))
 DEBUG_MODE = _get_env("DEBUG_MODE", "false").lower() == "true"
-LOG_FORMAT = _get_env("LOG_FORMAT", "text").lower()  # "json" para produção, "text" para dev
+LOG_FORMAT = _get_env("LOG_FORMAT", "json").lower()  # "json" para produção, "text" para dev
 
 # =============================================================================
 # APP METADATA
