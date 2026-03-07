@@ -75,6 +75,7 @@ class ConversationStore(MutableMapping[str, List[dict]]):
         self.max_conversations = max_conversations
         self.ttl_seconds = ttl_seconds
         self._on_evict = on_evict
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -124,6 +125,41 @@ class ConversationStore(MutableMapping[str, List[dict]]):
     def touch(self, key: str) -> None:
         if key in self._data:
             self._touch(key)
+
+    async def async_get(self, key: str, default=None):
+        """Thread-safe get com touch."""
+        async with self._lock:
+            if key in self._data:
+                self._touch(key)
+                return self._data[key]
+            return default
+
+    async def async_set(self, key: str, value: List[dict]) -> None:
+        """Thread-safe set com capacity check."""
+        async with self._lock:
+            if key not in self._data:
+                self.cleanup_expired()
+                while len(self._data) >= self.max_conversations:
+                    if self._evict_lru(exclude_key=key) is None:
+                        break
+            self._data[key] = value
+            self._touch(key)
+
+    async def async_delete(self, key: str) -> None:
+        """Thread-safe delete."""
+        async with self._lock:
+            if key in self._data:
+                self._evict(key, reason="manual")
+
+    async def async_contains(self, key: str) -> bool:
+        """Thread-safe contains check."""
+        async with self._lock:
+            return key in self._data
+
+    async def async_cleanup_expired(self) -> List[str]:
+        """Thread-safe cleanup."""
+        async with self._lock:
+            return self.cleanup_expired()
 
     def __getitem__(self, key: str) -> List[dict]:
         value = self._data[key]
