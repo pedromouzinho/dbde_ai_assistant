@@ -1373,7 +1373,8 @@ async def _execute_tool_calls(
                         blob_payload = {"masked_content": masked_serialized}
                 except Exception as mask_err:
                     logger.warning("[Agent] PII masking for blob failed (%s): %s", tc.name, mask_err)
-                    blob_payload = tool_result
+                    # Never fall back to unmasked PII in blob storage.
+                    blob_payload = {"error": "pii_masking_failed", "tool": tc.name}
 
             uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, blob_payload)
             result_blob_ref = str(uploaded.get("blob_ref", "") or "")
