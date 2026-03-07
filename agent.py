@@ -207,12 +207,15 @@ _conversation_meta_lock = asyncio.Lock()
 uploaded_files_store: Dict[str, Dict] = {}
 _uploaded_files_lock = asyncio.Lock()
 _conversation_locks: Dict[str, asyncio.Lock] = {}
+_conversation_locks_guard = asyncio.Lock()
 
 
 def _cleanup_conversation_related_state(conv_id: str) -> None:
     conversation_meta.pop(conv_id, None)
     uploaded_files_store.pop(conv_id, None)
-    _conversation_locks.pop(conv_id, None)
+    lock = _conversation_locks.get(conv_id)
+    if lock and not lock.locked():
+        _conversation_locks.pop(conv_id, None)
 
 
 conversations = ConversationStore(
@@ -310,8 +313,11 @@ def _safe_blob_component(raw: str, max_len: int = 120) -> str:
     return safe[:max_len]
 
 
-def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
-    return _conversation_locks.setdefault(conv_id, asyncio.Lock())
+async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
+    async with _conversation_locks_guard:
+        if conv_id not in _conversation_locks:
+            _conversation_locks[conv_id] = asyncio.Lock()
+        return _conversation_locks[conv_id]
 
 
 def _create_logged_task(coro, label: str) -> None:
@@ -1043,7 +1049,7 @@ async def _extract_forced_uploaded_table_calls(
 async def _persist_conversation(conv_id: str, partition_key: str) -> None:
     """Persiste conversa na tabela ChatHistory (fire-and-forget)."""
     try:
-        async with _get_conversation_lock(conv_id):
+        async with await _get_conversation_lock(conv_id):
             msgs = conversations.get(conv_id)
             if not msgs:
                 return
@@ -1506,7 +1512,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     should_persist = False
     tool_definitions = get_all_tool_definitions()
 
-    async with _get_conversation_lock(conv_id):
+    async with await _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         await _inject_file_context(conv_id, conversations[conv_id])
@@ -1675,7 +1681,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     def _sse(event: dict) -> str:
         return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     
-    async with _get_conversation_lock(conv_id):
+    async with await _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         await _inject_file_context(conv_id, conversations[conv_id])
