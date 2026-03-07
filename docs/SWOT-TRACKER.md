@@ -12,11 +12,11 @@
 | Metrica | Valor |
 |---|---|
 | Total de itens identificados | 40 |
-| Concluidos | 14 |
-| Em progresso (Codex) | 1 |
+| Concluidos | 15 |
+| Em progresso | 0 |
 | Pendentes | 25 |
-| **Progresso** | **35%** |
-| **Risk Score actual estimado** | **~3.8/10** |
+| **Progresso** | **37%** |
+| **Risk Score actual estimado** | **~3.2/10** |
 
 ---
 
@@ -25,7 +25,7 @@
 | # | Recomendacao | Esforco | Estado | Data | Notas |
 |---|---|---|---|---|---|
 | 1 | App Insights Ingestion + Health Check Path | Minutos | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs` criado. `healthCheckPath=/health`. |
-| 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | 🔄 CODEX | 2026-03-07 | **CRITICO** — instrucoes Codex escritas em `CODEX-CONCURRENCY-LOCKS.md`. 5 tasks, 17 race conditions identificadas. |
+| 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | ✅ FEITO | 2026-03-07 | **CRITICO** resolvido. 17 race conditions corrigidas. PR #5 merged. 12 tests novos. |
 | 3 | VNet + Entra ID | Depende DSI | ❌ PENDENTE | — | Dependente da DSI do banco. SCM restringido como medida interina (2026-03-07). |
 | 4 | Desactivar FTPS + Restringir SCM | Minutos | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`, SCM `DenyAll 0.0.0.0/0`. |
 | 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
@@ -41,7 +41,7 @@
 
 | ID | Fraqueza | Severidade | Estado | Data | Notas |
 |---|---|---|---|---|---|
-| W1 | Concorrencia nao thread-safe | CRITICO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. 17 race conditions mapeadas. = Rec 2. |
+| W1 | Concorrencia nao thread-safe | CRITICO | ✅ FEITO | 2026-03-07 | 17 race conditions corrigidas. asyncio.Lock em ConversationStore, meta, files, providers. PR #5. = Rec 2. |
 | W2 | Frontend monolitico | MEDIO | ❌ PENDENTE | — | App.jsx 1,872 linhas, 50+ estados, sem TypeScript. = Rec 9. |
 | W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
@@ -99,7 +99,7 @@
 | Model tiers configurados | 2026-03-07 | gpt-4.1 (fast), gpt-5-mini (standard), Claude Opus 4.6 (pro). |
 | Log Analytics workspace criado | 2026-03-07 | `dbde-ai-logs` em Sweden Central, 90 dias retencao. Workspace anterior (DefaultResourceGroup-SEC) estava orfao. |
 | Dependency scanning CI | 2026-03-07 | `pip-audit` (Python) + `npm audit --audit-level=high` (frontend) adicionados ao GitHub Actions. Commit `4677fc3`. |
-| Codex instructions: concurrency locks | 2026-03-07 | `CODEX-CONCURRENCY-LOCKS.md` — 5 tasks, 17 race conditions mapeadas. Pronto para execucao Codex. |
+| Concurrency locks implementation | 2026-03-07 | 17 race conditions corrigidas em agent.py + llm_provider.py. 12 tests novos. PR #5 merged. |
 
 ---
 
@@ -110,7 +110,7 @@
 - [ ] **Rec 6**: Verificar e remover recursos orfaos (bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot)
 
 ### Prioridade 2 — Alto impacto (dias)
-- [ ] **Rec 2 / W1**: Locks de concorrencia — **CRITICO** (instrucoes Codex prontas)
+- [x] **Rec 2 / W1**: Locks de concorrencia — **CRITICO** ✅ PR #5 merged
 - [ ] **Rec 8 / W7**: Filtrar secrets nos logs
 
 ### Prioridade 3 — Medio impacto (dias)
