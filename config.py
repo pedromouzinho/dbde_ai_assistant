@@ -69,11 +69,11 @@ LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "standard")
 # Mapping de tiers para providers+modelos
 # Formato: "provider:deployment_name" — o provider resolve internamente
 # DataZone deployments (*-dz): dados ficam na EU (Sweden Central) + Abuse Monitoring Opt-Out activo
-# GlobalStandard (gpt-5.3-chat): melhor modelo, opt-out cobre, PII Shield mascara antes de enviar
-# NOTA: Claude (anthropic:*) NÃO recomendado para dados confidenciais — sem opt-out específico
-LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4-1-mini-dz")      # DataZone, 229 TPM
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-4-1-dz")   # DataZone, 87 TPM
-LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "azure_openai:gpt-5.3-chat")           # GlobalStandard, 1000 TPM
+# Pro usa Claude Opus 4.6 via Anthropic — PII Shield mascara antes de enviar
+# NOTA: Para Pro funcionar requer ANTHROPIC_API_KEY ou ANTHROPIC_FOUNDRY_RESOURCE em App Settings
+LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4-1-dz")          # DataZone, gpt-4.1, 87 TPM
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-5-mini-dz") # DataZone, gpt-5-mini, 30 TPM
+LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "anthropic:opus")                      # Claude Opus 4.6
 LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4-1-dz")      # DataZone, multimodal
 VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"
 
