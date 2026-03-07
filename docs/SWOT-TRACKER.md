@@ -1,0 +1,130 @@
+# DBDE AI Assistant — SWOT Tracker
+
+**Criado**: 2026-03-07
+**Ultima actualizacao**: 2026-03-07
+**Baseado em**: [DBDE-SWOT-Analysis-Marco2026.md](./DBDE-SWOT-Analysis-Marco2026.md)
+**Risk Score inicial**: 5.2/10 → Revisto para 4.4/10 (apos auditoria Azure)
+
+---
+
+## Progresso Global
+
+| Metrica | Valor |
+|---|---|
+| Total de itens identificados | 40 |
+| Concluidos | 12 |
+| Em progresso | 0 |
+| Pendentes | 28 |
+| **Progresso** | **30%** |
+| **Risk Score actual estimado** | **~3.8/10** |
+
+---
+
+## Top 10 Recomendacoes — Estado
+
+| # | Recomendacao | Esforco | Estado | Data | Notas |
+|---|---|---|---|---|---|
+| 1 | App Insights Ingestion + Health Check Path | Minutos | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs` criado. `healthCheckPath=/health`. |
+| 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | ❌ PENDENTE | — | **CRITICO** — maior risco tecnico. `asyncio.Lock()` em ConversationStore, file loading, HTTP client. |
+| 3 | VNet + Entra ID | Depende DSI | ❌ PENDENTE | — | Dependente da DSI do banco. SCM restringido como medida interina (2026-03-07). |
+| 4 | Desactivar FTPS + Restringir SCM | Minutos | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`, SCM `DenyAll 0.0.0.0/0`. |
+| 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
+| 6 | Cleanup de Recursos Orfaos | Horas | ❌ PENDENTE | — | bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot, deployment gpt-4o. |
+| 7 | Dependency Scanning no CI | Horas | ❌ PENDENTE | — | `pip audit` + `npm audit` no GitHub Actions. |
+| 8 | Proteger Secrets nos Logs (W7) | 1 dia | ❌ PENDENTE | — | Filtrar headers Authorization. Parcialmente mitigado por Key Vault. |
+| 9 | Refactoring Frontend (Fase 1) | 1-2 semanas | ❌ PENDENTE | — | App.jsx 1,872 linhas. Nao bloqueante. |
+| 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ❌ PENDENTE | — | gpt-5.3-chat deployado mas nao configurado como tier. |
+
+---
+
+## Weaknesses (W1-W12) — Estado
+
+| ID | Fraqueza | Severidade | Estado | Data | Notas |
+|---|---|---|---|---|---|
+| W1 | Concorrencia nao thread-safe | CRITICO | ❌ PENDENTE | — | ConversationStore, file loading, HTTP client, generated files. = Rec 2. |
+| W2 | Frontend monolitico | MEDIO | ❌ PENDENTE | — | App.jsx 1,872 linhas, 50+ estados, sem TypeScript. = Rec 9. |
+| W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
+| W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
+| W5 | AI Search no tier Free | MEDIO | ❌ PENDENTE | — | Sem SLA, 50MB storage, 3 indices. = Rec 5. |
+| W6 | Sem token blacklist / refresh | MEDIO | ❌ PENDENTE | — | Tokens validos 10h apos logout. Sem rate limiting em auth. |
+| W7 | Logging pode expor secrets | ALTO | ❌ PENDENTE | — | DevOps PAT em headers. Sem filtragem. = Rec 8. |
+| W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
+| W9 | Recursos potencialmente orfaos | BAIXO | ❌ PENDENTE | — | bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot. = Rec 6. |
+| W10 | Code Interpreter gaps hardening | MEDIO | ❌ PENDENTE | — | PATH do parent, sem CPU/mem limits, symlink attacks. |
+| W11 | FTPS deveria estar Disabled | BAIXO | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`. = Rec 4. |
+| W12 | SCM site sem restricoes IP | MEDIO | ✅ FEITO | 2026-03-07 | `DenyAll 0.0.0.0/0` no SCM. = Rec 4. |
+
+---
+
+## Threats (T1-T9) — Mitigacoes
+
+| ID | Ameaca | Severidade | Mitigacao | Estado | Notas |
+|---|---|---|---|---|---|
+| T1 | Dados bancarios confidenciais | ALTO | PII Shield Phase 1+2 | ✅ MITIGADO | Regex pre-mask, Azure AI Language, tool masking, blob PII, Brave query masking, audit logs. Risco residual: threshold 0.7, comportamento utilizadores. |
+| T2 | Exposicao publica de servicos | ALTO | VNet + Private Endpoints | ❌ PENDENTE | Depende DSI. SCM restringido como interino. = Rec 3. |
+| T3 | Dependencia servicos Azure | MEDIO | DR plan + fallback | ⚠️ PARCIAL | Fallback Claude Opus/Sonnet activo para LLM. AI Search e Storage sem fallback. |
+| T4 | Supply chain / dependencias | MEDIO | CI scanning | ❌ PENDENTE | Sem `pip audit` / `npm audit`. = Rec 7. |
+| T5 | Escalabilidade limitada | BAIXO | Scale-out architecture | ❌ PENDENTE | ConversationStore in-memory, 1 worker. Autoscale configurado mas sem externalizacao de estado. |
+| T6 | Regulacao bancaria | MEDIO | Compliance docs | ⚠️ PARCIAL | Data Policy documentada. Sem classificacao automatica de documentos. |
+| T7 | Expiracao credenciais | MEDIO | Alertas proactivos | ❌ PENDENTE | Sem alertas de expiracao de PATs/keys. |
+| T8 | Prompt injection avancado | MEDIO | Prompt Shield + hardening | ⚠️ PARCIAL | Prompt Shield activo. Code Interpreter AST checker tem edge cases. |
+| T9 | Vendor lock-in | BAIXO | Multi-provider | ⚠️ PARCIAL | Claude via Foundry como fallback. Restante stack = Azure. |
+
+---
+
+## Opportunities (O1-O10) — Estado
+
+| ID | Oportunidade | Estado | Notas |
+|---|---|---|---|
+| O1 | VNet + Entra ID | ❌ PENDENTE | Depende DSI. = Rec 3. |
+| O2 | App Insights + telemetria custom | ⚠️ PARCIAL | Ingestao activada. Custom metrics (latencia, tokens) ainda por implementar. = Rec 1. |
+| O3 | Refactoring frontend | ❌ PENDENTE | = Rec 9. |
+| O4 | Upgrade AI Search | ❌ PENDENTE | = Rec 5. |
+| O5 | Optimizacao modelos (gpt-5.3, Router) | ⚠️ PARCIAL | Tiers configurados (gpt-4.1/gpt-5-mini/Claude Opus). gpt-5.3-chat + Model Router por testar. = Rec 10. |
+| O6 | Code Interpreter hardening | ❌ PENDENTE | = W10. |
+| O7 | Cleanup recursos orfaos | ❌ PENDENTE | = Rec 6. |
+| O8 | Health Check Path | ✅ FEITO | `healthCheckPath=/health`. = Rec 1. |
+| O9 | Export e reporting avancado | ❌ PENDENTE | Confluence/SharePoint export, templates por equipa. |
+| O10 | Integracao com mais ferramentas | ❌ PENDENTE | Jira, Confluence, Teams, GitLab/GitHub. |
+
+---
+
+## Accoes Completadas Fora do SWOT (Bonus)
+
+| Accao | Data | Notas |
+|---|---|---|
+| PII Shield Phase 2 — tool output masking | 2026-03-07 | Masking em `role=tool`, blob PII protection, Brave query masking, shared httpx client, audit logging. PR #4. |
+| Feature activation — RERANK + WEB_SEARCH | 2026-03-07 | `RERANK_ENABLED=true`, `WEB_SEARCH_ENABLED=true`, `XDT_BaseExtensions=~1`. |
+| Token quotas restauradas | 2026-03-07 | Fast 500K/5M, Standard 200K/2M, Pro 100K/1M (anteriormente 0,0 = ilimitado). |
+| Model tiers configurados | 2026-03-07 | gpt-4.1 (fast), gpt-5-mini (standard), Claude Opus 4.6 (pro). |
+| Log Analytics workspace criado | 2026-03-07 | `dbde-ai-logs` em Sweden Central, 90 dias retencao. Workspace anterior (DefaultResourceGroup-SEC) estava orfao. |
+
+---
+
+## Proximos Passos Recomendados (por prioridade)
+
+### Prioridade 1 — Quick wins (horas)
+- [ ] **Rec 7**: Adicionar `pip audit` + `npm audit` ao CI
+- [ ] **Rec 6**: Verificar e remover recursos orfaos (bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot)
+
+### Prioridade 2 — Alto impacto (dias)
+- [ ] **Rec 2 / W1**: Locks de concorrencia — **CRITICO**
+- [ ] **Rec 8 / W7**: Filtrar secrets nos logs
+
+### Prioridade 3 — Medio impacto (dias)
+- [ ] **Rec 5 / W5**: Upgrade AI Search para Basic
+- [ ] **Rec 10 / O5**: Testar gpt-5.3-chat + Model Router
+- [ ] **W6**: Token blacklist + rate limiting em auth
+- [ ] **W10**: Code Interpreter hardening (PATH, CPU/mem, symlinks)
+
+### Prioridade 4 — Esforco significativo (semanas)
+- [ ] **Rec 9 / W2**: Refactoring frontend
+- [ ] **O2**: Custom metrics e dashboard operacional
+
+### Dependente da DSI
+- [ ] **Rec 3 / O1**: VNet + Private Endpoints + Entra ID
+
+---
+
+*Tracker gerado em 2026-03-07 via Claude Code.*
+*Projecto: DBDE AI Assistant v7.3.0 — Millennium BCP (uso interno)*
