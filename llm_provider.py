@@ -7,6 +7,7 @@
 
 import json
 import asyncio
+import inspect
 import uuid
 import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
@@ -42,6 +43,12 @@ def _log(msg: str):
     entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg}
     _llm_debug_log.append(entry)
     logger.info("[LLM] %s", msg)
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _is_gpt5_family(deployment: str) -> bool:
@@ -286,15 +293,19 @@ class AzureOpenAIProvider(LLMProvider):
         self.endpoint = AZURE_OPENAI_ENDPOINT
         self.api_key = AZURE_OPENAI_KEY
         self._http_client: httpx.AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=180)
-        return self._http_client
+    async def _get_client(self) -> httpx.AsyncClient:
+        async with self._client_lock:
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(timeout=180)
+            return self._http_client
 
     async def close(self) -> None:
-        if self._http_client and not self._http_client.is_closed:
-            await self._http_client.aclose()
+        async with self._client_lock:
+            if self._http_client and not self._http_client.is_closed:
+                await self._http_client.aclose()
+            self._http_client = None
 
     async def chat(
         self,
@@ -324,7 +335,7 @@ class AzureOpenAIProvider(LLMProvider):
             body["response_format"] = response_format
         
         max_retries = 5
-        client = self._get_client()
+        client = await _maybe_await(self._get_client())
         for attempt in range(max_retries):
             try:
                 resp = await client.post(
@@ -400,7 +411,7 @@ class AzureOpenAIProvider(LLMProvider):
             body["response_format"] = response_format
 
         # Streaming puro (sem tools) — stream token a token
-        client = self._get_client()
+        client = await _maybe_await(self._get_client())
         async with client.stream(
             "POST", url, json=body,
             headers={"api-key": self.api_key, "Content-Type": "application/json"},
@@ -433,7 +444,7 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{EMBEDDING_DEPLOYMENT}"
             f"/embeddings?api-version={API_VERSION_OPENAI}"
         )
-        client = self._get_client()
+        client = await _maybe_await(self._get_client())
         resp = await client.post(
             url, json={"input": text},
             headers={"api-key": self.api_key, "Content-Type": "application/json"},
@@ -458,15 +469,19 @@ class AnthropicProvider(LLMProvider):
         self.api_key = ANTHROPIC_API_KEY
         self.api_url = ANTHROPIC_API_BASE  # Pode ser Foundry ou api.anthropic.com
         self._http_client: httpx.AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=180)
-        return self._http_client
+    async def _get_client(self) -> httpx.AsyncClient:
+        async with self._client_lock:
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(timeout=180)
+            return self._http_client
 
     async def close(self) -> None:
-        if self._http_client and not self._http_client.is_closed:
-            await self._http_client.aclose()
+        async with self._client_lock:
+            if self._http_client and not self._http_client.is_closed:
+                await self._http_client.aclose()
+            self._http_client = None
     
     def _headers(self) -> dict:
         return {
@@ -500,7 +515,7 @@ class AnthropicProvider(LLMProvider):
             body["tool_choice"] = {"type": "auto"}
         
         max_retries = 5
-        client = self._get_client()
+        client = await _maybe_await(self._get_client())
         for attempt in range(max_retries):
             try:
                 resp = await client.post(
@@ -557,7 +572,7 @@ class AnthropicProvider(LLMProvider):
         # Com tools e streaming no Anthropic, tool_use events vêm inline
         # Precisamos de reconstruir os tool calls a partir dos deltas
         
-        client = self._get_client()
+        client = await _maybe_await(self._get_client())
         async with client.stream(
             "POST", self.api_url, json=body, headers=self._headers(),
         ) as resp:

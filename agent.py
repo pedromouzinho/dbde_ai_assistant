@@ -75,6 +75,7 @@ class ConversationStore(MutableMapping[str, List[dict]]):
         self.max_conversations = max_conversations
         self.ttl_seconds = ttl_seconds
         self._on_evict = on_evict
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -125,6 +126,41 @@ class ConversationStore(MutableMapping[str, List[dict]]):
         if key in self._data:
             self._touch(key)
 
+    async def async_get(self, key: str, default=None):
+        """Thread-safe get com touch."""
+        async with self._lock:
+            if key in self._data:
+                self._touch(key)
+                return self._data[key]
+            return default
+
+    async def async_set(self, key: str, value: List[dict]) -> None:
+        """Thread-safe set com capacity check."""
+        async with self._lock:
+            if key not in self._data:
+                self.cleanup_expired()
+                while len(self._data) >= self.max_conversations:
+                    if self._evict_lru(exclude_key=key) is None:
+                        break
+            self._data[key] = value
+            self._touch(key)
+
+    async def async_delete(self, key: str) -> None:
+        """Thread-safe delete."""
+        async with self._lock:
+            if key in self._data:
+                self._evict(key, reason="manual")
+
+    async def async_contains(self, key: str) -> bool:
+        """Thread-safe contains check."""
+        async with self._lock:
+            return key in self._data
+
+    async def async_cleanup_expired(self) -> List[str]:
+        """Thread-safe cleanup."""
+        async with self._lock:
+            return self.cleanup_expired()
+
     def __getitem__(self, key: str) -> List[dict]:
         value = self._data[key]
         self._touch(key)
@@ -167,14 +203,19 @@ class ConversationStore(MutableMapping[str, List[dict]]):
 
 
 conversation_meta: Dict[str, Dict] = {}
+_conversation_meta_lock = asyncio.Lock()
 uploaded_files_store: Dict[str, Dict] = {}
+_uploaded_files_lock = asyncio.Lock()
 _conversation_locks: Dict[str, asyncio.Lock] = {}
+_conversation_locks_guard = asyncio.Lock()
 
 
 def _cleanup_conversation_related_state(conv_id: str) -> None:
     conversation_meta.pop(conv_id, None)
     uploaded_files_store.pop(conv_id, None)
-    _conversation_locks.pop(conv_id, None)
+    lock = _conversation_locks.get(conv_id)
+    if lock and not lock.locked():
+        _conversation_locks.pop(conv_id, None)
 
 
 conversations = ConversationStore(
@@ -272,8 +313,11 @@ def _safe_blob_component(raw: str, max_len: int = 120) -> str:
     return safe[:max_len]
 
 
-def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
-    return _conversation_locks.setdefault(conv_id, asyncio.Lock())
+async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
+    async with _conversation_locks_guard:
+        if conv_id not in _conversation_locks:
+            _conversation_locks[conv_id] = asyncio.Lock()
+        return _conversation_locks[conv_id]
 
 
 def _create_logged_task(coro, label: str) -> None:
@@ -317,7 +361,25 @@ MAX_IMAGES_PER_INPUT = max(1, int(UPLOAD_MAX_IMAGES_PER_MESSAGE))
 MAX_FILES_CONTEXT = 10
 
 
-def _normalize_uploaded_files_entry(conv_id: str) -> dict:
+async def _get_conversation_meta(conv_id: str) -> Dict:
+    async with _conversation_meta_lock:
+        meta = conversation_meta.get(conv_id)
+        return dict(meta) if isinstance(meta, dict) else {}
+
+
+async def _set_conversation_meta(conv_id: str, value: Dict) -> None:
+    async with _conversation_meta_lock:
+        conversation_meta[conv_id] = dict(value)
+
+
+async def _update_conversation_meta(conv_id: str, **updates) -> None:
+    async with _conversation_meta_lock:
+        meta = dict(conversation_meta.get(conv_id, {}))
+        meta.update(updates)
+        conversation_meta[conv_id] = meta
+
+
+def _normalize_uploaded_files_entry_unlocked(conv_id: str) -> dict:
     current = uploaded_files_store.get(conv_id)
     if isinstance(current, dict) and isinstance(current.get("files"), list):
         return current
@@ -330,14 +392,29 @@ def _normalize_uploaded_files_entry(conv_id: str) -> dict:
     return {"files": []}
 
 
+def _get_uploaded_files_unlocked(conv_id: str) -> List[dict]:
+    return list(_normalize_uploaded_files_entry_unlocked(conv_id).get("files", []))
+
+
 def _get_uploaded_files(conv_id: str) -> List[dict]:
-    return _normalize_uploaded_files_entry(conv_id).get("files", [])
+    return _get_uploaded_files_unlocked(conv_id)
+
+
+async def _normalize_uploaded_files_entry(conv_id: str) -> dict:
+    async with _uploaded_files_lock:
+        return _normalize_uploaded_files_entry_unlocked(conv_id)
+
+
+async def _get_uploaded_files_async(conv_id: str) -> List[dict]:
+    async with _uploaded_files_lock:
+        return _get_uploaded_files_unlocked(conv_id)
 
 
 async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> None:
-    current_files = _get_uploaded_files(conv_id)
-    if current_files:
-        return
+    async with _uploaded_files_lock:
+        current_files = _get_uploaded_files_unlocked(conv_id)
+        if current_files:
+            return
     try:
         safe_conv = odata_escape(conv_id)
         rows = await table_query("UploadIndex", f"PartitionKey eq '{safe_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
@@ -398,11 +475,14 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
             }
         )
     if files:
-        uploaded_files_store[conv_id] = {
-            "files": files[-MAX_FILES_CONTEXT:],
-            "uploaded_at": datetime.now().isoformat(),
-            "from_index": True,
-        }
+        async with _uploaded_files_lock:
+            if _get_uploaded_files_unlocked(conv_id):
+                return
+            uploaded_files_store[conv_id] = {
+                "files": files[-MAX_FILES_CONTEXT:],
+                "uploaded_at": datetime.now().isoformat(),
+                "from_index": True,
+            }
 
 
 def _extract_request_images(request: AgentChatRequest) -> List[dict]:
@@ -444,14 +524,14 @@ def _extract_request_images(request: AgentChatRequest) -> List[dict]:
     return extracted
 
 
-def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] = None) -> dict:
+async def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] = None) -> dict:
     """Constrói a mensagem do user (texto puro ou multimodal com 1..MAX_IMAGES_PER_INPUT imagens)."""
     images = _extract_request_images(request)
 
     # Fallback: usar imagem previamente carregada via /upload nesta conversa.
     if not images and conv_id:
         uploaded_images = []
-        for file_data in _get_uploaded_files(conv_id):
+        for file_data in await _get_uploaded_files_async(conv_id):
             upload_b64 = str(file_data.get("image_base64", "") or "").strip()
             if not upload_b64:
                 continue
@@ -487,10 +567,11 @@ def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] = None
     return {"role": "user", "content": content_blocks}
 
 
-def _inject_file_context(conv_id: str, messages: List[dict]):
+async def _inject_file_context(conv_id: str, messages: List[dict]):
     """Injeta contexto de ficheiros uploaded na conversa."""
-    files = _get_uploaded_files(conv_id)
-    if files and not conversation_meta.get(conv_id, {}).get("file_injected"):
+    files = await _get_uploaded_files_async(conv_id)
+    meta = await _get_conversation_meta(conv_id)
+    if files and not meta.get("file_injected"):
         messages[:] = [
             m for m in messages
             if not (
@@ -502,7 +583,7 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
                 )
             )
         ]
-        mode = conversation_meta.get(conv_id, {}).get("mode", "general")
+        mode = meta.get("mode", "general")
         use_files = files[-MAX_FILES_CONTEXT:]
         ctx_parts = [
             f"FICHEIROS CARREGADOS: {len(use_files)} (máximo analisado por pedido: {MAX_FILES_CONTEXT})",
@@ -595,7 +676,7 @@ def _inject_file_context(conv_id: str, messages: List[dict]):
 
         ctx = "\n\n".join(ctx_parts)[:120000]
         messages.append({"role": "system", "content": ctx})
-        conversation_meta.setdefault(conv_id, {})["file_injected"] = True
+        await _update_conversation_meta(conv_id, file_injected=True)
 
 
 async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> bool:
@@ -629,11 +710,14 @@ async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> b
             messages.insert(0, {"role": "system", "content": current_sp})
 
         conversations[conv_id] = messages
-        conversation_meta[conv_id] = {
-            "mode": stored_mode,
-            "created_at": row.get("CreatedAt", datetime.now().isoformat()),
-            "loaded_from_storage": True,
-        }
+        await _set_conversation_meta(
+            conv_id,
+            {
+                "mode": stored_mode,
+                "created_at": row.get("CreatedAt", datetime.now().isoformat()),
+                "loaded_from_storage": True,
+            },
+        )
 
         logger.info("[Agent] Loaded conversation %s from storage (%d messages)", conv_id, len(messages))
         return True
@@ -652,7 +736,10 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
             # Conversa nova
             sp = get_userstory_system_prompt() if mode == "userstory" else get_agent_system_prompt()
             conversations[conv_id] = [{"role": "system", "content": sp}]
-            conversation_meta[conv_id] = {"mode": mode, "created_at": datetime.now().isoformat()}
+            await _set_conversation_meta(
+                conv_id,
+                {"mode": mode, "created_at": datetime.now().isoformat()},
+            )
     else:
         conversations.touch(conv_id)
     return conv_id
@@ -680,7 +767,7 @@ async def _build_llm_messages(
 
     # Injeta conteúdo multimodal apenas na cópia efémera para evitar bloat no histórico real.
     if request:
-        user_msg = _build_user_message(request, conv_id=conv_id)
+        user_msg = await _build_user_message(request, conv_id=conv_id)
         if isinstance(user_msg.get("content"), list):
             replaced = False
             for idx in range(len(base) - 1, -1, -1):
@@ -949,6 +1036,14 @@ def _has_tabular_uploads(conv_id: str) -> bool:
     return False
 
 
+async def _has_tabular_uploads_async(conv_id: str) -> bool:
+    for file_data in await _get_uploaded_files_async(conv_id):
+        name = str(file_data.get("filename", "") or "").lower()
+        if name.endswith((".csv", ".xlsx", ".xls")):
+            return True
+    return False
+
+
 def _extract_forced_uploaded_table_calls(
     question: str,
     conv_id: str,
@@ -963,10 +1058,24 @@ def _extract_forced_uploaded_table_calls(
     return []
 
 
+async def _extract_forced_uploaded_table_calls_async(
+    question: str,
+    conv_id: str,
+    already_used: Optional[List[str]] = None,
+) -> List[LLMToolCall]:
+    if not await _has_tabular_uploads_async(conv_id):
+        return []
+    # Modo agressivo: não forçar analyze_uploaded_table.
+    # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
+    # O fallback para analyze_uploaded_table é tratado no handler de run_code
+    # quando houver erro/timeout.
+    return []
+
+
 async def _persist_conversation(conv_id: str, partition_key: str) -> None:
     """Persiste conversa na tabela ChatHistory (fire-and-forget)."""
     try:
-        async with _get_conversation_lock(conv_id):
+        async with await _get_conversation_lock(conv_id):
             msgs = conversations.get(conv_id)
             if not msgs:
                 return
@@ -1004,7 +1113,7 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                 compact = [{"role": "system", "content": "Histórico truncado para persistência."}]
                 messages_json = json.dumps(compact, ensure_ascii=False, default=str)
 
-            meta = conversation_meta.get(conv_id, {})
+            meta = await _get_conversation_meta(conv_id)
             entity = {
                 "PartitionKey": partition_key,
                 "RowKey": conv_id,
@@ -1119,7 +1228,7 @@ async def _execute_tool_calls(
             )
         )
         # --- Routing guardrail: CSV/Excel uploaded -> never query DevOps ---
-        files = _get_uploaded_files(conv_id)
+        files = await _get_uploaded_files_async(conv_id)
         if files and tc.name in ("query_workitems", "search_workitems", "compute_kpi", "query_hierarchy"):
             _file_keywords = ("csv", "excel", "xlsx", "tabela", "ficheiro", "upload", "dados", "coluna",
                               "linha", "media", "soma", "total", "grafico", "chart", "analise", "analisa")
@@ -1429,10 +1538,10 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     should_persist = False
     tool_definitions = get_all_tool_definitions()
 
-    async with _get_conversation_lock(conv_id):
+    async with await _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
-        _inject_file_context(conv_id, conversations[conv_id])
+        await _inject_file_context(conv_id, conversations[conv_id])
 
         conversations[conv_id].append({"role": "user", "content": request.question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
@@ -1485,7 +1594,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                     current_calls = list(response.tool_calls or [])
                     forced_uploaded_table = False
                     if not current_calls:
-                        forced_calls = _extract_forced_uploaded_table_calls(
+                        forced_calls = await _extract_forced_uploaded_table_calls_async(
                             request.question,
                             conv_id,
                             already_used=tools_used,
@@ -1598,10 +1707,10 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     def _sse(event: dict) -> str:
         return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     
-    async with _get_conversation_lock(conv_id):
+    async with await _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
-        _inject_file_context(conv_id, conversations[conv_id])
+        await _inject_file_context(conv_id, conversations[conv_id])
         conversations[conv_id].append({"role": "user", "content": request.question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
@@ -1675,7 +1784,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 current_calls = list(response.tool_calls or [])
                 forced_uploaded_table = False
                 if not current_calls:
-                    forced_calls = _extract_forced_uploaded_table_calls(
+                    forced_calls = await _extract_forced_uploaded_table_calls_async(
                         request.question,
                         conv_id,
                         already_used=tools_used,
