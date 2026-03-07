@@ -29,9 +29,9 @@
 | 3 | VNet + Entra ID | Depende DSI | ❌ PENDENTE | — | Dependente da DSI do banco. SCM restringido como medida interina (2026-03-07). |
 | 4 | Desactivar FTPS + Restringir SCM | Minutos | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`, SCM `DenyAll 0.0.0.0/0`. |
 | 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
-| 6 | Cleanup de Recursos Orfaos | Horas | ❌ PENDENTE | — | bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot, deployment gpt-4o. |
+| 6 | Cleanup de Recursos Orfaos | Horas | ⚠️ PARCIAL | 2026-03-07 | bing_chatbot, Logic App, DBDE-Chatbot apagados. Restam: CosmosDB (`cosmosdbrgmsaccesschabot84949c`), deployment gpt-4o (`dbde_access_chatbot`). |
 | 7 | Dependency Scanning no CI | Horas | ✅ FEITO | 2026-03-07 | `pip-audit` + `npm audit --audit-level=high` no GitHub Actions CI. Commit `4677fc3`. |
-| 8 | Proteger Secrets nos Logs (W7) | 1 dia | ❌ PENDENTE | — | Filtrar headers Authorization. Parcialmente mitigado por Key Vault. |
+| 8 | Proteger Secrets nos Logs (W7) | 1 dia | 🔄 CODEX | 2026-03-07 | Instrucoes Codex em `CODEX-SECURITY-HARDENING.md`. 14 pontos de logging identificados. |
 | 9 | Refactoring Frontend (Fase 1) | 1-2 semanas | ❌ PENDENTE | — | App.jsx 1,872 linhas. Nao bloqueante. |
 | 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ❌ PENDENTE | — | gpt-5.3-chat deployado mas nao configurado como tier. |
 
@@ -47,10 +47,10 @@
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
 | W5 | AI Search no tier Free | MEDIO | ❌ PENDENTE | — | Sem SLA, 50MB storage, 3 indices. = Rec 5. |
 | W6 | Sem token blacklist / refresh | MEDIO | ❌ PENDENTE | — | Tokens validos 10h apos logout. Sem rate limiting em auth. |
-| W7 | Logging pode expor secrets | ALTO | ❌ PENDENTE | — | DevOps PAT em headers. Sem filtragem. = Rec 8. |
+| W7 | Logging pode expor secrets | ALTO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. 14 pontos em 6 ficheiros. = Rec 8. |
 | W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
-| W9 | Recursos potencialmente orfaos | BAIXO | ❌ PENDENTE | — | bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot. = Rec 6. |
-| W10 | Code Interpreter gaps hardening | MEDIO | ❌ PENDENTE | — | PATH do parent, sem CPU/mem limits, symlink attacks. |
+| W9 | Recursos potencialmente orfaos | BAIXO | ⚠️ PARCIAL | 2026-03-07 | 3/5 apagados. Restam CosmosDB + deployment gpt-4o. = Rec 6. |
+| W10 | Code Interpreter gaps hardening | MEDIO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. PATH, resource limits, symlinks, AST hardening. |
 | W11 | FTPS deveria estar Disabled | BAIXO | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`. = Rec 4. |
 | W12 | SCM site sem restricoes IP | MEDIO | ✅ FEITO | 2026-03-07 | `DenyAll 0.0.0.0/0` no SCM. = Rec 4. |
 
