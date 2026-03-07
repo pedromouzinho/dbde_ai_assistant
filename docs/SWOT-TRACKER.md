@@ -12,10 +12,10 @@
 | Metrica | Valor |
 |---|---|
 | Total de itens identificados | 40 |
-| Concluidos | 12 |
-| Em progresso | 0 |
-| Pendentes | 28 |
-| **Progresso** | **30%** |
+| Concluidos | 14 |
+| Em progresso (Codex) | 1 |
+| Pendentes | 25 |
+| **Progresso** | **35%** |
 | **Risk Score actual estimado** | **~3.8/10** |
 
 ---
@@ -25,12 +25,12 @@
 | # | Recomendacao | Esforco | Estado | Data | Notas |
 |---|---|---|---|---|---|
 | 1 | App Insights Ingestion + Health Check Path | Minutos | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs` criado. `healthCheckPath=/health`. |
-| 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | ❌ PENDENTE | — | **CRITICO** — maior risco tecnico. `asyncio.Lock()` em ConversationStore, file loading, HTTP client. |
+| 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | 🔄 CODEX | 2026-03-07 | **CRITICO** — instrucoes Codex escritas em `CODEX-CONCURRENCY-LOCKS.md`. 5 tasks, 17 race conditions identificadas. |
 | 3 | VNet + Entra ID | Depende DSI | ❌ PENDENTE | — | Dependente da DSI do banco. SCM restringido como medida interina (2026-03-07). |
 | 4 | Desactivar FTPS + Restringir SCM | Minutos | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`, SCM `DenyAll 0.0.0.0/0`. |
 | 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
 | 6 | Cleanup de Recursos Orfaos | Horas | ❌ PENDENTE | — | bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot, deployment gpt-4o. |
-| 7 | Dependency Scanning no CI | Horas | ❌ PENDENTE | — | `pip audit` + `npm audit` no GitHub Actions. |
+| 7 | Dependency Scanning no CI | Horas | ✅ FEITO | 2026-03-07 | `pip-audit` + `npm audit --audit-level=high` no GitHub Actions CI. Commit `4677fc3`. |
 | 8 | Proteger Secrets nos Logs (W7) | 1 dia | ❌ PENDENTE | — | Filtrar headers Authorization. Parcialmente mitigado por Key Vault. |
 | 9 | Refactoring Frontend (Fase 1) | 1-2 semanas | ❌ PENDENTE | — | App.jsx 1,872 linhas. Nao bloqueante. |
 | 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ❌ PENDENTE | — | gpt-5.3-chat deployado mas nao configurado como tier. |
@@ -41,7 +41,7 @@
 
 | ID | Fraqueza | Severidade | Estado | Data | Notas |
 |---|---|---|---|---|---|
-| W1 | Concorrencia nao thread-safe | CRITICO | ❌ PENDENTE | — | ConversationStore, file loading, HTTP client, generated files. = Rec 2. |
+| W1 | Concorrencia nao thread-safe | CRITICO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. 17 race conditions mapeadas. = Rec 2. |
 | W2 | Frontend monolitico | MEDIO | ❌ PENDENTE | — | App.jsx 1,872 linhas, 50+ estados, sem TypeScript. = Rec 9. |
 | W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
@@ -63,7 +63,7 @@
 | T1 | Dados bancarios confidenciais | ALTO | PII Shield Phase 1+2 | ✅ MITIGADO | Regex pre-mask, Azure AI Language, tool masking, blob PII, Brave query masking, audit logs. Risco residual: threshold 0.7, comportamento utilizadores. |
 | T2 | Exposicao publica de servicos | ALTO | VNet + Private Endpoints | ❌ PENDENTE | Depende DSI. SCM restringido como interino. = Rec 3. |
 | T3 | Dependencia servicos Azure | MEDIO | DR plan + fallback | ⚠️ PARCIAL | Fallback Claude Opus/Sonnet activo para LLM. AI Search e Storage sem fallback. |
-| T4 | Supply chain / dependencias | MEDIO | CI scanning | ❌ PENDENTE | Sem `pip audit` / `npm audit`. = Rec 7. |
+| T4 | Supply chain / dependencias | MEDIO | CI scanning | ✅ MITIGADO | `pip-audit` + `npm audit` adicionados ao CI. = Rec 7. |
 | T5 | Escalabilidade limitada | BAIXO | Scale-out architecture | ❌ PENDENTE | ConversationStore in-memory, 1 worker. Autoscale configurado mas sem externalizacao de estado. |
 | T6 | Regulacao bancaria | MEDIO | Compliance docs | ⚠️ PARCIAL | Data Policy documentada. Sem classificacao automatica de documentos. |
 | T7 | Expiracao credenciais | MEDIO | Alertas proactivos | ❌ PENDENTE | Sem alertas de expiracao de PATs/keys. |
@@ -98,17 +98,19 @@
 | Token quotas restauradas | 2026-03-07 | Fast 500K/5M, Standard 200K/2M, Pro 100K/1M (anteriormente 0,0 = ilimitado). |
 | Model tiers configurados | 2026-03-07 | gpt-4.1 (fast), gpt-5-mini (standard), Claude Opus 4.6 (pro). |
 | Log Analytics workspace criado | 2026-03-07 | `dbde-ai-logs` em Sweden Central, 90 dias retencao. Workspace anterior (DefaultResourceGroup-SEC) estava orfao. |
+| Dependency scanning CI | 2026-03-07 | `pip-audit` (Python) + `npm audit --audit-level=high` (frontend) adicionados ao GitHub Actions. Commit `4677fc3`. |
+| Codex instructions: concurrency locks | 2026-03-07 | `CODEX-CONCURRENCY-LOCKS.md` — 5 tasks, 17 race conditions mapeadas. Pronto para execucao Codex. |
 
 ---
 
 ## Proximos Passos Recomendados (por prioridade)
 
 ### Prioridade 1 — Quick wins (horas)
-- [ ] **Rec 7**: Adicionar `pip audit` + `npm audit` ao CI
+- [x] **Rec 7**: Adicionar `pip audit` + `npm audit` ao CI ✅
 - [ ] **Rec 6**: Verificar e remover recursos orfaos (bing_chatbot, Logic App, CosmosDB, DBDE-Chatbot)
 
 ### Prioridade 2 — Alto impacto (dias)
-- [ ] **Rec 2 / W1**: Locks de concorrencia — **CRITICO**
+- [ ] **Rec 2 / W1**: Locks de concorrencia — **CRITICO** (instrucoes Codex prontas)
 - [ ] **Rec 8 / W7**: Filtrar secrets nos logs
 
 ### Prioridade 3 — Medio impacto (dias)
