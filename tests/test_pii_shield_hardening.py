@@ -1,5 +1,7 @@
 """Tests for PII Shield Phase 1 hardening."""
 
+import asyncio
+
 import pytest
 
 import pii_shield
@@ -10,6 +12,24 @@ from pii_shield import (
     _resolve_overlapping_entities,
     mask_pii,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_pii_http_client():
+    pii_shield._http_client = None
+    yield
+    client = pii_shield._http_client
+    pii_shield._http_client = None
+    if client is None or getattr(client, "is_closed", True):
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop and running_loop.is_running():
+        running_loop.create_task(client.aclose())
+    else:
+        asyncio.run(client.aclose())
 
 
 class TestRegexPreFilter:
@@ -165,21 +185,19 @@ class TestMaskPiiIntegration:
     async def test_mask_pii_keeps_regex_mask_when_azure_fails(self, monkeypatch):
         class _FailingClient:
             def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
+                self.is_closed = False
 
             async def post(self, *args, **kwargs):
                 raise pii_shield.httpx.TimeoutException("timeout")
+
+            async def aclose(self):
+                self.is_closed = True
 
         monkeypatch.setattr(pii_shield, "PII_ENABLED", True)
         monkeypatch.setattr(pii_shield, "PII_ENDPOINT", "https://pii.example.test")
         monkeypatch.setattr(pii_shield, "PII_API_KEY", "test-key")
         monkeypatch.setattr(pii_shield.httpx, "AsyncClient", _FailingClient)
+        monkeypatch.setattr(pii_shield, "_http_client", None)
 
         ctx = PIIMaskingContext()
         result = await mask_pii("IBAN: PT50000201231234567890154", ctx)
@@ -214,21 +232,19 @@ class TestMaskPiiIntegration:
 
         class _Client:
             def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
+                self.is_closed = False
 
             async def post(self, *args, **kwargs):
                 return _Response()
+
+            async def aclose(self):
+                self.is_closed = True
 
         monkeypatch.setattr(pii_shield, "PII_ENABLED", True)
         monkeypatch.setattr(pii_shield, "PII_ENDPOINT", "https://pii.example.test")
         monkeypatch.setattr(pii_shield, "PII_API_KEY", "test-key")
         monkeypatch.setattr(pii_shield.httpx, "AsyncClient", _Client)
+        monkeypatch.setattr(pii_shield, "_http_client", None)
 
         ctx = PIIMaskingContext()
         result = await mask_pii("NIF: 123456789", ctx)
@@ -236,3 +252,89 @@ class TestMaskPiiIntegration:
         assert result == "NIF: [NIF_1]"
         assert len(ctx.mappings) == 1
         assert ctx.unmask(result) == "NIF: 123456789"
+
+
+class TestPhase2:
+    """Tests for PII Shield Phase 2 hardening."""
+
+    @pytest.mark.asyncio
+    async def test_mask_messages_masks_tool_role(self, monkeypatch):
+        monkeypatch.setattr(pii_shield, "PII_ENABLED", True)
+        monkeypatch.setattr(pii_shield, "PII_ENDPOINT", "")
+        monkeypatch.setattr(pii_shield, "PII_API_KEY", "")
+
+        ctx = PIIMaskingContext()
+        messages = [
+            {"role": "user", "content": "Procura o NIF 123456789"},
+            {"role": "assistant", "content": "Vou procurar."},
+            {"role": "tool", "tool_call_id": "tc1", "content": '{"result": "NIF encontrado: 123456789"}'},
+        ]
+
+        from pii_shield import mask_messages
+
+        result = await mask_messages(messages, ctx)
+
+        assert "123456789" not in result[0]["content"]
+        assert result[1]["content"] == "Vou procurar."
+        assert "123456789" not in result[2]["content"]
+        assert result[2]["tool_call_id"] == "tc1"
+        assert "123456789" in ctx.unmask(result[2]["content"])
+
+    @pytest.mark.asyncio
+    async def test_mask_messages_skips_system_and_assistant(self, monkeypatch):
+        monkeypatch.setattr(pii_shield, "PII_ENABLED", True)
+        monkeypatch.setattr(pii_shield, "PII_ENDPOINT", "")
+        monkeypatch.setattr(pii_shield, "PII_API_KEY", "")
+
+        ctx = PIIMaskingContext()
+        messages = [
+            {"role": "system", "content": "NIF do admin: 123456789"},
+            {"role": "assistant", "content": "O NIF é 123456789"},
+        ]
+
+        from pii_shield import mask_messages
+
+        result = await mask_messages(messages, ctx)
+
+        assert result[0]["content"] == "NIF do admin: 123456789"
+        assert result[1]["content"] == "O NIF é 123456789"
+        assert len(ctx.mappings) == 0
+
+    def test_regex_pre_mask_strips_nif_from_query(self):
+        ctx = PIIMaskingContext()
+        result = _regex_pre_mask("pesquisa o NIF 123456789 no google", ctx)
+        assert "123456789" not in result
+        assert len(ctx.mappings) == 1
+
+    def test_regex_pre_mask_strips_iban_from_query(self):
+        ctx = PIIMaskingContext()
+        result = _regex_pre_mask("procura IBAN PT50000201231234567890154", ctx)
+        assert "PT50" not in result
+        assert len(ctx.mappings) == 1
+
+    def test_shared_http_client_creation(self):
+        from pii_shield import _get_http_client, close_http_client
+
+        client = _get_http_client()
+        assert client is not None
+        assert not client.is_closed
+
+        client2 = _get_http_client()
+        assert client is client2
+
+        asyncio.run(close_http_client())
+
+    @pytest.mark.asyncio
+    async def test_audit_log_emitted_on_regex_masking(self, monkeypatch, caplog):
+        monkeypatch.setattr(pii_shield, "PII_ENABLED", True)
+        monkeypatch.setattr(pii_shield, "PII_ENDPOINT", "")
+        monkeypatch.setattr(pii_shield, "PII_API_KEY", "")
+
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="pii_shield"):
+            ctx = PIIMaskingContext()
+            await mask_pii("NIF: 123456789", ctx)
+
+        assert any("pii_shield_audit" in record.message for record in caplog.records)
+        assert all("123456789" not in record.message for record in caplog.records)

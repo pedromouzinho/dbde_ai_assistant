@@ -127,6 +127,7 @@ from http_helpers import devops_request_with_retry as _devops_request_with_retry
 from tools_knowledge import _close_http_client as _close_knowledge_client
 from tools_figma import _close_http_client as _close_figma_client
 from tools_miro import _close_http_client as _close_miro_client
+from pii_shield import close_http_client as _close_pii_http_client
 from tool_registry import get_registered_tool_names
 from learning import invalidate_prompt_rules_cache
 from agent import (
@@ -1110,6 +1111,7 @@ async def shutdown_event():
         _inline_export_worker_task = None
     if http_client:
         await http_client.aclose()
+    await _close_pii_http_client()
     await _close_knowledge_client()
     await _close_figma_client()
     await _close_miro_client()

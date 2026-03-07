@@ -20,7 +20,7 @@ from collections.abc import MutableMapping
 from config import (
     AGENT_MAX_ITERATIONS, AGENT_MAX_TOKENS, AGENT_TEMPERATURE,
     AGENT_HISTORY_LIMIT, LLM_DEFAULT_TIER, UPLOAD_MAX_IMAGES_PER_MESSAGE,
-    UPLOAD_INDEX_TOP, DEVOPS_AREAS, CHAT_TOOLRESULT_BLOB_CONTAINER,
+    UPLOAD_INDEX_TOP, DEVOPS_AREAS, CHAT_TOOLRESULT_BLOB_CONTAINER, PII_ENABLED,
 )
 from models import (
     AgentChatRequest, AgentChatResponse, LLMToolCall,
@@ -52,6 +52,7 @@ from storage import (
     parse_blob_ref,
 )
 from utils import odata_escape
+from pii_shield import PIIMaskingContext, mask_pii
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -1357,7 +1358,24 @@ async def _execute_tool_calls(
             safe_tool = _safe_blob_component(tc.name, 40)
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             blob_name = f"{safe_user}/{safe_conv}/{ts}_{safe_tool}_{_safe_blob_component(tc.id, 60)}.json"
-            uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, tool_result)
+
+            blob_payload = tool_result
+            if PII_ENABLED:
+                try:
+                    blob_ctx = PIIMaskingContext()
+                    serialized = json.dumps(tool_result, ensure_ascii=False, default=str)
+                    masked_serialized = await mask_pii(serialized, blob_ctx)
+                    try:
+                        blob_payload = json.loads(masked_serialized)
+                    except json.JSONDecodeError:
+                        # Placeholders can turn numeric JSON scalars into strings;
+                        # keep a masked serialized fallback rather than leaking PII.
+                        blob_payload = {"masked_content": masked_serialized}
+                except Exception as mask_err:
+                    logger.warning("[Agent] PII masking for blob failed (%s): %s", tc.name, mask_err)
+                    blob_payload = tool_result
+
+            uploaded = await blob_upload_json(CHAT_TOOLRESULT_BLOB_CONTAINER, blob_name, blob_payload)
             result_blob_ref = str(uploaded.get("blob_ref", "") or "")
         except Exception as e:
             logger.warning("[Agent] tool result blob persist failed (%s): %s", tc.name, e)
