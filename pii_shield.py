@@ -5,6 +5,7 @@ Usa Azure AI Language (Text Analytics) PII Detection.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Dict, List, Any
@@ -91,6 +92,25 @@ _PRIORITY_CATEGORIES = {
     "EUTaxIdentificationNumber",
 }
 
+_CATEGORY_LABELS = {
+    "Person": "NOME",
+    "PersonType": "TIPO_PESSOA",
+    "PhoneNumber": "TELEFONE",
+    "Address": "MORADA",
+    "Email": "EMAIL",
+    "PTTaxIdentificationNumber": "NIF",
+    "InternationalBankingAccountNumber": "IBAN",
+    "CreditCardNumber": "CARTAO",
+    "SWIFTCode": "SWIFT",
+    "EUPassportNumber": "PASSAPORTE",
+    "EUSocialSecurityNumber": "NISS",
+    "EUDriversLicenseNumber": "CARTA_CONDUCAO",
+}
+
+_LABEL_TO_CATEGORY = {label: category for category, label in _CATEGORY_LABELS.items()}
+
+_http_client: httpx.AsyncClient | None = None
+
 
 class PIIMaskingContext:
     """Guarda o mapeamento mask -> valor real para desmascarar depois."""
@@ -128,21 +148,25 @@ class PIIMaskingContext:
 
 def _category_to_label(category: str) -> str:
     """Converte categoria Azure PII para label legível."""
-    labels = {
-        "Person": "NOME",
-        "PersonType": "TIPO_PESSOA",
-        "PhoneNumber": "TELEFONE",
-        "Address": "MORADA",
-        "Email": "EMAIL",
-        "PTTaxIdentificationNumber": "NIF",
-        "InternationalBankingAccountNumber": "IBAN",
-        "CreditCardNumber": "CARTAO",
-        "SWIFTCode": "SWIFT",
-        "EUPassportNumber": "PASSAPORTE",
-        "EUSocialSecurityNumber": "NISS",
-        "EUDriversLicenseNumber": "CARTA_CONDUCAO",
-    }
-    return labels.get(category, category.upper())
+    return _CATEGORY_LABELS.get(category, category.upper())
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _http_client
+
+
+async def close_http_client() -> None:
+    """Fecha o cliente HTTP partilhado do PII Shield."""
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 def _regex_pre_mask(text: str, context: PIIMaskingContext) -> str:
@@ -235,20 +259,70 @@ def _span_overlaps_placeholders(offset: int, length: int, placeholder_spans: lis
     return False
 
 
+def _new_placeholder_keys(previous_keys: set[str], context: PIIMaskingContext) -> list[str]:
+    return [placeholder for placeholder in context.mappings.keys() if placeholder not in previous_keys]
+
+
+def _categories_from_placeholders(placeholders: list[str]) -> list[str]:
+    categories = set()
+    for placeholder in placeholders:
+        label = placeholder.strip("[]").rsplit("_", 1)[0]
+        categories.add(_LABEL_TO_CATEGORY.get(label, label))
+    return sorted(categories)
+
+
+def _log_pii_audit(
+    *,
+    regex_masked: int,
+    azure_masked: int,
+    categories: list[str] | set[str],
+    azure_used: bool,
+    text_length: int,
+) -> None:
+    if regex_masked <= 0 and azure_masked <= 0:
+        return
+
+    audit = {
+        "event": "pii_shield_audit",
+        "regex_masked": regex_masked,
+        "azure_masked": azure_masked,
+        "categories": sorted({str(category) for category in categories if category}),
+        "azure_used": azure_used,
+        "text_length": text_length,
+    }
+    logger.info("[PIIShieldAudit] %s", json.dumps(audit, ensure_ascii=False))
+
+
 async def mask_pii(text: str, context: PIIMaskingContext) -> str:
     """
     Envia texto ao Azure AI Language PII Detection.
     Devolve texto com PII mascarado e popula o context com os mappings.
     """
-    if not PII_ENABLED or not PII_ENDPOINT or not PII_API_KEY:
-        if PII_ENABLED:
-            return _regex_pre_mask(text, context)
-        return text
-
     if not text or len(text.strip()) < 3:
         return text
 
+    if not PII_ENABLED:
+        return text
+
+    original_text_length = len(text)
+    initial_placeholders = set(context.mappings.keys())
+
+    if not PII_ENDPOINT or not PII_API_KEY:
+        result = _regex_pre_mask(text, context)
+        regex_placeholders = _new_placeholder_keys(initial_placeholders, context)
+        _log_pii_audit(
+            regex_masked=len(regex_placeholders),
+            azure_masked=0,
+            categories=_categories_from_placeholders(regex_placeholders),
+            azure_used=False,
+            text_length=original_text_length,
+        )
+        return result
+
     text = _regex_pre_mask(text, context)
+    regex_placeholders = _new_placeholder_keys(initial_placeholders, context)
+    regex_count = len(regex_placeholders)
+    regex_categories = _categories_from_placeholders(regex_placeholders)
     placeholder_spans = [match.span() for match in _PLACEHOLDER_PATTERN.finditer(text)]
 
     try:
@@ -267,21 +341,28 @@ async def mask_pii(text: str, context: PIIMaskingContext) -> str:
             },
         }
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={
-                    "Ocp-Apim-Subscription-Key": PII_API_KEY,
-                    "Content-Type": "application/json",
-                },
-            )
-            resp.raise_for_status()
+        client = _get_http_client()
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={
+                "Ocp-Apim-Subscription-Key": PII_API_KEY,
+                "Content-Type": "application/json",
+            },
+        )
+        resp.raise_for_status()
 
         result = resp.json()
         doc = (result.get("results", {}).get("documents") or [{}])[0]
         entities = doc.get("entities", [])
         if not entities:
+            _log_pii_audit(
+                regex_masked=regex_count,
+                azure_masked=0,
+                categories=regex_categories,
+                azure_used=True,
+                text_length=original_text_length,
+            )
             return text
 
         filtered_entities: list[dict] = []
@@ -300,6 +381,13 @@ async def mask_pii(text: str, context: PIIMaskingContext) -> str:
             filtered_entities.append(entity)
 
         if not filtered_entities:
+            _log_pii_audit(
+                regex_masked=regex_count,
+                azure_masked=0,
+                categories=regex_categories,
+                azure_used=True,
+                text_length=original_text_length,
+            )
             return text
 
         entities = _resolve_overlapping_entities(filtered_entities)
@@ -307,6 +395,7 @@ async def mask_pii(text: str, context: PIIMaskingContext) -> str:
 
         masked = text
         masked_count = 0
+        azure_categories: set[str] = set()
         for entity in entities:
             offset = int(entity.get("offset", 0))
             length = int(entity.get("length", 0))
@@ -315,19 +404,35 @@ async def mask_pii(text: str, context: PIIMaskingContext) -> str:
             placeholder = context.add_mapping(category, original)
             masked = masked[:offset] + placeholder + masked[offset + length :]
             masked_count += 1
+            azure_categories.add(category)
 
         logger.info("PII Shield: mascaradas %d entidades", masked_count)
+        _log_pii_audit(
+            regex_masked=regex_count,
+            azure_masked=masked_count,
+            categories=regex_categories + sorted(azure_categories),
+            azure_used=True,
+            text_length=original_text_length,
+        )
         return masked
     except Exception as e:
         logger.warning("PII Shield falhou na API Azure (mantida mascara local, se aplicada): %s", e)
+        _log_pii_audit(
+            regex_masked=regex_count,
+            azure_masked=0,
+            categories=regex_categories,
+            azure_used=False,
+            text_length=original_text_length,
+        )
         return text
 
 
 async def mask_messages(messages: List[dict], context: PIIMaskingContext) -> List[dict]:
-    """Mascara PII apenas em mensagens do utilizador."""
+    """Mascara PII em mensagens do utilizador e resultados de tools."""
     masked_messages: List[dict] = []
     for msg in messages:
-        if msg.get("role") != "user":
+        role = str(msg.get("role", "") or "")
+        if role not in ("user", "tool"):
             masked_messages.append(msg)
             continue
 
