@@ -7,6 +7,7 @@
 
 import json
 import asyncio
+import inspect
 import uuid
 import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
@@ -42,6 +43,12 @@ def _log(msg: str):
     entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg}
     _llm_debug_log.append(entry)
     logger.info("[LLM] %s", msg)
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _is_gpt5_family(deployment: str) -> bool:
@@ -328,7 +335,7 @@ class AzureOpenAIProvider(LLMProvider):
             body["response_format"] = response_format
         
         max_retries = 5
-        client = await self._get_client()
+        client = await _maybe_await(self._get_client())
         for attempt in range(max_retries):
             try:
                 resp = await client.post(
@@ -404,7 +411,7 @@ class AzureOpenAIProvider(LLMProvider):
             body["response_format"] = response_format
 
         # Streaming puro (sem tools) — stream token a token
-        client = await self._get_client()
+        client = await _maybe_await(self._get_client())
         async with client.stream(
             "POST", url, json=body,
             headers={"api-key": self.api_key, "Content-Type": "application/json"},
@@ -437,7 +444,7 @@ class AzureOpenAIProvider(LLMProvider):
             f"{self.endpoint}/openai/deployments/{EMBEDDING_DEPLOYMENT}"
             f"/embeddings?api-version={API_VERSION_OPENAI}"
         )
-        client = await self._get_client()
+        client = await _maybe_await(self._get_client())
         resp = await client.post(
             url, json={"input": text},
             headers={"api-key": self.api_key, "Content-Type": "application/json"},
@@ -508,7 +515,7 @@ class AnthropicProvider(LLMProvider):
             body["tool_choice"] = {"type": "auto"}
         
         max_retries = 5
-        client = await self._get_client()
+        client = await _maybe_await(self._get_client())
         for attempt in range(max_retries):
             try:
                 resp = await client.post(
@@ -565,7 +572,7 @@ class AnthropicProvider(LLMProvider):
         # Com tools e streaming no Anthropic, tool_use events vêm inline
         # Precisamos de reconstruir os tool calls a partir dos deltas
         
-        client = await self._get_client()
+        client = await _maybe_await(self._get_client())
         async with client.stream(
             "POST", self.api_url, json=body, headers=self._headers(),
         ) as resp:

@@ -396,12 +396,16 @@ def _get_uploaded_files_unlocked(conv_id: str) -> List[dict]:
     return list(_normalize_uploaded_files_entry_unlocked(conv_id).get("files", []))
 
 
+def _get_uploaded_files(conv_id: str) -> List[dict]:
+    return _get_uploaded_files_unlocked(conv_id)
+
+
 async def _normalize_uploaded_files_entry(conv_id: str) -> dict:
     async with _uploaded_files_lock:
         return _normalize_uploaded_files_entry_unlocked(conv_id)
 
 
-async def _get_uploaded_files(conv_id: str) -> List[dict]:
+async def _get_uploaded_files_async(conv_id: str) -> List[dict]:
     async with _uploaded_files_lock:
         return _get_uploaded_files_unlocked(conv_id)
 
@@ -527,7 +531,7 @@ async def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] 
     # Fallback: usar imagem previamente carregada via /upload nesta conversa.
     if not images and conv_id:
         uploaded_images = []
-        for file_data in await _get_uploaded_files(conv_id):
+        for file_data in await _get_uploaded_files_async(conv_id):
             upload_b64 = str(file_data.get("image_base64", "") or "").strip()
             if not upload_b64:
                 continue
@@ -565,7 +569,7 @@ async def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] 
 
 async def _inject_file_context(conv_id: str, messages: List[dict]):
     """Injeta contexto de ficheiros uploaded na conversa."""
-    files = await _get_uploaded_files(conv_id)
+    files = await _get_uploaded_files_async(conv_id)
     meta = await _get_conversation_meta(conv_id)
     if files and not meta.get("file_injected"):
         messages[:] = [
@@ -1024,20 +1028,42 @@ async def _run_forced_dual_hierarchy(
     return await _execute_tool_calls(forced_calls, conv_id, user_sub=user_sub)
 
 
-async def _has_tabular_uploads(conv_id: str) -> bool:
-    for file_data in await _get_uploaded_files(conv_id):
+def _has_tabular_uploads(conv_id: str) -> bool:
+    for file_data in _get_uploaded_files(conv_id):
         name = str(file_data.get("filename", "") or "").lower()
         if name.endswith((".csv", ".xlsx", ".xls")):
             return True
     return False
 
 
-async def _extract_forced_uploaded_table_calls(
+async def _has_tabular_uploads_async(conv_id: str) -> bool:
+    for file_data in await _get_uploaded_files_async(conv_id):
+        name = str(file_data.get("filename", "") or "").lower()
+        if name.endswith((".csv", ".xlsx", ".xls")):
+            return True
+    return False
+
+
+def _extract_forced_uploaded_table_calls(
     question: str,
     conv_id: str,
     already_used: Optional[List[str]] = None,
 ) -> List[LLMToolCall]:
-    if not await _has_tabular_uploads(conv_id):
+    if not _has_tabular_uploads(conv_id):
+        return []
+    # Modo agressivo: não forçar analyze_uploaded_table.
+    # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
+    # O fallback para analyze_uploaded_table é tratado no handler de run_code
+    # quando houver erro/timeout.
+    return []
+
+
+async def _extract_forced_uploaded_table_calls_async(
+    question: str,
+    conv_id: str,
+    already_used: Optional[List[str]] = None,
+) -> List[LLMToolCall]:
+    if not await _has_tabular_uploads_async(conv_id):
         return []
     # Modo agressivo: não forçar analyze_uploaded_table.
     # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
@@ -1202,7 +1228,7 @@ async def _execute_tool_calls(
             )
         )
         # --- Routing guardrail: CSV/Excel uploaded -> never query DevOps ---
-        files = await _get_uploaded_files(conv_id)
+        files = await _get_uploaded_files_async(conv_id)
         if files and tc.name in ("query_workitems", "search_workitems", "compute_kpi", "query_hierarchy"):
             _file_keywords = ("csv", "excel", "xlsx", "tabela", "ficheiro", "upload", "dados", "coluna",
                               "linha", "media", "soma", "total", "grafico", "chart", "analise", "analisa")
@@ -1568,7 +1594,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                     current_calls = list(response.tool_calls or [])
                     forced_uploaded_table = False
                     if not current_calls:
-                        forced_calls = await _extract_forced_uploaded_table_calls(
+                        forced_calls = await _extract_forced_uploaded_table_calls_async(
                             request.question,
                             conv_id,
                             already_used=tools_used,
@@ -1758,7 +1784,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 current_calls = list(response.tool_calls or [])
                 forced_uploaded_table = False
                 if not current_calls:
-                    forced_calls = await _extract_forced_uploaded_table_calls(
+                    forced_calls = await _extract_forced_uploaded_table_calls_async(
                         request.question,
                         conv_id,
                         already_used=tools_used,
