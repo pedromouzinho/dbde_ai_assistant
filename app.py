@@ -141,6 +141,13 @@ from agent import (
 from export_engine import to_csv, to_xlsx, to_pdf, to_svg_bar_chart, to_html_report
 from llm_provider import llm_simple, get_debug_log as get_llm_debug_log, close_all_providers
 from rate_limit_storage import TableStorageRateLimit
+from tabular_loader import (
+    TabularLoaderError,
+    get_tabular_upload_limit_bytes,
+    get_tabular_upload_limits,
+    is_tabular_filename,
+    load_tabular_preview,
+)
 from job_store import PersistentJobStore
 from utils import odata_escape, safe_blob_component, create_logged_task
 from tool_metrics import tool_metrics
@@ -1260,6 +1267,10 @@ async def _read_upload_with_limit(upload: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _max_upload_bytes_for_file(filename: str) -> int:
+    return int(get_tabular_upload_limit_bytes(filename, MAX_UPLOAD_FILE_BYTES))
+
+
 def _normalize_uploaded_conv_entry(conv_id: str) -> dict:
     current = uploaded_files_store.get(conv_id)
     if isinstance(current, dict) and isinstance(current.get("files"), list):
@@ -1748,7 +1759,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     ext = os.path.splitext(filename_lower)[1]
 
     allowed_extensions = {
-        ".xlsx", ".xls", ".csv", ".pdf", ".png", ".jpg", ".jpeg",
+        ".xlsx", ".xls", ".xlsb", ".csv", ".pdf", ".png", ".jpg", ".jpeg",
         ".gif", ".webp", ".bmp", ".pptx", ".svg", ".txt", ".md",
         ".json", ".xml", ".html", ".htm", ".log", ".tsv",
     }
@@ -1760,6 +1771,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
 
     magic_signatures = {
         ".xlsx": (b"PK\x03\x04",),
+        ".xlsb": (b"PK\x03\x04",),
         ".xls": (b"\xd0\xcf\x11\xe0",),
         ".pdf": (b"%PDF",),
         ".png": (b"\x89PNG",),
@@ -1778,29 +1790,17 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
                 f"Conteúdo do ficheiro não corresponde à extensão '{ext}'. Verifica o ficheiro e tenta novamente.",
             )
 
-    if filename_lower.endswith((".xlsx", ".xls")):
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        rows = list(wb.active.iter_rows(values_only=True))
-        if not rows:
-            raise HTTPException(400, "Excel vazio")
-        col_names = [str(c) if c else f"Col{i}" for i, c in enumerate(rows[0])]
-        row_count = len(rows) - 1
-        data_text = "\t".join(col_names) + "\n" + "\n".join(
-            "\t".join(str(c) if c is not None else "" for c in r) for r in rows[1:]
-        )
-        detected_delimiter = "\t"
-        wb.close()
-    elif filename_lower.endswith(".csv"):
-        text = content.decode("utf-8", errors="replace")
-        lines = [ln for ln in text.strip().split("\n") if ln.strip()]
-        if not lines:
-            raise HTTPException(400, "CSV vazio")
-        sep = "," if "," in lines[0] else ";"
-        col_names = [c.strip().strip('"') for c in lines[0].split(sep)]
-        row_count = len(lines) - 1
-        data_text = text
-        detected_delimiter = sep
+    if is_tabular_filename(filename_lower):
+        try:
+            preview = load_tabular_preview(content, filename_lower)
+        except TabularLoaderError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        col_names = list(preview.get("columns") or [])
+        row_count = int(preview.get("row_count", 0) or 0)
+        data_text = str(preview.get("data_text", "") or "")
+        detected_delimiter = str(preview.get("delimiter", "\t") or "\t")
+        col_analysis = list(preview.get("col_analysis") or [])
+        truncated = bool(preview.get("truncated", False))
     elif filename_lower.endswith(".pdf"):
         used_doc_intel = False
         if DOC_INTEL_ENABLED:
@@ -1936,27 +1936,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         store_entry["chunks"] = semantic_chunks
     if doc_intel_meta:
         store_entry["document_intelligence"] = doc_intel_meta
-    if filename_lower.endswith((".xlsx", ".xls", ".csv")):
-        sample_lines = data_text.split("\n")[1:11]
-        for ci, cname in enumerate(col_names):
-            vals = []
-            for sl in sample_lines:
-                parts = sl.split(detected_delimiter)
-                if ci < len(parts):
-                    v = parts[ci].strip().strip('"')
-                    if v:
-                        vals.append(v)
-            numeric_count = sum(
-                1 for v in vals if v.replace(".", "").replace("-", "").replace(",", "").isdigit()
-            )
-            is_numeric = numeric_count > len(vals) * 0.6 and len(vals) > 0
-            col_analysis.append(
-                {
-                    "name": cname,
-                    "type": "numeric" if is_numeric else "text",
-                    "sample": vals[:5],
-                }
-            )
+    if is_tabular_filename(filename_lower):
         store_entry["col_analysis"] = col_analysis
 
     response_payload = {
@@ -2367,8 +2347,9 @@ async def upload_files_async_batch(
     batch_total_bytes = 0
     for uf in files_to_queue:
         filename = uf.filename or "unknown"
+        max_bytes = _max_upload_bytes_for_file(filename)
         try:
-            content = await _read_upload_with_limit(uf, MAX_UPLOAD_FILE_BYTES)
+            content = await _read_upload_with_limit(uf, max_bytes)
         except HTTPException as exc:
             skipped.append(
                 {
@@ -3281,6 +3262,7 @@ def _build_admin_info_payload() -> dict:
             "max_files_per_conversation": MAX_FILES_PER_CONVERSATION,
             "max_images_per_message": UPLOAD_MAX_IMAGES_PER_MESSAGE,
             "max_file_bytes": MAX_UPLOAD_FILE_BYTES,
+            "max_file_bytes_by_extension": get_tabular_upload_limits(),
             "max_batch_total_bytes": UPLOAD_MAX_BATCH_TOTAL_BYTES,
             "max_concurrent_jobs": MAX_CONCURRENT_UPLOAD_JOBS,
             "max_pending_jobs_per_user": UPLOAD_MAX_PENDING_JOBS_PER_USER,

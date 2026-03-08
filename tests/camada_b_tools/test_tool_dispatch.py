@@ -24,6 +24,7 @@ EXPECTED_TOOLS = [
     "create_workitem",
     "refine_workitem",
     "generate_chart",
+    "chart_uploaded_table",
     "run_code",
     "generate_file",
 ]
