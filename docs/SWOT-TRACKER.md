@@ -28,12 +28,12 @@
 | 2 | Locks de Concorrencia no Backend (W1) | 2-3 dias | ✅ FEITO | 2026-03-07 | **CRITICO** resolvido. 17 race conditions corrigidas. PR #5 merged. 12 tests novos. |
 | 3 | VNet + Entra ID | Depende DSI | ❌ PENDENTE | — | Dependente da DSI do banco. SCM restringido como medida interina (2026-03-07). |
 | 4 | Desactivar FTPS + Restringir SCM | Minutos | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`, SCM `DenyAll 0.0.0.0/0`. |
-| 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
+| 5 | Upgrade AI Search para Basic | 1 dia | ⏸️ ADIADO | — | Tier Free suficiente para uso actual. Reavaliar quando necessario. |
 | 6 | Cleanup de Recursos Orfaos | Horas | ⚠️ PARCIAL | 2026-03-07 | bing_chatbot, Logic App, DBDE-Chatbot apagados. Restam: CosmosDB (`cosmosdbrgmsaccesschabot84949c`), deployment gpt-4o (`dbde_access_chatbot`). |
 | 7 | Dependency Scanning no CI | Horas | ✅ FEITO | 2026-03-07 | `pip-audit` + `npm audit --audit-level=high` no GitHub Actions CI. Commit `4677fc3`. |
 | 8 | Proteger Secrets nos Logs (W7) | 1 dia | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. |
 | 9 | Refactoring Frontend (Fase 1) | 1-2 semanas | ❌ PENDENTE | — | App.jsx 1,872 linhas. Nao bloqueante. |
-| 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ❌ PENDENTE | — | gpt-5.3-chat deployado mas nao configurado como tier. |
+| 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ⏸️ ADIADO | — | Modelos nao certificados para dados confidenciais bancarios. Reavaliar quando houver compliance. |
 
 ---
 
@@ -45,7 +45,7 @@
 | W2 | Frontend monolitico | MEDIO | ❌ PENDENTE | — | App.jsx 1,872 linhas, 50+ estados, sem TypeScript. = Rec 9. |
 | W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
-| W5 | AI Search no tier Free | MEDIO | ❌ PENDENTE | — | Sem SLA, 50MB storage, 3 indices. = Rec 5. |
+| W5 | AI Search no tier Free | MEDIO | ⏸️ ADIADO | — | Tier Free suficiente para uso actual. Reavaliar quando necessario. = Rec 5. |
 | W6 | Sem token blacklist / refresh | MEDIO | ❌ PENDENTE | — | Tokens validos 10h apos logout. Sem rate limiting em auth. |
 | W7 | Logging pode expor secrets | ALTO | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. = Rec 8. |
 | W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
@@ -79,8 +79,8 @@
 | O1 | VNet + Entra ID | ❌ PENDENTE | Depende DSI. = Rec 3. |
 | O2 | App Insights + telemetria custom | ⚠️ PARCIAL | Ingestao activada. Custom metrics (latencia, tokens) ainda por implementar. = Rec 1. |
 | O3 | Refactoring frontend | ❌ PENDENTE | = Rec 9. |
-| O4 | Upgrade AI Search | ❌ PENDENTE | = Rec 5. |
-| O5 | Optimizacao modelos (gpt-5.3, Router) | ⚠️ PARCIAL | Tiers configurados (gpt-4.1/gpt-5-mini/Claude Opus). gpt-5.3-chat + Model Router por testar. = Rec 10. |
+| O4 | Upgrade AI Search | ⏸️ ADIADO | Tier Free suficiente. = Rec 5. |
+| O5 | Optimizacao modelos (gpt-5.3, Router) | ⏸️ ADIADO | Tiers configurados (gpt-4.1/gpt-5-mini/Claude Opus). gpt-5.3-chat + Model Router adiados — nao certificados para dados confidenciais. = Rec 10. |
 | O6 | Code Interpreter hardening | ✅ FEITO | PATH minimal, resource limits, symlink validation, AST hardening. PR #6 merged. = W10. |
 | O7 | Cleanup recursos orfaos | ❌ PENDENTE | = Rec 6. |
 | O8 | Health Check Path | ✅ FEITO | `healthCheckPath=/health`. = Rec 1. |
@@ -116,8 +116,8 @@
 - [x] **Rec 8 / W7**: Filtrar secrets nos logs ✅ PR #6 merged
 
 ### Prioridade 3 — Medio impacto (dias)
-- [ ] **Rec 5 / W5**: Upgrade AI Search para Basic
-- [ ] **Rec 10 / O5**: Testar gpt-5.3-chat + Model Router
+- [ ] ~~**Rec 5 / W5**: Upgrade AI Search para Basic~~ ⏸️ ADIADO — Free suficiente
+- [ ] ~~**Rec 10 / O5**: Testar gpt-5.3-chat + Model Router~~ ⏸️ ADIADO — nao certificados para dados confidenciais
 - [ ] **W6**: Token blacklist + rate limiting em auth
 - [x] **W10**: Code Interpreter hardening (PATH, CPU/mem, symlinks) ✅ PR #6 merged
 
