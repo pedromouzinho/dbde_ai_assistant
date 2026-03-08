@@ -1,7 +1,7 @@
 # DBDE AI Assistant — SWOT Tracker
 
 **Criado**: 2026-03-07
-**Ultima actualizacao**: 2026-03-07
+**Ultima actualizacao**: 2026-03-08
 **Baseado em**: [DBDE-SWOT-Analysis-Marco2026.md](./DBDE-SWOT-Analysis-Marco2026.md)
 **Risk Score inicial**: 5.2/10 → Revisto para 4.4/10 (apos auditoria Azure)
 
@@ -12,11 +12,11 @@
 | Metrica | Valor |
 |---|---|
 | Total de itens identificados | 40 |
-| Concluidos | 15 |
+| Concluidos | 17 |
 | Em progresso | 0 |
-| Pendentes | 25 |
-| **Progresso** | **37%** |
-| **Risk Score actual estimado** | **~3.2/10** |
+| Pendentes | 23 |
+| **Progresso** | **42%** |
+| **Risk Score actual estimado** | **~2.8/10** |
 
 ---
 
@@ -31,7 +31,7 @@
 | 5 | Upgrade AI Search para Basic | 1 dia | ❌ PENDENTE | — | Tier Free sem SLA. Requer re-indexacao apos upgrade. |
 | 6 | Cleanup de Recursos Orfaos | Horas | ⚠️ PARCIAL | 2026-03-07 | bing_chatbot, Logic App, DBDE-Chatbot apagados. Restam: CosmosDB (`cosmosdbrgmsaccesschabot84949c`), deployment gpt-4o (`dbde_access_chatbot`). |
 | 7 | Dependency Scanning no CI | Horas | ✅ FEITO | 2026-03-07 | `pip-audit` + `npm audit --audit-level=high` no GitHub Actions CI. Commit `4677fc3`. |
-| 8 | Proteger Secrets nos Logs (W7) | 1 dia | 🔄 CODEX | 2026-03-07 | Instrucoes Codex em `CODEX-SECURITY-HARDENING.md`. 14 pontos de logging identificados. |
+| 8 | Proteger Secrets nos Logs (W7) | 1 dia | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. |
 | 9 | Refactoring Frontend (Fase 1) | 1-2 semanas | ❌ PENDENTE | — | App.jsx 1,872 linhas. Nao bloqueante. |
 | 10 | Testar Model Router + gpt-5.3-chat | 1-2 dias | ❌ PENDENTE | — | gpt-5.3-chat deployado mas nao configurado como tier. |
 
@@ -47,10 +47,10 @@
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
 | W5 | AI Search no tier Free | MEDIO | ❌ PENDENTE | — | Sem SLA, 50MB storage, 3 indices. = Rec 5. |
 | W6 | Sem token blacklist / refresh | MEDIO | ❌ PENDENTE | — | Tokens validos 10h apos logout. Sem rate limiting em auth. |
-| W7 | Logging pode expor secrets | ALTO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. 14 pontos em 6 ficheiros. = Rec 8. |
+| W7 | Logging pode expor secrets | ALTO | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. = Rec 8. |
 | W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
 | W9 | Recursos potencialmente orfaos | BAIXO | ⚠️ PARCIAL | 2026-03-07 | 3/5 apagados. Restam CosmosDB + deployment gpt-4o. = Rec 6. |
-| W10 | Code Interpreter gaps hardening | MEDIO | 🔄 CODEX | 2026-03-07 | Instrucoes Codex prontas. PATH, resource limits, symlinks, AST hardening. |
+| W10 | Code Interpreter gaps hardening | MEDIO | ✅ FEITO | 2026-03-08 | PATH minimal, resource limits (CPU 120s, mem 512MB), symlink validation, AST import+getattr blocking. PR #6 merged. |
 | W11 | FTPS deveria estar Disabled | BAIXO | ✅ FEITO | 2026-03-07 | `ftpsState=Disabled`. = Rec 4. |
 | W12 | SCM site sem restricoes IP | MEDIO | ✅ FEITO | 2026-03-07 | `DenyAll 0.0.0.0/0` no SCM. = Rec 4. |
 
@@ -67,7 +67,7 @@
 | T5 | Escalabilidade limitada | BAIXO | Scale-out architecture | ❌ PENDENTE | ConversationStore in-memory, 1 worker. Autoscale configurado mas sem externalizacao de estado. |
 | T6 | Regulacao bancaria | MEDIO | Compliance docs | ⚠️ PARCIAL | Data Policy documentada. Sem classificacao automatica de documentos. |
 | T7 | Expiracao credenciais | MEDIO | Alertas proactivos | ❌ PENDENTE | Sem alertas de expiracao de PATs/keys. |
-| T8 | Prompt injection avancado | MEDIO | Prompt Shield + hardening | ⚠️ PARCIAL | Prompt Shield activo. Code Interpreter AST checker tem edge cases. |
+| T8 | Prompt injection avancado | MEDIO | Prompt Shield + hardening | ⚠️ PARCIAL | Prompt Shield activo. AST checker melhorado (ImportFrom names, getattr/setattr/delattr blocking). Risco residual: prompt injection em linguagem natural. |
 | T9 | Vendor lock-in | BAIXO | Multi-provider | ⚠️ PARCIAL | Claude via Foundry como fallback. Restante stack = Azure. |
 
 ---
@@ -81,7 +81,7 @@
 | O3 | Refactoring frontend | ❌ PENDENTE | = Rec 9. |
 | O4 | Upgrade AI Search | ❌ PENDENTE | = Rec 5. |
 | O5 | Optimizacao modelos (gpt-5.3, Router) | ⚠️ PARCIAL | Tiers configurados (gpt-4.1/gpt-5-mini/Claude Opus). gpt-5.3-chat + Model Router por testar. = Rec 10. |
-| O6 | Code Interpreter hardening | ❌ PENDENTE | = W10. |
+| O6 | Code Interpreter hardening | ✅ FEITO | PATH minimal, resource limits, symlink validation, AST hardening. PR #6 merged. = W10. |
 | O7 | Cleanup recursos orfaos | ❌ PENDENTE | = Rec 6. |
 | O8 | Health Check Path | ✅ FEITO | `healthCheckPath=/health`. = Rec 1. |
 | O9 | Export e reporting avancado | ❌ PENDENTE | Confluence/SharePoint export, templates por equipa. |
@@ -100,6 +100,8 @@
 | Log Analytics workspace criado | 2026-03-07 | `dbde-ai-logs` em Sweden Central, 90 dias retencao. Workspace anterior (DefaultResourceGroup-SEC) estava orfao. |
 | Dependency scanning CI | 2026-03-07 | `pip-audit` (Python) + `npm audit --audit-level=high` (frontend) adicionados ao GitHub Actions. Commit `4677fc3`. |
 | Concurrency locks implementation | 2026-03-07 | 17 race conditions corrigidas em agent.py + llm_provider.py. 12 tests novos. PR #5 merged. |
+| Security hardening — secrets in logs | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. 15 tests novos. PR #6 merged. |
+| Code Interpreter hardening | 2026-03-08 | PATH minimal, `resource.setrlimit()` CPU/mem, symlink validation, AST ImportFrom + getattr/setattr/delattr blocking. PR #6 merged. |
 
 ---
 
@@ -111,13 +113,13 @@
 
 ### Prioridade 2 — Alto impacto (dias)
 - [x] **Rec 2 / W1**: Locks de concorrencia — **CRITICO** ✅ PR #5 merged
-- [ ] **Rec 8 / W7**: Filtrar secrets nos logs
+- [x] **Rec 8 / W7**: Filtrar secrets nos logs ✅ PR #6 merged
 
 ### Prioridade 3 — Medio impacto (dias)
 - [ ] **Rec 5 / W5**: Upgrade AI Search para Basic
 - [ ] **Rec 10 / O5**: Testar gpt-5.3-chat + Model Router
 - [ ] **W6**: Token blacklist + rate limiting em auth
-- [ ] **W10**: Code Interpreter hardening (PATH, CPU/mem, symlinks)
+- [x] **W10**: Code Interpreter hardening (PATH, CPU/mem, symlinks) ✅ PR #6 merged
 
 ### Prioridade 4 — Esforco significativo (semanas)
 - [ ] **Rec 9 / W2**: Refactoring frontend
@@ -128,5 +130,5 @@
 
 ---
 
-*Tracker gerado em 2026-03-07 via Claude Code.*
+*Tracker actualizado em 2026-03-08 via Claude Code.*
 *Projecto: DBDE AI Assistant v7.3.0 — Millennium BCP (uso interno)*
