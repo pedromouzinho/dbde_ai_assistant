@@ -1,0 +1,490 @@
+from __future__ import annotations
+
+import csv
+import io
+import os
+import tempfile
+from datetime import date, datetime, time
+from typing import Iterator
+
+from config import (
+    UPLOAD_MAX_FILE_BYTES,
+    UPLOAD_MAX_FILE_BYTES_CSV,
+    UPLOAD_MAX_FILE_BYTES_TSV,
+    UPLOAD_MAX_FILE_BYTES_XLSX,
+    UPLOAD_MAX_FILE_BYTES_XLSB,
+    UPLOAD_MAX_FILE_BYTES_XLS,
+)
+
+TABULAR_PREVIEW_CHAR_LIMIT = 100_000
+TABULAR_PREVIEW_ROW_LIMIT = 200
+TABULAR_RECORD_LIMIT = 500_000
+SUPPORTED_TABULAR_EXTENSIONS = (".csv", ".tsv", ".xlsx", ".xlsb", ".xls")
+
+_TABULAR_UPLOAD_LIMITS = {
+    ".csv": UPLOAD_MAX_FILE_BYTES_CSV,
+    ".tsv": UPLOAD_MAX_FILE_BYTES_TSV,
+    ".xlsx": UPLOAD_MAX_FILE_BYTES_XLSX,
+    ".xlsb": UPLOAD_MAX_FILE_BYTES_XLSB,
+    ".xls": UPLOAD_MAX_FILE_BYTES_XLS,
+}
+
+
+class TabularLoaderError(ValueError):
+    pass
+
+
+def get_tabular_extension(filename: str) -> str:
+    return os.path.splitext(str(filename or "").strip().lower())[1]
+
+
+def is_tabular_filename(filename: str) -> bool:
+    return get_tabular_extension(filename) in SUPPORTED_TABULAR_EXTENSIONS
+
+
+def get_tabular_upload_limit_bytes(filename: str, default_bytes: int | None = None) -> int:
+    ext = get_tabular_extension(filename)
+    return int(_TABULAR_UPLOAD_LIMITS.get(ext, default_bytes or UPLOAD_MAX_FILE_BYTES))
+
+
+def get_tabular_upload_limits() -> dict[str, int]:
+    return dict(_TABULAR_UPLOAD_LIMITS)
+
+
+def load_tabular_preview(
+    raw_bytes: bytes,
+    filename: str,
+    preview_rows: int = TABULAR_PREVIEW_ROW_LIMIT,
+    preview_char_limit: int = TABULAR_PREVIEW_CHAR_LIMIT,
+) -> dict:
+    ext = get_tabular_extension(filename)
+    if ext == ".csv":
+        return _load_delimited_preview(raw_bytes, delimiter_hint=None, preview_rows=preview_rows, preview_char_limit=preview_char_limit)
+    if ext == ".tsv":
+        return _load_delimited_preview(raw_bytes, delimiter_hint="\t", preview_rows=preview_rows, preview_char_limit=preview_char_limit)
+    if ext == ".xlsx":
+        return _load_xlsx_preview(raw_bytes, preview_rows=preview_rows, preview_char_limit=preview_char_limit)
+    if ext == ".xlsb":
+        return _load_xlsb_preview(raw_bytes, preview_rows=preview_rows, preview_char_limit=preview_char_limit)
+    if ext == ".xls":
+        return _load_xls_preview(raw_bytes, preview_rows=preview_rows, preview_char_limit=preview_char_limit)
+    raise TabularLoaderError(f"Formato tabular não suportado: {ext or 'desconhecido'}")
+
+
+def load_tabular_dataset(
+    raw_bytes: bytes,
+    filename: str,
+    max_rows: int = TABULAR_RECORD_LIMIT,
+) -> dict:
+    ext = get_tabular_extension(filename)
+    if ext == ".csv":
+        return _load_delimited_dataset(raw_bytes, delimiter_hint=None, max_rows=max_rows)
+    if ext == ".tsv":
+        return _load_delimited_dataset(raw_bytes, delimiter_hint="\t", max_rows=max_rows)
+    if ext == ".xlsx":
+        return _load_xlsx_dataset(raw_bytes, max_rows=max_rows)
+    if ext == ".xlsb":
+        return _load_xlsb_dataset(raw_bytes, max_rows=max_rows)
+    if ext == ".xls":
+        return _load_xls_dataset(raw_bytes, max_rows=max_rows)
+    raise TabularLoaderError(f"Formato tabular não suportado: {ext or 'desconhecido'}")
+
+
+def _load_delimited_preview(
+    raw_bytes: bytes,
+    delimiter_hint: str | None,
+    preview_rows: int,
+    preview_char_limit: int,
+) -> dict:
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    if not text.strip():
+        raise TabularLoaderError("CSV/TSV vazio.")
+    delimiter = delimiter_hint or _sniff_delimiter(text)
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    header = next(reader, None)
+    if not header:
+        raise TabularLoaderError("CSV/TSV sem header válido.")
+    columns = _normalize_header_row(header)
+    sample_rows: list[list[str]] = []
+    preview_lines = [delimiter.join(columns)]
+    row_count = 0
+    truncated = False
+    for raw_row in reader:
+        row_count += 1
+        row = _normalize_row(raw_row, len(columns))
+        if len(sample_rows) < preview_rows:
+            sample_rows.append(row)
+        line = delimiter.join(row)
+        if _fits_preview(preview_lines, line, preview_char_limit):
+            preview_lines.append(line)
+        else:
+            truncated = True
+    return _preview_payload(columns, sample_rows, row_count, delimiter, preview_lines, truncated)
+
+
+def _load_delimited_dataset(raw_bytes: bytes, delimiter_hint: str | None, max_rows: int) -> dict:
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    if not text.strip():
+        raise TabularLoaderError("CSV/TSV vazio.")
+    delimiter = delimiter_hint or _sniff_delimiter(text)
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    header = next(reader, None)
+    if not header:
+        raise TabularLoaderError("CSV/TSV sem header válido.")
+    columns = _normalize_header_row(header)
+    records = []
+    row_count = 0
+    truncated = False
+    for raw_row in reader:
+        row_count += 1
+        row = _normalize_row(raw_row, len(columns))
+        if len(records) < max_rows:
+            records.append({col: row[idx] for idx, col in enumerate(columns)})
+        else:
+            truncated = True
+    return {
+        "columns": columns,
+        "records": records,
+        "row_count": row_count,
+        "rows_loaded": len(records),
+        "truncated": truncated,
+        "delimiter": delimiter,
+    }
+
+
+def _load_xlsx_preview(raw_bytes: bytes, preview_rows: int, preview_char_limit: int) -> dict:
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+    try:
+        worksheet = workbook.active
+        row_iter = worksheet.iter_rows(values_only=True)
+        header = next(row_iter, None)
+        if not header:
+            raise TabularLoaderError("Excel vazio.")
+        columns = _normalize_header_row(header)
+        sample_rows, row_count, preview_lines, truncated = _collect_row_preview(
+            columns,
+            (_row_values_from_sequence(row) for row in row_iter),
+            "\t",
+            preview_rows,
+            preview_char_limit,
+        )
+        return _preview_payload(columns, sample_rows, row_count, "\t", preview_lines, truncated)
+    finally:
+        workbook.close()
+
+
+def _load_xlsx_dataset(raw_bytes: bytes, max_rows: int) -> dict:
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+    try:
+        worksheet = workbook.active
+        row_iter = worksheet.iter_rows(values_only=True)
+        header = next(row_iter, None)
+        if not header:
+            raise TabularLoaderError("Excel vazio.")
+        columns = _normalize_header_row(header)
+        return _collect_dataset(columns, (_row_values_from_sequence(row) for row in row_iter), max_rows=max_rows, delimiter="\t")
+    finally:
+        workbook.close()
+
+
+def _load_xlsb_preview(raw_bytes: bytes, preview_rows: int, preview_char_limit: int) -> dict:
+    from pyxlsb import open_workbook
+
+    with _temporary_tabular_file(raw_bytes, ".xlsb") as temp_path:
+        workbook = open_workbook(temp_path)
+        try:
+            worksheet = workbook.get_sheet(1)
+            row_iter = worksheet.rows()
+            header = next(row_iter, None)
+            if not header:
+                raise TabularLoaderError("XLSB vazio.")
+            columns = _normalize_header_row(cell.v for cell in header)
+            sample_rows, row_count, preview_lines, truncated = _collect_row_preview(
+                columns,
+                (_row_values_from_sequence(cell.v for cell in row) for row in row_iter),
+                "\t",
+                preview_rows,
+                preview_char_limit,
+            )
+            return _preview_payload(columns, sample_rows, row_count, "\t", preview_lines, truncated)
+        finally:
+            workbook.close()
+
+
+def _load_xlsb_dataset(raw_bytes: bytes, max_rows: int) -> dict:
+    from pyxlsb import open_workbook
+
+    with _temporary_tabular_file(raw_bytes, ".xlsb") as temp_path:
+        workbook = open_workbook(temp_path)
+        try:
+            worksheet = workbook.get_sheet(1)
+            row_iter = worksheet.rows()
+            header = next(row_iter, None)
+            if not header:
+                raise TabularLoaderError("XLSB vazio.")
+            columns = _normalize_header_row(cell.v for cell in header)
+            return _collect_dataset(
+                columns,
+                (_row_values_from_sequence(cell.v for cell in row) for row in row_iter),
+                max_rows=max_rows,
+                delimiter="\t",
+            )
+        finally:
+            workbook.close()
+
+
+def _load_xls_preview(raw_bytes: bytes, preview_rows: int, preview_char_limit: int) -> dict:
+    dataset = _load_xls_dataset(raw_bytes, max_rows=preview_rows)
+    columns = dataset["columns"]
+    sample_rows = [[record.get(col, "") for col in columns] for record in dataset["records"]]
+    preview_lines = ["\t".join(columns)] + ["\t".join(row) for row in sample_rows]
+    truncated = bool(dataset["truncated"] or len("\n".join(preview_lines)) > preview_char_limit)
+    data_text = ("\n".join(preview_lines))[:preview_char_limit]
+    preview_payload = _preview_payload(columns, sample_rows, dataset["row_count"], "\t", preview_lines, truncated)
+    preview_payload["data_text"] = data_text
+    return preview_payload
+
+
+def _load_xls_dataset(raw_bytes: bytes, max_rows: int) -> dict:
+    try:
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - dependency error depends on runtime
+        raise TabularLoaderError("Leitura de .xls requer pandas/xlrd no servidor.") from exc
+
+    with _temporary_tabular_file(raw_bytes, ".xls") as temp_path:
+        try:
+            frame = pd.read_excel(temp_path, dtype=object)
+        except Exception as exc:
+            raise TabularLoaderError("Falha a ler ficheiro .xls.") from exc
+    if frame.empty and not list(frame.columns):
+        raise TabularLoaderError("Excel vazio.")
+    columns = _normalize_header_row(frame.columns.tolist())
+    records = []
+    row_count = 0
+    truncated = False
+    for row in frame.itertuples(index=False, name=None):
+        row_count += 1
+        normalized = _normalize_row(row, len(columns))
+        if len(records) < max_rows:
+            records.append({col: normalized[idx] for idx, col in enumerate(columns)})
+        else:
+            truncated = True
+    return {
+        "columns": columns,
+        "records": records,
+        "row_count": row_count,
+        "rows_loaded": len(records),
+        "truncated": truncated,
+        "delimiter": "\t",
+    }
+
+
+def _collect_row_preview(
+    columns: list[str],
+    row_iter: Iterator[list[str]],
+    delimiter: str,
+    preview_rows: int,
+    preview_char_limit: int,
+) -> tuple[list[list[str]], int, list[str], bool]:
+    sample_rows: list[list[str]] = []
+    preview_lines = [delimiter.join(columns)]
+    row_count = 0
+    truncated = False
+    for row in row_iter:
+        row_count += 1
+        normalized = _normalize_row(row, len(columns))
+        if len(sample_rows) < preview_rows:
+            sample_rows.append(normalized)
+        line = delimiter.join(normalized)
+        if _fits_preview(preview_lines, line, preview_char_limit):
+            preview_lines.append(line)
+        else:
+            truncated = True
+    return sample_rows, row_count, preview_lines, truncated
+
+
+def _collect_dataset(
+    columns: list[str],
+    row_iter: Iterator[list[str]],
+    max_rows: int,
+    delimiter: str,
+) -> dict:
+    records = []
+    row_count = 0
+    truncated = False
+    for row in row_iter:
+        row_count += 1
+        normalized = _normalize_row(row, len(columns))
+        if len(records) < max_rows:
+            records.append({col: normalized[idx] for idx, col in enumerate(columns)})
+        else:
+            truncated = True
+    return {
+        "columns": columns,
+        "records": records,
+        "row_count": row_count,
+        "rows_loaded": len(records),
+        "truncated": truncated,
+        "delimiter": delimiter,
+    }
+
+
+def _preview_payload(
+    columns: list[str],
+    sample_rows: list[list[str]],
+    row_count: int,
+    delimiter: str,
+    preview_lines: list[str],
+    truncated: bool,
+) -> dict:
+    sample_records = [{col: row[idx] for idx, col in enumerate(columns)} for row in sample_rows]
+    column_types = _infer_column_types(columns, sample_rows)
+    return {
+        "columns": columns,
+        "row_count": row_count,
+        "data_text": "\n".join(preview_lines),
+        "delimiter": delimiter,
+        "sample_rows": sample_rows,
+        "sample_records": sample_records,
+        "col_analysis": _build_column_analysis(columns, sample_rows, column_types),
+        "column_types": column_types,
+        "truncated": truncated or row_count > len(sample_rows),
+    }
+
+
+def _build_column_analysis(
+    columns: list[str],
+    sample_rows: list[list[str]],
+    column_types: dict[str, str],
+) -> list[dict]:
+    analyses = []
+    for idx, column in enumerate(columns):
+        values = [row[idx] for row in sample_rows if idx < len(row) and str(row[idx]).strip()]
+        analyses.append(
+            {
+                "name": column,
+                "sample": values[:3],
+                "non_empty_in_preview": len(values),
+                "preview_type": column_types.get(column, "empty"),
+            }
+        )
+    return analyses
+
+
+def _infer_column_types(columns: list[str], sample_rows: list[list[str]]) -> dict[str, str]:
+    result = {}
+    for idx, column in enumerate(columns):
+        values = [row[idx] for row in sample_rows if idx < len(row) and str(row[idx]).strip()]
+        if not values:
+            result[column] = "empty"
+            continue
+        numeric_hits = sum(1 for value in values if _parse_float(value) is not None)
+        date_hits = sum(1 for value in values if _parse_datetime(value) is not None)
+        if numeric_hits / max(1, len(values)) >= 0.8:
+            result[column] = "numeric"
+        elif date_hits / max(1, len(values)) >= 0.8:
+            result[column] = "date"
+        else:
+            result[column] = "text"
+    return result
+
+
+def _temporary_tabular_file(raw_bytes: bytes, suffix: str):
+    class _TempPath:
+        def __enter__(self_inner):
+            handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            handle.write(raw_bytes)
+            handle.flush()
+            handle.close()
+            self_inner.path = handle.name
+            return self_inner.path
+
+        def __exit__(self_inner, exc_type, exc, tb):
+            try:
+                os.unlink(self_inner.path)
+            except Exception:
+                pass
+            return False
+
+    return _TempPath()
+
+
+def _normalize_header_row(values) -> list[str]:
+    columns = []
+    for idx, value in enumerate(values):
+        text = _stringify_cell(value).strip()
+        columns.append(text or f"Col{idx + 1}")
+    return columns
+
+
+def _normalize_row(values, width: int) -> list[str]:
+    seq = list(values)
+    if len(seq) < width:
+        seq.extend([""] * (width - len(seq)))
+    return [_stringify_cell(seq[idx]) if idx < len(seq) else "" for idx in range(width)]
+
+
+def _row_values_from_sequence(values) -> list[str]:
+    return list(values or [])
+
+
+def _stringify_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.isoformat()
+    return str(value)
+
+
+def _fits_preview(preview_lines: list[str], next_line: str, preview_char_limit: int) -> bool:
+    current_size = sum(len(line) for line in preview_lines) + max(0, len(preview_lines) - 1)
+    projected = current_size + 1 + len(next_line)
+    return projected <= preview_char_limit
+
+
+def _sniff_delimiter(text: str) -> str:
+    sample = "\n".join(text.splitlines()[:20])
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return str(dialect.delimiter or ",")
+    except Exception:
+        if sample.count(";") > sample.count(","):
+            return ";"
+        if sample.count("\t") > sample.count(","):
+            return "\t"
+        return ","
+
+
+def _parse_float(value: str) -> float | None:
+    text = str(value or "").strip().replace(" ", "")
+    if not text:
+        return None
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None

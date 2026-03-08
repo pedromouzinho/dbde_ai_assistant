@@ -78,7 +78,11 @@ export function getFileDownloads(toolResults) {
       downloads.push(...parsed._auto_file_downloads.filter(Boolean));
     }
   }
-  return downloads;
+  return downloads.sort((a, b) => {
+    const primaryA = a?.primary ? 1 : 0;
+    const primaryB = b?.primary ? 1 : 0;
+    return primaryB - primaryA;
+  });
 }
 
 export function getPreferredAutoCsvDownload(toolResults, preferredIndex = null) {

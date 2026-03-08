@@ -91,20 +91,20 @@ export default function MessageBubble({
                 className="export-btn"
                 onClick={() => onFileDownload(fd)}
                 style={{
-                  background: 'rgba(0,0,0,0.03)',
-                  border: '1px solid rgba(0,0,0,0.08)',
+                  background: fd.primary ? '#1A1A1A' : 'rgba(0,0,0,0.03)',
+                  border: fd.primary ? '1px solid #1A1A1A' : '1px solid rgba(0,0,0,0.08)',
                   borderRadius: 8,
                   padding: '5px 12px',
                   cursor: 'pointer',
                   fontSize: 11,
-                  color: '#666',
+                  color: fd.primary ? '#fff' : '#666',
                   fontWeight: 600,
                   fontFamily: "'Montserrat', sans-serif",
                   transition: 'all 0.2s ease',
                 }}
-                title={fd.filename || 'download'}
+                title={fd.description || fd.filename || 'download'}
               >
-                {`⬇ Download ${String(fd.format || 'file').toUpperCase()}`}
+                {fd.label ? `⬇ ${fd.label}` : `⬇ Download ${String(fd.format || 'file').toUpperCase()}`}
               </button>
             ))}
           </div>

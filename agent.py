@@ -59,6 +59,13 @@ from pii_shield import PIIMaskingContext, mask_pii
 # =============================================================================
 MAX_CONVERSATIONS = 200
 CONVERSATION_TTL_SECONDS = 4 * 3600
+_TOOLS_NEEDING_CONV_CONTEXT = {
+    "search_uploaded_document",
+    "analyze_uploaded_table",
+    "run_code",
+    "classify_uploaded_emails",
+    "chart_uploaded_table",
+}
 
 
 class ConversationStore(MutableMapping[str, List[dict]]):
@@ -1304,22 +1311,15 @@ async def _execute_tool_calls(
                 context_blocks.append(f"[{idx}] {fname}\n{content[:per_file_budget]}")
             if context_blocks:
                 args["context"] = "\n\n".join(context_blocks)[:90000]
-        if tc.name == "search_uploaded_document" and not args.get("conv_id"):
-            args["conv_id"] = conv_id
-        if tc.name == "search_uploaded_document" and user_sub and not args.get("user_sub"):
-            args["user_sub"] = user_sub
-        if tc.name == "analyze_uploaded_table" and not args.get("conv_id"):
-            args["conv_id"] = conv_id
-        if tc.name == "analyze_uploaded_table" and user_sub and not args.get("user_sub"):
-            args["user_sub"] = user_sub
+        if tc.name in _TOOLS_NEEDING_CONV_CONTEXT:
+            if not args.get("conv_id"):
+                args["conv_id"] = conv_id
+            if user_sub and not args.get("user_sub"):
+                args["user_sub"] = user_sub
         if tc.name == "analyze_uploaded_table" and "full_points" not in args:
             args["full_points"] = True
         if tc.name == "analyze_uploaded_table" and "top" not in args:
             args["top"] = 5000
-        if tc.name == "run_code" and not args.get("conv_id"):
-            args["conv_id"] = conv_id
-        if tc.name == "run_code" and user_sub and not args.get("user_sub"):
-            args["user_sub"] = user_sub
         if tc.name == "generate_chart":
             has_explicit_data = bool(
                 args.get("series")

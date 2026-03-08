@@ -52,8 +52,10 @@ from tools_devops import (
 from tools_knowledge import tool_search_workitems, tool_search_website, tool_search_web
 from tools_upload import tool_search_uploaded_document
 from tools_export import tool_generate_chart, tool_generate_file
+from tools_email import tool_prepare_outlook_draft, tool_classify_uploaded_emails
 from tools_learning import tool_get_writer_profile, tool_save_writer_profile
 from structured_schemas import SCREENSHOT_USER_STORIES_SCHEMA
+from tabular_loader import TabularLoaderError, load_tabular_dataset, load_tabular_preview
 
 _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
@@ -652,6 +654,75 @@ def _infer_value_column(query: str, columns, records, date_column: str = ""):
     return ""
 
 
+async def _resolve_uploaded_tabular_source(
+    conv_id: str,
+    user_sub: str = "",
+    filename: str = "",
+) -> dict:
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    if not safe_conv:
+        return {"error": "conv_id é obrigatório para analisar ficheiros carregados."}
+
+    odata_conv = safe_conv.replace("'", "''")
+    try:
+        rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
+    except Exception as exc:
+        return {"error": f"Falha a carregar UploadIndex: {str(exc)}"}
+    if not rows:
+        return {"error": "Não foram encontrados ficheiros carregados nesta conversa."}
+
+    wanted_filename = _normalize_lookup_key(filename)
+    candidates = []
+    for row in rows:
+        owner_sub = str(row.get("UserSub", "") or "")
+        if safe_user and owner_sub and owner_sub != safe_user:
+            continue
+        fname = str(row.get("Filename", "") or "")
+        if not fname.lower().endswith((".csv", ".tsv", ".xlsx", ".xls", ".xlsb")):
+            continue
+        if not str(row.get("RawBlobRef", "") or ""):
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return {"error": "Não há ficheiros CSV/Excel com raw blob disponível nesta conversa."}
+
+    candidates.sort(key=lambda r: str(r.get("UploadedAt", "")), reverse=True)
+    selected = None
+    if wanted_filename:
+        for row in candidates:
+            norm = _normalize_lookup_key(str(row.get("Filename", "") or ""))
+            if norm == wanted_filename or wanted_filename in norm:
+                selected = row
+                break
+        if selected is None:
+            return {"error": f"Ficheiro '{filename}' não encontrado nesta conversa."}
+    else:
+        selected = candidates[0]
+
+    selected_filename = str(selected.get("Filename", "") or "")
+    raw_blob_ref = str(selected.get("RawBlobRef", "") or "")
+    container, blob_name = parse_blob_ref(raw_blob_ref)
+    if not container or not blob_name:
+        return {"error": "RawBlobRef inválido para o ficheiro selecionado."}
+
+    try:
+        raw_bytes = await blob_download_bytes(container, blob_name)
+    except Exception as exc:
+        return {"error": f"Falha ao descarregar raw blob: {str(exc)}"}
+    if not raw_bytes:
+        return {"error": "Raw blob vazio para o ficheiro selecionado."}
+
+    # NOTA: raw_bytes pode ser grande. O caller deve processar e libertar
+    # a referência o mais cedo possível.
+    return {
+        "filename": selected_filename,
+        "raw_bytes": raw_bytes,
+        "upload_row": selected,
+    }
+
+
 async def tool_analyze_uploaded_table(
     query: str = "",
     conv_id: str = "",
@@ -670,104 +741,22 @@ async def tool_analyze_uploaded_table(
     q = str(query or "").strip()
     safe_conv = str(conv_id or "").strip()
     safe_user = str(user_sub or "").strip()
-    if not safe_conv:
-        return {"error": "conv_id é obrigatório para analisar ficheiros carregados."}
+    source = await _resolve_uploaded_tabular_source(safe_conv, safe_user, filename)
+    if source.get("error"):
+        return source
+    selected_filename = str(source.get("filename", "") or "")
+    raw_bytes = source.get("raw_bytes") or b""
 
-    odata_conv = safe_conv.replace("'", "''")
-    try:
-        rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
-    except Exception as e:
-        return {"error": f"Falha a carregar UploadIndex: {str(e)}"}
-    if not rows:
-        return {"error": "Não foram encontrados ficheiros carregados nesta conversa."}
-
-    wanted_filename = _normalize_lookup_key(filename)
-    selected = None
-    tabular_rows = []
-    for row in rows:
-        owner_sub = str(row.get("UserSub", "") or "")
-        if safe_user and owner_sub and owner_sub != safe_user:
-            continue
-        fname = str(row.get("Filename", "") or "")
-        fname_lower = fname.lower()
-        if not fname_lower.endswith((".csv", ".xlsx", ".xls")):
-            continue
-        if not str(row.get("RawBlobRef", "") or ""):
-            continue
-        tabular_rows.append(row)
-    if not tabular_rows:
-        return {"error": "Não há ficheiros CSV/Excel com raw blob disponível nesta conversa."}
-
-    tabular_rows.sort(key=lambda r: str(r.get("UploadedAt", "")), reverse=True)
-    if wanted_filename:
-        for row in tabular_rows:
-            fname = str(row.get("Filename", "") or "")
-            norm = _normalize_lookup_key(fname)
-            if norm == wanted_filename or wanted_filename in norm:
-                selected = row
-                break
-        if selected is None:
-            return {"error": f"Ficheiro '{filename}' não encontrado nesta conversa."}
-    else:
-        selected = tabular_rows[0]
-
-    selected_filename = str(selected.get("Filename", "") or "")
-    raw_blob_ref = str(selected.get("RawBlobRef", "") or "")
-    container, blob_name = parse_blob_ref(raw_blob_ref)
-    if not container or not blob_name:
-        return {"error": "RawBlobRef inválido para o ficheiro selecionado."}
-
-    try:
-        raw_bytes = await blob_download_bytes(container, blob_name)
-    except Exception as e:
-        return {"error": f"Falha ao descarregar raw blob: {str(e)}"}
-    if not raw_bytes:
-        return {"error": "Raw blob vazio para o ficheiro selecionado."}
-
-    records = []
-    columns = []
     max_rows = 500000
-    fname_lower = selected_filename.lower()
-    if fname_lower.endswith(".csv"):
-        text = raw_bytes.decode("utf-8", errors="replace")
-        if not text.strip():
-            return {"error": "CSV vazio."}
-        sample = "\n".join(text.splitlines()[:20])
-        delimiter = ","
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-            delimiter = dialect.delimiter
-        except Exception:
-            delimiter = ";" if ";" in sample and sample.count(";") >= sample.count(",") else ","
-        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-        if not reader.fieldnames:
-            return {"error": "CSV sem header válido."}
-        columns = [str(c).strip() for c in reader.fieldnames]
-        for i, row in enumerate(reader):
-            if i >= max_rows:
-                break
-            records.append({c: row.get(c, "") for c in columns})
-    else:
-        try:
-            import openpyxl
-        except Exception:
-            return {"error": "openpyxl indisponível no servidor para analisar Excel."}
-        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-        ws = wb.active
-        row_iter = ws.iter_rows(values_only=True)
-        header = next(row_iter, None)
-        if not header:
-            wb.close()
-            return {"error": "Excel vazio."}
-        columns = [str(c).strip() if c is not None and str(c).strip() else f"Col{idx+1}" for idx, c in enumerate(header)]
-        for i, vals in enumerate(row_iter):
-            if i >= max_rows:
-                break
-            item = {}
-            for ci, c in enumerate(columns):
-                item[c] = "" if ci >= len(vals) or vals[ci] is None else str(vals[ci])
-            records.append(item)
-        wb.close()
+    try:
+        dataset = load_tabular_dataset(raw_bytes, selected_filename, max_rows=max_rows)
+    except TabularLoaderError as exc:
+        return {"error": str(exc)}
+    finally:
+        del source
+    records = list(dataset.get("records") or [])
+    columns = list(dataset.get("columns") or [])
+    rows_total = int(dataset.get("row_count", len(records)) or len(records))
 
     if not records:
         return {"error": "Ficheiro sem linhas de dados."}
@@ -796,7 +785,10 @@ async def tool_analyze_uploaded_table(
         )
     )
     warnings_list = []
-    rows_total = len(records)
+    if rows_total > len(records):
+        warnings_list.append(
+            f"Dataset truncado a {len(records)} linhas para análise determinística (total real: {rows_total})."
+        )
     valid_data_points = 0
     was_sampled = False
 
@@ -813,7 +805,7 @@ async def tool_analyze_uploaded_table(
             "source": "uploaded_table_raw_blob",
             "conversation_id": safe_conv,
             "filename": selected_filename,
-            "row_count": len(records),
+            "row_count": rows_total,
             "columns": columns,
             "column_profiles": column_profiles[:40],
             "total_columns_profiled": len(column_profiles),
@@ -898,7 +890,7 @@ async def tool_analyze_uploaded_table(
             "comparison": True,
             "conversation_id": safe_conv,
             "filename": selected_filename,
-            "row_count": len(records),
+            "row_count": rows_total,
             "columns": columns,
             "date_column": period_col,
             "value_column": matched_value_col,
@@ -1070,6 +1062,7 @@ async def tool_analyze_uploaded_table(
                 "all_values_truncated": all_values_truncated,
                 "summary": (
                     f"Análise categórica completa de '{selected_filename}' ({len(records)} linhas) "
+                    f"de {rows_total} totais "
                     f"na coluna '{matched_value_col}': {distinct_count} valor(es) distinto(s)."
                 ),
                 "analysis_quality": {
@@ -1171,7 +1164,7 @@ async def tool_analyze_uploaded_table(
         "source": "uploaded_table_raw_blob",
         "conversation_id": safe_conv,
         "filename": selected_filename,
-        "row_count": len(records),
+        "row_count": rows_total,
         "columns": columns,
         "group_by": group_mode,
         "agg": agg_mode,
@@ -1180,7 +1173,7 @@ async def tool_analyze_uploaded_table(
         "value_column": matched_value_col,
         "groups": groups,
         "summary": (
-            f"Análise completa de '{selected_filename}' ({len(records)} linhas). "
+            f"Análise completa de '{selected_filename}' ({len(records)} linhas carregadas, {rows_total} totais). "
             f"Agrupamento={group_mode}, agregação={agg_mode}, "
             f"date_column={matched_date_col or '-'}, value_column={matched_value_col or '-'}."
         ),
@@ -1200,6 +1193,590 @@ async def tool_analyze_uploaded_table(
             "y_label": metric_label,
         },
     }
+
+
+def _infer_chart_type_for_uploaded_table(query: str, chart_type: str) -> str:
+    requested = str(chart_type or "").strip().lower()
+    if requested and requested not in {"auto", "default"}:
+        return requested
+    q = _normalize_lookup_key(query or "")
+    if any(token in q for token in ("scatter", "correl", "dispers")):
+        return "scatter"
+    if any(token in q for token in ("hist", "distribu", "frequenc")):
+        return "histogram"
+    if any(token in q for token in ("pie", "pizza", "donut", "setor")):
+        return "pie"
+    if any(token in q for token in ("box", "caixa", "quartil")):
+        return "box"
+    if any(token in q for token in ("area", "stack")):
+        return "area"
+    if any(token in q for token in ("linha", "line", "trend", "tendenc", "evolu", "serie temporal", "time series")):
+        return "line"
+    return "bar"
+
+
+def _infer_uploaded_table_chart_agg(query: str, agg: str, chart_type: str, has_y: bool) -> str:
+    requested = str(agg or "").strip().lower()
+    if requested and requested not in {"auto", "default"}:
+        return requested
+    if chart_type in {"scatter", "histogram", "box"}:
+        return "none"
+    q = _normalize_lookup_key(query or "")
+    if any(token in q for token in ("count", "contagem", "frequenc", "quant")) or not has_y:
+        return "count"
+    if any(token in q for token in ("media", "média", "average", "avg")):
+        return "mean"
+    if "median" in q or "mediana" in q:
+        return "median"
+    if any(token in q for token in ("max", "maior", "pico")):
+        return "max"
+    if any(token in q for token in ("min", "menor")):
+        return "min"
+    if any(token in q for token in ("sum", "soma", "total")):
+        return "sum"
+    return "sum" if has_y else "count"
+
+
+def _pick_query_matched_columns(query: str, columns: list[str], exclude: set[str] | None = None) -> list[str]:
+    q = _normalize_lookup_key(query or "")
+    excluded = exclude or set()
+    scored = []
+    for column in columns:
+        if column in excluded:
+            continue
+        norm = _normalize_lookup_key(column)
+        if not norm:
+            continue
+        score = 0
+        if norm in q:
+            score += 10
+        tokens = [token for token in re.split(r"[^a-z0-9]+", norm) if len(token) >= 3]
+        score += sum(1 for token in tokens if token in q)
+        if score > 0:
+            scored.append((score, column))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [column for _, column in scored]
+
+
+def _build_uploaded_table_chart_spec(
+    query: str,
+    preview: dict,
+    chart_type: str,
+    x_column: str = "",
+    y_column: str = "",
+    series_column: str = "",
+    agg: str = "auto",
+    top_n: int = 20,
+    max_points: int = 2000,
+) -> dict:
+    columns = list(preview.get("columns") or [])
+    sample_records = list(preview.get("sample_records") or [])
+    column_types = dict(preview.get("column_types") or {})
+    numeric_columns = [col for col in columns if column_types.get(col) == "numeric"]
+    date_columns = [col for col in columns if column_types.get(col) == "date"]
+    text_columns = [col for col in columns if column_types.get(col) not in {"numeric", "date"}]
+
+    matched_x = _match_column_name(x_column, columns) if x_column else ""
+    matched_y = _match_column_name(y_column, columns) if y_column else ""
+    matched_series = _match_column_name(series_column, columns) if series_column else ""
+
+    query_matches = _pick_query_matched_columns(query, columns)
+    query_numeric = [col for col in query_matches if col in numeric_columns]
+    query_text = [col for col in query_matches if col in text_columns]
+    query_dates = [col for col in query_matches if col in date_columns]
+
+    date_guess = _infer_date_column(query, columns, sample_records) if columns else ""
+    value_guess = _infer_value_column(query, columns, sample_records, date_column=date_guess) if columns else ""
+    text_guess = _infer_text_column(query, columns, date_column=date_guess, records=sample_records) if columns else ""
+
+    resolved_type = _infer_chart_type_for_uploaded_table(query, chart_type)
+    resolved_x = matched_x
+    resolved_y = matched_y
+    resolved_series = matched_series
+
+    if resolved_type == "scatter":
+        if not resolved_x:
+            resolved_x = query_numeric[0] if query_numeric else (numeric_columns[0] if numeric_columns else "")
+        if not resolved_y:
+            candidates = [col for col in query_numeric + numeric_columns if col != resolved_x]
+            resolved_y = candidates[0] if candidates else ""
+    elif resolved_type in {"histogram", "box"}:
+        if not resolved_y:
+            resolved_y = query_numeric[0] if query_numeric else (value_guess or (numeric_columns[0] if numeric_columns else ""))
+        if resolved_type == "box" and not resolved_x:
+            resolved_x = query_text[0] if query_text else (text_guess or "")
+    else:
+        if not resolved_x:
+            if resolved_type in {"line", "area"}:
+                resolved_x = query_dates[0] if query_dates else (date_guess or "")
+            if not resolved_x:
+                resolved_x = query_text[0] if query_text else ""
+            if not resolved_x:
+                resolved_x = date_guess or text_guess or (date_columns[0] if date_columns else "")
+            if not resolved_x:
+                resolved_x = columns[0] if columns else ""
+        if not resolved_y:
+            resolved_y = query_numeric[0] if query_numeric else (value_guess or (numeric_columns[0] if numeric_columns else ""))
+        if not resolved_series:
+            series_candidates = [
+                col for col in query_text + text_columns + date_columns
+                if col not in {resolved_x, resolved_y}
+            ]
+            if len(series_candidates) >= 1 and re.search(r"\b(por|vs|versus|segment|serie|série|categoria|compar)\b", _normalize_lookup_key(query or "")):
+                resolved_series = series_candidates[0]
+
+    resolved_agg = _infer_uploaded_table_chart_agg(query, agg, resolved_type, bool(resolved_y))
+    if resolved_type in {"scatter", "histogram", "box"}:
+        resolved_agg = "none"
+    if resolved_agg == "count":
+        resolved_y = ""
+    col_set = set(columns)
+    if resolved_x and resolved_x not in col_set:
+        resolved_x = ""
+    if resolved_y and resolved_y not in col_set:
+        resolved_y = ""
+    if resolved_series and resolved_series not in col_set:
+        resolved_series = ""
+    if resolved_type == "pie":
+        resolved_series = ""
+
+    x_kind = column_types.get(resolved_x, "") if resolved_x else ""
+    return {
+        "chart_type": resolved_type,
+        "x_column": resolved_x,
+        "y_column": resolved_y,
+        "series_column": resolved_series,
+        "x_kind": x_kind,
+        "agg": resolved_agg,
+        "top_n": max(0, min(int(top_n or 0), 5000)),
+        "max_points": max(100, min(int(max_points or 2000), 10000)),
+        "row_count": int(preview.get("row_count", 0) or 0),
+        "columns": columns,
+    }
+
+
+def _build_uploaded_table_chart_code(filename: str, spec: dict, query: str) -> str:
+    payload = {
+        "filename": filename,
+        "spec": spec,
+        "query": query,
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    return f"""
+import json
+import math
+from pathlib import Path
+
+import pandas as pd
+
+payload = json.loads({payload_json!r})
+spec = payload["spec"]
+query = payload.get("query", "")
+filename = payload["filename"]
+path = f"/mnt/data/{{filename}}"
+ext = Path(filename).suffix.lower()
+
+def load_frame(file_path, suffix):
+    import pandas as pd
+
+    if suffix == ".csv":
+        return pd.read_csv(file_path, sep=None, engine="python", encoding_errors="replace")
+    if suffix == ".tsv":
+        return pd.read_csv(file_path, sep="\\t", encoding_errors="replace")
+    if suffix == ".xlsb":
+        return pd.read_excel(file_path, engine="pyxlsb")
+    return pd.read_excel(file_path)
+
+def clip_points(frame, limit, date_like=False):
+    if frame.empty or len(frame) <= limit:
+        return frame
+    if date_like:
+        frame = frame.sort_values(frame.columns[0])
+        return frame.iloc[:limit]
+    step = max(1, len(frame) // limit)
+    return frame.iloc[::step].head(limit)
+
+def ensure_column(frame, column_name):
+    if column_name and column_name not in frame.columns:
+        raise ValueError(f"Coluna '{{column_name}}' não encontrada no ficheiro.")
+
+def normalise_label(value):
+    if value is None:
+        return "(vazio)"
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return str(value)
+
+def xml_escape(value):
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+def to_float_list(values):
+    result = []
+    for value in values:
+        try:
+            result.append(float(value))
+        except Exception:
+            result.append(0.0)
+    return result
+
+def render_bar_like_svg(labels, values, title, line_mode=False, _normalise_label=normalise_label, _to_float_list=to_float_list, _xml_escape=xml_escape):
+    labels = [_normalise_label(label) for label in labels]
+    values = _to_float_list(values)
+    width = 960
+    height = 540
+    padding_left = 80
+    padding_right = 30
+    padding_top = 50
+    padding_bottom = 110
+    chart_width = max(100, width - padding_left - padding_right)
+    chart_height = max(100, height - padding_top - padding_bottom)
+    max_value = max(values or [1.0])
+    min_value = min(values or [0.0])
+    if max_value == min_value:
+        max_value = min_value + 1.0
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{{width}}" height="{{height}}" viewBox="0 0 {{width}} {{height}}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{{padding_left}}" y="28" font-size="22" font-family="Arial" font-weight="bold">{{_xml_escape(title)}}</text>',
+        f'<line x1="{{padding_left}}" y1="{{padding_top}}" x2="{{padding_left}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+        f'<line x1="{{padding_left}}" y1="{{padding_top + chart_height}}" x2="{{padding_left + chart_width}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+    ]
+    if not values:
+        svg.append('</svg>')
+        return ''.join(svg)
+    step = chart_width / max(1, len(values))
+    points = []
+    for idx, value in enumerate(values):
+        x = padding_left + idx * step + step / 2
+        ratio = (value - min_value) / (max_value - min_value)
+        y = padding_top + chart_height - ratio * chart_height
+        points.append((x, y))
+        label_x = padding_left + idx * step + max(2, step * 0.1)
+        if not line_mode:
+            bar_width = max(8, step * 0.7)
+            bar_x = x - bar_width / 2
+            bar_height = padding_top + chart_height - y
+            svg.append(f'<rect x="{{bar_x:.2f}}" y="{{y:.2f}}" width="{{bar_width:.2f}}" height="{{bar_height:.2f}}" fill="#2563eb" opacity="0.85"/>')
+        svg.append(f'<text x="{{label_x:.2f}}" y="{{padding_top + chart_height + 24}}" font-size="11" font-family="Arial" transform="rotate(35 {{label_x:.2f}} {{padding_top + chart_height + 24}})">{{_xml_escape(labels[idx][:28])}}</text>')
+    if line_mode:
+        path = " ".join(f"L {{x:.2f}} {{y:.2f}}" for x, y in points)
+        first_x, first_y = points[0]
+        svg.append(f'<path d="M {{first_x:.2f}} {{first_y:.2f}} {{path}}" fill="none" stroke="#2563eb" stroke-width="3"/>')
+        for x, y in points:
+            svg.append(f'<circle cx="{{x:.2f}}" cy="{{y:.2f}}" r="4" fill="#0f172a"/>')
+    svg.append('</svg>')
+    return ''.join(svg)
+
+def render_scatter_svg(xs, ys, title, _to_float_list=to_float_list, _xml_escape=xml_escape):
+    xs = _to_float_list(xs)
+    ys = _to_float_list(ys)
+    width = 960
+    height = 540
+    padding_left = 80
+    padding_right = 30
+    padding_top = 50
+    padding_bottom = 80
+    chart_width = max(100, width - padding_left - padding_right)
+    chart_height = max(100, height - padding_top - padding_bottom)
+    min_x, max_x = min(xs or [0.0]), max(xs or [1.0])
+    min_y, max_y = min(ys or [0.0]), max(ys or [1.0])
+    if min_x == max_x:
+        max_x = min_x + 1.0
+    if min_y == max_y:
+        max_y = min_y + 1.0
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{{width}}" height="{{height}}" viewBox="0 0 {{width}} {{height}}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{{padding_left}}" y="28" font-size="22" font-family="Arial" font-weight="bold">{{_xml_escape(title)}}</text>',
+        f'<line x1="{{padding_left}}" y1="{{padding_top}}" x2="{{padding_left}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+        f'<line x1="{{padding_left}}" y1="{{padding_top + chart_height}}" x2="{{padding_left + chart_width}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+    ]
+    for x_value, y_value in zip(xs, ys):
+        px = padding_left + ((x_value - min_x) / (max_x - min_x)) * chart_width
+        py = padding_top + chart_height - ((y_value - min_y) / (max_y - min_y)) * chart_height
+        svg.append(f'<circle cx="{{px:.2f}}" cy="{{py:.2f}}" r="4.5" fill="#2563eb" opacity="0.8"/>')
+    svg.append('</svg>')
+    return ''.join(svg)
+
+def render_histogram_svg(values, title, _to_float_list=to_float_list, _render_bar_like_svg=render_bar_like_svg):
+    import math
+
+    numeric = _to_float_list(values)
+    if not numeric:
+        return _render_bar_like_svg([], [], title)
+    bins = min(12, max(4, int(math.sqrt(len(numeric)))))
+    min_value = min(numeric)
+    max_value = max(numeric)
+    if min_value == max_value:
+        max_value = min_value + 1.0
+    step = (max_value - min_value) / bins
+    labels = []
+    counts = []
+    for idx in range(bins):
+        low = min_value + idx * step
+        high = min_value + (idx + 1) * step
+        if idx == bins - 1:
+            count = sum(1 for value in numeric if low <= value <= high)
+        else:
+            count = sum(1 for value in numeric if low <= value < high)
+        labels.append(f"{{low:.2f}}-{{high:.2f}}")
+        counts.append(count)
+    return _render_bar_like_svg(labels, counts, title)
+
+def write_plotly_html(chart_payload, title, _xml_escape=xml_escape):
+    import json
+    from pathlib import Path
+
+    html_doc = f'''<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <title>{{_xml_escape(title)}}</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>body {{{{ font-family: Arial, sans-serif; margin: 0; padding: 24px; background: #f8fafc; }}}} #chart {{{{ width: 100%; height: 78vh; }}}}</style>
+</head>
+<body>
+  <div id="chart"></div>
+  <script>
+    const payload = {{json.dumps(chart_payload, ensure_ascii=False)}};
+    Plotly.newPlot('chart', payload.data, payload.layout, {{{{responsive: true, displaylogo: false}}}});
+  </script>
+</body>
+</html>'''
+    Path("uploaded_table_chart.html").write_text(html_doc, encoding="utf-8")
+
+df = load_frame(path, ext)
+df.columns = [str(col).strip() if str(col).strip() else f"Col{{idx + 1}}" for idx, col in enumerate(df.columns)]
+for column in df.columns:
+    if str(df[column].dtype) == "object":
+        df[column] = df[column].map(lambda value: str(value).strip() if value is not None and str(value).strip() else None)
+
+x = spec.get("x_column") or ""
+y = spec.get("y_column") or ""
+series = spec.get("series_column") or ""
+chart_type = spec.get("chart_type") or "bar"
+agg = spec.get("agg") or "sum"
+top_n = int(spec.get("top_n") or 0)
+max_points = int(spec.get("max_points") or 2000)
+x_kind = spec.get("x_kind") or ""
+
+ensure_column(df, x)
+ensure_column(df, y)
+ensure_column(df, series)
+
+if x and x_kind == "date":
+    df[x] = pd.to_datetime(df[x], errors="coerce")
+if y:
+    df[y] = pd.to_numeric(df[y], errors="coerce")
+
+title = query or f"{{chart_type.title()}} de {{filename}}"
+plot_df = pd.DataFrame()
+chart_payload = {{"data": [], "layout": {{"title": title, "template": "plotly_white"}}}}
+svg_markup = ""
+
+if chart_type == "scatter":
+    if not x or not y:
+        raise ValueError("Scatter requer x_column e y_column numéricos.")
+    cols = [x, y] + ([series] if series else [])
+    plot_df = df[cols].copy()
+    plot_df[x] = pd.to_numeric(plot_df[x], errors="coerce")
+    plot_df[y] = pd.to_numeric(plot_df[y], errors="coerce")
+    plot_df = plot_df.dropna(subset=[x, y])
+    plot_df = clip_points(plot_df, max_points, date_like=False)
+    if plot_df.empty:
+        raise ValueError("Sem dados válidos para scatter.")
+    if series and series in plot_df.columns:
+        traces = []
+        for label, group in plot_df.groupby(series, dropna=False):
+            traces.append({{"type": "scatter", "mode": "markers", "name": normalise_label(label), "x": group[x].tolist(), "y": group[y].tolist()}})
+        chart_payload["data"] = traces
+    else:
+        chart_payload["data"] = [{{"type": "scatter", "mode": "markers", "x": plot_df[x].tolist(), "y": plot_df[y].tolist(), "name": y}}]
+    chart_payload["layout"].update({{"xaxis": {{"title": x}}, "yaxis": {{"title": y}}}})
+    svg_markup = render_scatter_svg(plot_df[x].tolist(), plot_df[y].tolist(), title)
+elif chart_type == "histogram":
+    target = y or x
+    if not target:
+        raise ValueError("Histogram requer coluna numérica.")
+    plot_df = pd.DataFrame({{target: pd.to_numeric(df[target], errors="coerce")}}).dropna()
+    plot_df = clip_points(plot_df, max_points, date_like=False)
+    if plot_df.empty:
+        raise ValueError("Sem dados válidos para histogram.")
+    chart_payload["data"] = [{{"type": "histogram", "x": plot_df[target].tolist(), "name": target}}]
+    chart_payload["layout"].update({{"xaxis": {{"title": target}}, "yaxis": {{"title": "Frequência"}}}})
+    svg_markup = render_histogram_svg(plot_df[target].tolist(), title)
+elif chart_type == "box":
+    target = y or x
+    if not target:
+        raise ValueError("Box plot requer coluna numérica.")
+    cols = [target] + ([x] if x and x != target else [])
+    plot_df = df[cols].copy()
+    plot_df[target] = pd.to_numeric(plot_df[target], errors="coerce")
+    plot_df = plot_df.dropna(subset=[target])
+    plot_df = clip_points(plot_df, max_points, date_like=False)
+    if plot_df.empty:
+        raise ValueError("Sem dados válidos para box plot.")
+    chart_payload["data"] = [{{"type": "box", "y": plot_df[target].tolist(), "name": target}}]
+    chart_payload["layout"].update({{"yaxis": {{"title": target}}}})
+    svg_markup = render_histogram_svg(plot_df[target].tolist(), title)
+else:
+    if not x:
+        raise ValueError("É necessária uma x_column para este gráfico.")
+    base = df.copy()
+    group_keys = [x] + ([series] if series else [])
+    if agg == "count" or not y:
+        grouped = base.groupby(group_keys, dropna=False).size().reset_index(name="value")
+    else:
+        base = base.dropna(subset=[y])
+        grouped = base.groupby(group_keys, dropna=False)[y].agg(agg).reset_index(name="value")
+    if x_kind == "date":
+        grouped = grouped.sort_values(x)
+    if top_n and chart_type in ("bar", "pie"):
+        grouped = grouped.sort_values("value", ascending=False).head(top_n)
+    plot_df = grouped.copy()
+    plot_df = clip_points(plot_df, max_points, date_like=(x_kind == "date"))
+    if plot_df.empty:
+        raise ValueError("Sem dados suficientes para o gráfico pedido.")
+    if chart_type == "pie":
+        chart_payload["data"] = [{{"type": "pie", "labels": plot_df[x].astype(str).tolist(), "values": plot_df["value"].tolist(), "name": x}}]
+        svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title)
+    elif chart_type == "line":
+        if series and series in plot_df.columns:
+            traces = []
+            for label, group in plot_df.groupby(series, dropna=False):
+                ordered = group.sort_values(x) if x_kind == "date" else group
+                traces.append({{"type": "scatter", "mode": "lines+markers", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()}})
+            chart_payload["data"] = traces
+        else:
+            ordered = plot_df.sort_values(x) if x_kind == "date" else plot_df
+            chart_payload["data"] = [{{"type": "scatter", "mode": "lines+markers", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}}]
+        svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title, line_mode=True)
+    elif chart_type == "area":
+        if series and series in plot_df.columns:
+            traces = []
+            for label, group in plot_df.groupby(series, dropna=False):
+                ordered = group.sort_values(x) if x_kind == "date" else group
+                traces.append({{"type": "scatter", "mode": "lines", "fill": "tozeroy", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()}})
+            chart_payload["data"] = traces
+        else:
+            ordered = plot_df.sort_values(x) if x_kind == "date" else plot_df
+            chart_payload["data"] = [{{"type": "scatter", "mode": "lines", "fill": "tozeroy", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}}]
+        svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title, line_mode=True)
+    else:
+        if series and series in plot_df.columns:
+            traces = []
+            for label, group in plot_df.groupby(series, dropna=False):
+                traces.append({{"type": "bar", "name": normalise_label(label), "x": group[x].astype(str).tolist(), "y": group["value"].tolist()}})
+            chart_payload["data"] = traces
+            chart_payload["layout"]["barmode"] = "group"
+        else:
+            chart_payload["data"] = [{{"type": "bar", "x": plot_df[x].astype(str).tolist(), "y": plot_df["value"].tolist(), "name": "value"}}]
+        svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title)
+    chart_payload["layout"].update({{"xaxis": {{"title": x}}, "yaxis": {{"title": "value"}}}})
+
+write_plotly_html(chart_payload, title)
+plot_df.to_csv("uploaded_table_chart_data.csv", index=False, encoding="utf-8-sig")
+Path("uploaded_table_chart.svg").write_text(svg_markup or render_bar_like_svg([], [], title), encoding="utf-8")
+
+summary = {{
+    "chart_type": chart_type,
+    "x_column": x,
+    "y_column": y,
+    "series_column": series,
+    "agg": agg,
+    "rows_used": int(len(plot_df)),
+    "source_rows": int(len(df)),
+}}
+print(json.dumps(summary, ensure_ascii=False))
+""".strip()
+
+
+async def tool_chart_uploaded_table(
+    query: str = "",
+    conv_id: str = "",
+    user_sub: str = "",
+    filename: str = "",
+    chart_type: str = "auto",
+    x_column: str = "",
+    y_column: str = "",
+    series_column: str = "",
+    agg: str = "auto",
+    top_n: int = 20,
+    max_points: int = 2000,
+):
+    safe_query = str(query or "").strip()
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    if not safe_conv:
+        return {"error": "conv_id é obrigatório para gerar gráficos de ficheiros carregados."}
+
+    source = await _resolve_uploaded_tabular_source(safe_conv, safe_user, filename)
+    if source.get("error"):
+        return source
+    selected_filename = str(source.get("filename", "") or "")
+    raw_bytes = source.get("raw_bytes") or b""
+
+    try:
+        preview = load_tabular_preview(raw_bytes, selected_filename, preview_rows=200, preview_char_limit=20_000)
+    except TabularLoaderError as exc:
+        return {"error": str(exc)}
+    finally:
+        del source
+
+    spec = _build_uploaded_table_chart_spec(
+        safe_query,
+        preview,
+        chart_type,
+        x_column=x_column,
+        y_column=y_column,
+        series_column=series_column,
+        agg=agg,
+        top_n=top_n,
+        max_points=max_points,
+    )
+
+    if spec.get("chart_type") == "scatter" and (not spec.get("x_column") or not spec.get("y_column")):
+        return {
+            "error": "Não consegui inferir duas colunas numéricas para scatter. Indica x_column e y_column.",
+            "columns": preview.get("columns", []),
+            "filename": selected_filename,
+        }
+    if spec.get("chart_type") in {"histogram", "box"} and not spec.get("y_column") and not spec.get("x_column"):
+        return {
+            "error": "Não consegui inferir coluna numérica para o gráfico pedido.",
+            "columns": preview.get("columns", []),
+            "filename": selected_filename,
+        }
+    if spec.get("chart_type") not in {"histogram", "box", "scatter"} and not spec.get("x_column"):
+        return {
+            "error": "Não consegui inferir a coluna do eixo X. Indica x_column explicitamente.",
+            "columns": preview.get("columns", []),
+            "filename": selected_filename,
+        }
+
+    code = _build_uploaded_table_chart_code(selected_filename, spec, safe_query)
+    result = await tool_run_code(
+        code=code,
+        description=f"Gerar gráfico {spec.get('chart_type')} a partir de {selected_filename}",
+        conv_id=safe_conv,
+        user_sub=safe_user,
+        filename=selected_filename,
+    )
+    result["source"] = "uploaded_table_chart"
+    result["chart_spec"] = spec
+    result["filename"] = selected_filename
+    result["row_count"] = int(preview.get("row_count", 0) or 0)
+    result["columns"] = list(preview.get("columns") or [])
+    return result
 
 
 async def _load_uploaded_files_for_code(
@@ -1536,6 +2113,29 @@ _BUILTIN_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "chart_uploaded_table",
+            "description": "Gera gráficos robustos diretamente de CSV/Excel carregado usando code interpreter. Preferir para charts de ficheiros carregados, incluindo scatter, histogram, séries temporais e multi-series.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Pedido do utilizador para o gráfico (ex: 'grafico de linhas de vendas por mês')."},
+                    "conv_id": {"type": "string", "description": "ID da conversa (autopreenchido pelo agente)."},
+                    "filename": {"type": "string", "description": "Nome do ficheiro carregado, se houver vários."},
+                    "chart_type": {"type": "string", "enum": ["auto", "bar", "line", "scatter", "histogram", "pie", "box", "area"], "description": "Tipo de gráfico. Default: auto."},
+                    "x_column": {"type": "string", "description": "Coluna para eixo X/categorias/tempo."},
+                    "y_column": {"type": "string", "description": "Coluna numérica para eixo Y/valores."},
+                    "series_column": {"type": "string", "description": "Coluna opcional para séries/cor."},
+                    "agg": {"type": "string", "enum": ["auto", "sum", "mean", "count", "min", "max", "median", "none"], "description": "Agregação para charts agrupados."},
+                    "top_n": {"type": "integer", "description": "Top-N categorias para bar/pie."},
+                    "max_points": {"type": "integer", "description": "Máximo de pontos no gráfico antes de downsample controlado."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {"type":"function","function":{"name":"analyze_patterns","description":"Analisa padrões de escrita de work items com LLM. Templates, estilo de autor.","parameters":{"type":"object","properties":{"created_by":{"type":"string"},"topic":{"type":"string"},"work_item_type":{"type":"string","description":"Default: 'User Story'"},"area_path":{"type":"string"},"sample_size":{"type":"integer","description":"Default: 50"},"analysis_type":{"type":"string","description":"'template','author_style','general'"}}}}},
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
     {"type":"function","function":{"name":"get_writer_profile","description":"Carrega perfil de escrita de um autor para personalizar user stories. Usar quando o utilizador mencionar um autor específico.","parameters":{"type":"object","properties":{"author_name":{"type":"string","description":"Nome do autor (ex: 'Pedro Mousinho')."}},"required":["author_name"]}}},
@@ -1547,6 +2147,8 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"refine_workitem","description":"Refina uma User Story existente no DevOps a partir de uma instrução curta (sem alterar automaticamente o item). Usa quando o utilizador pedir ajustes numa US já criada, ex: 'na US 12345 adiciona validação de email'.","parameters":{"type":"object","properties":{"work_item_id":{"type":"integer","description":"ID do work item existente a refinar."},"refinement_request":{"type":"string","description":"Instrução objetiva do que mudar na US existente."}},"required":["work_item_id","refinement_request"]}}},
     {"type":"function","function":{"name":"generate_chart","description":"Gera gráfico interativo (bar, pie, line, scatter, histogram, hbar). USA SEMPRE que o utilizador pedir gráfico, chart, visualização ou distribuição visual. Extrai dados de tool_results anteriores ou de dados fornecidos.","parameters":{"type":"object","properties":{"chart_type":{"type":"string","description":"Tipo: 'bar','pie','line','scatter','histogram','hbar'. Default: 'bar'."},"title":{"type":"string","description":"Título do gráfico."},"x_values":{"type":"array","items":{"type":"string"},"description":"Valores eixo X (categorias ou datas). Ex: ['Active','Closed','New']"},"y_values":{"type":"array","items":{"type":"number"},"description":"Valores eixo Y (numéricos). Ex: [45, 30, 12]"},"labels":{"type":"array","items":{"type":"string"},"description":"Labels para pie chart. Ex: ['Bug','US','Task']"},"values":{"type":"array","items":{"type":"number"},"description":"Valores para pie chart. Ex: [20, 50, 30]"},"series":{"type":"array","items":{"type":"object"},"description":"Multi-series. Cada obj: {type,name,x,y,labels,values}"},"x_label":{"type":"string","description":"Label do eixo X"},"y_label":{"type":"string","description":"Label do eixo Y"}},"required":["title"]}}},
     {"type":"function","function":{"name":"run_code","description":"Executa código Python em sandbox seguro para cálculos, análise de dados, manipulação de CSV/Excel e geração de gráficos/ficheiros. Usa quando o pedido exigir computação programática que outras tools não cobrem.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Código Python a executar. Usa print() para output textual. Para gráficos matplotlib, usa plt.show(). Ficheiros guardados no diretório atual serão devolvidos para download."},"description":{"type":"string","description":"Descrição breve do objetivo do código (auditoria/log)."},"filename":{"type":"string","description":"Nome do ficheiro carregado a montar no sandbox (opcional; por omissão usa os mais recentes da conversa)."},"conv_id":{"type":"string","description":"ID da conversa (preenchido automaticamente pelo agente)."},"user_sub":{"type":"string","description":"Sub do utilizador para filtrar uploads da conversa (interno)."}},"required":["code"]}}},
+    {"type":"function","function":{"name":"prepare_outlook_draft","description":"Prepara um rascunho para Outlook quando o utilizador aprovar o texto de um email. Gera pack descarregável com .eml, payload JSON e script PowerShell para abrir compose no Outlook já preenchido.","parameters":{"type":"object","properties":{"subject":{"type":"string","description":"Assunto final do email."},"body":{"type":"string","description":"Corpos final do email, em texto ou HTML."},"to":{"type":"string","description":"Destinatários separados por ';'."},"cc":{"type":"string","description":"CC separados por ';'."},"bcc":{"type":"string","description":"BCC separados por ';'."},"body_format":{"type":"string","enum":["html","text"],"description":"Formato do body. Default: html."},"attachments":{"type":"array","items":{"type":"string"},"description":"Paths locais opcionais para anexar quando o .ps1 for executado no Windows."}},"required":["subject","body"]}}},
+    {"type":"function","function":{"name":"classify_uploaded_emails","description":"Classifica emails de um CSV/Excel carregado usando critérios dados pelo utilizador no momento e devolve pack pronto para Outlook (XLSX, CSV, JSON e PowerShell de aplicação por EntryID). Usa quando o utilizador pedir triagem, labels, flags, categorias, urgência ou pastas no Outlook.","parameters":{"type":"object","properties":{"instructions":{"type":"string","description":"Critérios e regras de classificação dados pelo utilizador."},"conv_id":{"type":"string","description":"ID da conversa com o ficheiro carregado. Preenchido automaticamente."},"filename":{"type":"string","description":"Nome do ficheiro a usar, se houver vários uploads."},"label_actions":{"type":"array","description":"Lista de labels permitidas e ação Outlook associada.","items":{"type":"object","properties":{"label":{"type":"string"},"action_type":{"type":"string","enum":["move","flag","category","none"]},"target":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"batch_size":{"type":"integer","description":"Tamanho do batch por chamada de classificação. Default: 20."}},"required":["instructions"]}}},
     {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF, DOCX, HTML) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf","docx","html"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
 ]
 
@@ -1582,6 +2184,19 @@ def _tool_dispatch() -> dict:
             arguments.get("top_n", 0),
             arguments.get("compare_periods"),
             arguments.get("full_points", False),
+        ),
+        "chart_uploaded_table": lambda arguments: tool_chart_uploaded_table(
+            arguments.get("query", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
+            arguments.get("chart_type", "auto"),
+            arguments.get("x_column", ""),
+            arguments.get("y_column", ""),
+            arguments.get("series_column", ""),
+            arguments.get("agg", "auto"),
+            arguments.get("top_n", 20),
+            arguments.get("max_points", 2000),
         ),
         "analyze_patterns": lambda arguments: tool_analyze_patterns_with_llm(arguments.get("created_by"), arguments.get("topic"), arguments.get("work_item_type","User Story"), arguments.get("area_path"), arguments.get("sample_size",50), arguments.get("analysis_type","template")),
         "generate_user_stories": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("context",""), arguments.get("num_stories",3), arguments.get("reference_area"), arguments.get("reference_author"), arguments.get("reference_topic")),
@@ -1639,6 +2254,23 @@ def _tool_dispatch() -> dict:
             arguments.get("conv_id", ""),
             arguments.get("user_sub", ""),
             arguments.get("filename", ""),
+        ),
+        "prepare_outlook_draft": lambda arguments: tool_prepare_outlook_draft(
+            arguments.get("subject", ""),
+            arguments.get("body", ""),
+            arguments.get("to", ""),
+            arguments.get("cc", ""),
+            arguments.get("bcc", ""),
+            arguments.get("body_format", "html"),
+            arguments.get("attachments"),
+        ),
+        "classify_uploaded_emails": lambda arguments: tool_classify_uploaded_emails(
+            arguments.get("instructions", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
+            arguments.get("label_actions"),
+            arguments.get("batch_size", 20),
         ),
         "generate_file": lambda arguments: tool_generate_file(
             arguments.get("format", "csv"),
@@ -1809,6 +2441,7 @@ def get_agent_system_prompt():
     miro_enabled = has_tool("search_miro")
     uploaded_doc_enabled = has_tool("search_uploaded_document")
     uploaded_table_enabled = has_tool("analyze_uploaded_table")
+    uploaded_table_chart_enabled = has_tool("chart_uploaded_table")
 
     def _join_with_ou(parts):
         if not parts:
@@ -1836,6 +2469,18 @@ def get_agent_system_prompt():
     if uploaded_table_enabled:
         gate_priority_hints.append(
             "- Se o utilizador pedir análise de CSV/Excel carregado, usa run_code como primeira tentativa. Usa analyze_uploaded_table apenas se run_code falhar ou timeout."
+        )
+    if uploaded_table_chart_enabled:
+        gate_priority_hints.append(
+            "- Se o utilizador pedir gráfico de CSV/Excel carregado, usa chart_uploaded_table como primeira tentativa."
+        )
+    if has_tool("prepare_outlook_draft"):
+        gate_priority_hints.append(
+            "- Se o utilizador aprovar um email e pedir rascunho para Outlook, usa prepare_outlook_draft."
+        )
+    if has_tool("classify_uploaded_emails"):
+        gate_priority_hints.append(
+            "- Se o utilizador pedir triagem/classificação de emails a partir de CSV/Excel carregado para flags/pastas/categorias Outlook, usa classify_uploaded_emails."
         )
     if figma_enabled:
         gate_priority_hints.append(
@@ -1928,6 +2573,29 @@ def get_agent_system_prompt():
             "   REGRA: Se analyze_uploaded_table devolver chart_ready, chama generate_chart com os campos de chart_ready."
         )
         next_rule += 1
+    if uploaded_table_chart_enabled:
+        routing_rules.append(
+            f"{next_rule}. Para GRAFICOS DE CSV/EXCEL CARREGADO -> usa chart_uploaded_table (OBRIGATORIO)\n"
+            "   Exemplos: \"faz scatter destas duas colunas\", \"mostra histograma do valor\", \"gera gráfico por mês deste Excel\".\n"
+            "   REGRA: Usa chart_uploaded_table antes de run_code quando o objetivo principal for um gráfico sobre ficheiro carregado.\n"
+            "   REGRA: Se precisares de chart custom muito fora do schema, então usa run_code."
+        )
+        next_rule += 1
+    if has_tool("prepare_outlook_draft"):
+        routing_rules.append(
+            f"{next_rule}. Para TRANSFORMAR um email final num rascunho Outlook -> usa prepare_outlook_draft\n"
+            "   Exemplos: \"está bom, faz-me o rascunho\", \"gera draft para Outlook\", \"prepara isto para enviar\".\n"
+            "   REGRA: Usa apenas quando o conteúdo do email já estiver aprovado/fechado pelo utilizador."
+        )
+        next_rule += 1
+    if has_tool("classify_uploaded_emails"):
+        routing_rules.append(
+            f"{next_rule}. Para TRIAGEM de emails carregados (flags, pastas, categorias Outlook) -> usa classify_uploaded_emails\n"
+            "   Exemplos: \"analisa estes emails e marca os urgentes\", \"devolve um ficheiro para o Outlook mover por pasta\", \"categoriza a inbox com estas regras\".\n"
+            "   REGRA: Se o utilizador definir labels/pastas/categorias, passa-as em label_actions.\n"
+            "   REGRA: Usa sempre o ficheiro carregado da conversa; não inventes EntryIDs nem ações fora das labels permitidas."
+        )
+        next_rule += 1
     if figma_enabled:
         routing_rules.append(
             f"{next_rule}. Para DESIGN, MOCKUPS, ECRAS UI e PROTOTIPOS FIGMA -> usa search_figma (OBRIGATORIO)\n"
@@ -1975,6 +2643,14 @@ def get_agent_system_prompt():
                 "- \"Mostra top 10 candles com maior amplitude\" -> run_code",
             ]
         )
+    if uploaded_table_chart_enabled:
+        usage_examples.extend(
+            [
+                "- \"Faz um gráfico deste Excel\" -> chart_uploaded_table",
+                "- \"Mostra scatter entre Revenue e Margin\" -> chart_uploaded_table",
+                "- \"Gera histograma do Close no CSV\" -> chart_uploaded_table",
+            ]
+        )
     if figma_enabled:
         usage_examples.extend(
             [
@@ -1988,6 +2664,14 @@ def get_agent_system_prompt():
                 "- \"Lista os boards do Miro\" -> search_miro",
                 "- \"O que foi discutido no board X?\" -> search_miro com board_id",
             ]
+        )
+    if has_tool("prepare_outlook_draft"):
+        usage_examples.append(
+            "- \"O email está bom, prepara um draft Outlook\" -> prepare_outlook_draft"
+        )
+    if has_tool("classify_uploaded_emails"):
+        usage_examples.append(
+            "- \"Analisa o CSV de emails e marca os urgentes no Outlook\" -> classify_uploaded_emails"
         )
     usage_examples_text = "\n".join(usage_examples)
 
