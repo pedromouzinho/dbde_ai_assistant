@@ -46,7 +46,7 @@
 | W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
 | W5 | AI Search no tier Free | MEDIO | ⏸️ ADIADO | — | Tier Free suficiente para uso actual. Reavaliar quando necessario. = Rec 5. |
-| W6 | Sem token blacklist / refresh | MEDIO | ❌ PENDENTE | — | Tokens validos 10h apos logout. Sem rate limiting em auth. |
+| W6 | Sem token blacklist / refresh | MEDIO | 🔄 CODEX | 2026-03-08 | Instrucoes Codex em `CODEX-TOKEN-BLACKLIST.md`. Token blacklist, account lockout, force-logout. |
 | W7 | Logging pode expor secrets | ALTO | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. = Rec 8. |
 | W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
 | W9 | Recursos potencialmente orfaos | BAIXO | ⚠️ PARCIAL | 2026-03-07 | 3/5 apagados. Restam CosmosDB + deployment gpt-4o. = Rec 6. |
