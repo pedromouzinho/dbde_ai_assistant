@@ -29,6 +29,7 @@ from config import (
     GENERATED_FILES_BLOB_CONTAINER,
 )
 from auth import hash_password
+from http_helpers import _sanitize_error_response
 
 # Global HTTP client — inicializado pelo app.py no startup
 http_client: Optional[httpx.AsyncClient] = None
@@ -259,7 +260,9 @@ async def blob_upload_bytes(
     url = f"{BLOB_SERVICE_BASE_URL}/{quote(container)}/{quote(blob_name, safe='/')}"
     resp = await client.put(url, headers=headers, content=payload)
     if resp.status_code not in (201, 202):
-        raise RuntimeError(f"blob_upload_bytes failed: {resp.status_code} {resp.text[:200]}")
+        raise RuntimeError(
+            f"blob_upload_bytes failed: {resp.status_code} {_sanitize_error_response(resp.text, 200)}"
+        )
     return {
         "container": container,
         "blob_name": blob_name,
@@ -300,7 +303,9 @@ async def blob_download_bytes(container: str, blob_name: str) -> Optional[bytes]
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        raise RuntimeError(f"blob_download_bytes failed: {resp.status_code} {resp.text[:200]}")
+        raise RuntimeError(
+            f"blob_download_bytes failed: {resp.status_code} {_sanitize_error_response(resp.text, 200)}"
+        )
     return resp.content
 
 
@@ -330,7 +335,11 @@ async def table_insert(table_name: str, entity: dict) -> bool:
         )
         if resp.status_code in (201, 204):
             return True
-        logger.error("Table insert error: %s - %s", resp.status_code, resp.text[:200])
+        logger.error(
+            "Table insert error: %s - %s",
+            resp.status_code,
+            _sanitize_error_response(resp.text, 200),
+        )
         return False
     except Exception as e:
         logger.error("[Storage] table_insert failed: %s", e)
@@ -354,7 +363,11 @@ async def table_query(table_name: str, filter_str: str = "", top: int = 50) -> l
         )
         if resp.status_code == 200:
             return resp.json().get("value", [])
-        logger.error("Table query error: %s - %s", resp.status_code, resp.text[:200])
+        logger.error(
+            "Table query error: %s - %s",
+            resp.status_code,
+            _sanitize_error_response(resp.text, 200),
+        )
         return []
     except Exception as e:
         logger.error("[Storage] table_query failed: %s", e)
@@ -380,7 +393,9 @@ async def table_merge(table_name: str, entity: dict):
     client = _require_http_client()
     resp = await client.request("MERGE", url, headers=headers, json=body, timeout=15)
     if resp.status_code not in (204, 200):
-        raise Exception(f"Table merge failed: {resp.status_code} - {resp.text[:200]}")
+        raise Exception(
+            f"Table merge failed: {resp.status_code} - {_sanitize_error_response(resp.text, 200)}"
+        )
 
 
 async def table_delete(table_name: str, partition_key: str, row_key: str):

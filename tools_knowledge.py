@@ -34,7 +34,7 @@ from config import (
     WEB_ANSWERS_TIMEOUT_SECONDS,
 )
 from llm_provider import get_embedding_provider
-from http_helpers import search_request_with_retry
+from http_helpers import _sanitize_error_response, search_request_with_retry
 from pii_shield import PIIMaskingContext, _regex_pre_mask
 
 _http_client: Optional[httpx.AsyncClient] = None
@@ -102,7 +102,11 @@ async def _rerank_items_post_retrieval(query: str, items: list) -> tuple[list, d
         client = _get_http_client()
         resp = await client.post(RERANK_ENDPOINT, headers=headers, json=payload)
         if resp.status_code >= 400:
-            logging.warning("[Tools] rerank HTTP %s: %s", resp.status_code, resp.text[:300])
+            logging.warning(
+                "[Tools] rerank HTTP %s: %s",
+                resp.status_code,
+                _sanitize_error_response(resp.text, 300),
+            )
             return items, {"applied": False, "reason": f"http_{resp.status_code}"}
 
         data = resp.json()
@@ -287,7 +291,12 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
         return {"error": f"Pesquisa web falhou: {str(e)}"}
 
     if resp.status_code != 200:
-        return {"error": f"Brave Search API {resp.status_code}: {resp.text[:200]}"}
+        return {
+            "error": (
+                f"Brave Search API {resp.status_code}: "
+                f"{_sanitize_error_response(resp.text, 200)}"
+            )
+        }
 
     try:
         data = resp.json()
@@ -346,7 +355,7 @@ async def tool_search_web(query: str, top: int = 5) -> dict:
                 logging.warning(
                     "[WebSearch] Brave Answers HTTP %s: %s",
                     answer_resp.status_code,
-                    answer_resp.text[:200],
+                    _sanitize_error_response(answer_resp.text, 200),
                 )
         except Exception as e:
             logging.warning("[WebSearch] Brave Answers failed: %s", e)

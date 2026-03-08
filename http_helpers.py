@@ -4,13 +4,34 @@
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import httpx
 
 
+_SECRET_PATTERNS = [
+    re.compile(
+        r'(?i)(api[_-]?key|authorization|x-api-key|ocp-apim-subscription-key|bearer)\s*[:=]\s*["\']?(?:Bearer\s+)?[\w\-\.]+'
+    ),
+    re.compile(r'(?i)(key|token|secret|password|pat)\s*[:=]\s*["\']?[\w\-\.]{8,}'),
+    re.compile(r'[A-Za-z0-9+/]{40,}={0,2}'),
+    re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}'),
+]
+
+
 def _log(prefix: str, msg: str) -> None:
     logging.info("[%s] %s", prefix, msg)
+
+
+def _sanitize_error_response(text: str | None, max_len: int = 200) -> str:
+    """Redact potential secrets from HTTP error bodies before logging."""
+    if not text:
+        return ""
+    truncated = str(text)[:max_len]
+    for pattern in _SECRET_PATTERNS:
+        truncated = pattern.sub("[REDACTED]", truncated)
+    return truncated
 
 
 async def _request_with_retry(
@@ -65,7 +86,9 @@ async def _request_with_retry(
                     continue
 
                 if resp.status_code >= 400:
-                    return {"error": f"{log_prefix} {resp.status_code}: {resp.text[:200]}"}
+                    return {
+                        "error": f"{log_prefix} {resp.status_code}: {_sanitize_error_response(resp.text, 200)}"
+                    }
 
                 if not resp.content:
                     return {}

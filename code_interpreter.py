@@ -11,6 +11,10 @@ import base64
 import json
 import logging
 import os
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on some platforms
+    resource = None
 import sys
 import tempfile
 import textwrap
@@ -30,6 +34,9 @@ RESULT_MARKER = "__CODE_RESULT__:"
 MAX_CODE_CHARS = 20000
 MAX_RETURN_FILE_BYTES = 10_000_000
 MAX_UPLOADED_FILE_BYTES = CODE_INTERPRETER_MAX_INPUT_FILE_BYTES
+_MINIMAL_PATH = "/usr/local/bin:/usr/bin:/bin"
+_CODE_CPU_LIMIT_SECONDS = 120
+_CODE_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
 # Imports seguros permitidos.
 ALLOWED_IMPORTS = {
@@ -57,8 +64,13 @@ BLOCKED_IMPORTS = {
     "webbrowser", "antigravity",
 }
 
+_BLOCKED_IMPORT_NAMES = {
+    "system", "popen", "exec", "eval", "remove", "unlink", "rmdir",
+    "rmtree", "Popen", "run", "call", "check_output", "check_call",
+}
 _BLOCKED_CALLS = {
     "exec", "eval", "compile", "__import__", "globals", "locals",
+    "getattr", "setattr", "delattr",
 }
 _BLOCKED_ATTR_CALLS = {
     "os.system", "os.popen", "os.remove", "os.unlink", "os.rmdir",
@@ -111,6 +123,10 @@ def _validate_code(code: str) -> Optional[str]:
             mod = str(node.module or "").strip()
             if not _is_import_allowed(mod):
                 return f"Import bloqueado por seguranca: {mod}"
+            for alias in node.names or []:
+                name = str(alias.name or "").strip()
+                if name in _BLOCKED_IMPORT_NAMES:
+                    return f"Import de funcao bloqueada por seguranca: from {mod} import {name}"
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
             if name in _BLOCKED_CALLS:
@@ -156,6 +172,47 @@ def _guess_mime(filename: str) -> str:
     return "application/octet-stream"
 
 
+def _build_subprocess_env(tmpdir: str) -> Dict[str, str]:
+    return {
+        "PATH": _MINIMAL_PATH,
+        "HOME": tmpdir,
+        "TMPDIR": tmpdir,
+        "PYTHONPATH": "",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MPLCONFIGDIR": tmpdir,
+    }
+
+
+def _set_resource_limits() -> None:
+    """Limit CPU time and virtual memory for the child process."""
+    if resource is None:
+        return
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_CPU,
+            (_CODE_CPU_LIMIT_SECONDS, _CODE_CPU_LIMIT_SECONDS),
+        )
+        if hasattr(resource, "RLIMIT_AS"):
+            resource.setrlimit(
+                resource.RLIMIT_AS,
+                (_CODE_MEMORY_LIMIT_BYTES, _CODE_MEMORY_LIMIT_BYTES),
+            )
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
+def _path_within_root(path: str, root: str) -> bool:
+    real_path = os.path.realpath(path)
+    real_root = os.path.realpath(root)
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _is_safe_symlink_source(path: str, root: str) -> bool:
+    if not os.path.islink(path):
+        return True
+    return _path_within_root(path, root)
+
+
 def _runner_script(tmpdir: str, code_b64: str) -> str:
     # Wrapper em subprocess isolado; bloqueia path absoluto e serializa resultado final.
     return textwrap.dedent(
@@ -172,9 +229,13 @@ def _runner_script(tmpdir: str, code_b64: str) -> str:
         TMPDIR = {tmpdir!r}
         os.chdir(TMPDIR)
         os.makedirs(os.path.join(TMPDIR, "mnt", "data"), exist_ok=True)
+        _real_root = os.path.realpath(TMPDIR)
         for _name in list(os.listdir(TMPDIR)):
             _src = os.path.join(TMPDIR, _name)
             if not os.path.isfile(_src) or _name.startswith("_"):
+                continue
+            _real_src = os.path.realpath(_src)
+            if os.path.islink(_src) and not (_real_src == _real_root or _real_src.startswith(_real_root + os.sep)):
                 continue
             _dst = os.path.join(TMPDIR, "mnt", "data", _name)
             try:
@@ -337,14 +398,8 @@ async def execute_code(code: str, uploaded_files: Optional[Dict[str, bytes]] = N
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=tmpdir,
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    "HOME": tmpdir,
-                    "TMPDIR": tmpdir,
-                    "PYTHONPATH": "",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "MPLCONFIGDIR": tmpdir,
-                },
+                env=_build_subprocess_env(tmpdir),
+                preexec_fn=_set_resource_limits if os.name != "nt" else None,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=CODE_INTERPRETER_TIMEOUT)

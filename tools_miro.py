@@ -11,6 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from config import MIRO_ACCESS_TOKEN
+from http_helpers import _sanitize_error_response
 from tool_registry import register_tool
 
 _MIRO_API_BASE = "https://api.miro.com/v2"
@@ -87,7 +88,9 @@ async def _miro_get(path: str, params=None):
                 await asyncio.sleep(attempt)
                 continue
             if resp.status_code >= 400:
-                return {"error": f"Miro {resp.status_code}: {resp.text[:200]}"}
+                return {
+                    "error": f"Miro {resp.status_code}: {_sanitize_error_response(resp.text, 200)}"
+                }
             return resp.json()
         except httpx.TimeoutException:
             if attempt == 3:
