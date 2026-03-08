@@ -110,6 +110,9 @@ from models import (
 from auth import (
     get_current_user, jwt_encode, jwt_decode, hash_password, verify_password,
     set_request_cookie_token, reset_request_cookie_token,
+    record_login_failure, is_account_locked, clear_login_attempts,
+    cleanup_blacklist, blacklist_token, invalidate_user_tokens,
+    _LOCKOUT_DURATION_MINUTES,
 )
 from storage import (
     init_http_client, ensure_tables_exist,
@@ -290,6 +293,7 @@ def _request_is_https(request: Request) -> bool:
 
 _rate_limiter_backend = TableStorageRateLimit()
 _last_rate_cache_cleanup = 0.0
+_last_blacklist_cleanup = 0.0
 limiter = _DecoratorRateLimiter(key_func=_user_or_ip_rate_key)
 
 @contextlib.asynccontextmanager
@@ -327,7 +331,7 @@ MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
 
 @app.middleware("http")
 async def enforce_allowed_origins(request: Request, call_next):
-    global _last_rate_cache_cleanup
+    global _last_rate_cache_cleanup, _last_blacklist_cleanup
     req_path = str(request.url.path or "").strip()
     is_exempt_path = req_path in _AUTH_EXEMPT_PATHS or req_path == "/health"
 
@@ -370,6 +374,9 @@ async def enforce_allowed_origins(request: Request, call_next):
         if now - _last_rate_cache_cleanup > 60:
             _rate_limiter_backend.cleanup_local_cache()
             _last_rate_cache_cleanup = now
+        if now - _last_blacklist_cleanup > 300:
+            cleanup_blacklist()
+            _last_blacklist_cleanup = now
 
         rule = limiter.resolve(request)
         if rule:
@@ -2954,12 +2961,24 @@ async def download_generated_file(request: Request, download_id: str, credential
 @app.post("/api/auth/login")
 @limiter.limit("5/minute", key_func=_login_rate_key)
 async def login(request: Request, login_request: LoginRequest):
+    if is_account_locked(login_request.username):
+        raise HTTPException(
+            429,
+            f"Conta temporariamente bloqueada. Tenta novamente em {_LOCKOUT_DURATION_MINUTES} minutos.",
+        )
+
     safe_username = odata_escape(login_request.username)
     users = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
-    if not users: raise HTTPException(401, "Credenciais inválidas")
+    if not users:
+        record_login_failure(login_request.username)
+        raise HTTPException(401, "Credenciais inválidas")
     user = users[0]
-    if not verify_password(login_request.password, user.get("PasswordHash","")): raise HTTPException(401, "Credenciais inválidas")
-    if user.get("IsActive") == False: raise HTTPException(403, "Conta desactivada")
+    if not verify_password(login_request.password, user.get("PasswordHash","")):
+        record_login_failure(login_request.username)
+        raise HTTPException(401, "Credenciais inválidas")
+    if user.get("IsActive") == False:
+        raise HTTPException(403, "Conta desactivada")
+    clear_login_attempts(login_request.username)
     token = jwt_encode({"sub":login_request.username, "role":user.get("Role","user"), "name":user.get("DisplayName",login_request.username)})
     response = JSONResponse(
         content={
@@ -2985,6 +3004,20 @@ async def login(request: Request, login_request: LoginRequest):
 @app.post("/api/auth/logout")
 @limiter.limit("20/minute", key_func=_user_or_ip_rate_key)
 async def logout(request: Request):
+    token = (request.cookies.get(AUTH_COOKIE_NAME) or "").strip()
+    if token:
+        try:
+            payload = jwt_decode(token)
+            jti = str(payload.get("jti", "") or "")
+            exp_raw = payload.get("exp")
+            if jti and isinstance(exp_raw, str):
+                exp = datetime.fromisoformat(exp_raw)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                blacklist_token(jti, exp)
+        except ValueError:
+            pass
+
     response = JSONResponse(content={"status": "ok"})
     secure_cookie = AUTH_COOKIE_SECURE if _request_is_https(request) else False
     response.set_cookie(
@@ -3025,6 +3058,7 @@ async def deactivate_user(request: Request, username: str, credentials: HTTPAuth
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
     if username == user.get("sub"): raise HTTPException(400, "Não podes desactivar-te")
     await table_merge("Users", {"PartitionKey":"user","RowKey":username,"IsActive":False})
+    invalidate_user_tokens(username)
     return {"status":"ok"}
 
 @app.post("/api/auth/change-password")
@@ -3037,6 +3071,7 @@ async def change_password(request: Request, payload: ChangePasswordRequest, cred
     if not users: raise HTTPException(404, "User não encontrado")
     if not verify_password(payload.current_password, users[0].get("PasswordHash","")): raise HTTPException(401, "Password actual incorrecta")
     await table_merge("Users", {"PartitionKey":"user","RowKey":username,"PasswordHash":hash_password(payload.new_password)})
+    invalidate_user_tokens(username)
     return {"status":"ok"}
 
 @app.post("/api/auth/reset-password/{username}")
@@ -3045,7 +3080,17 @@ async def admin_reset_password(request: Request, username: str, payload: LoginRe
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
     await table_merge("Users", {"PartitionKey":"user","RowKey":username,"PasswordHash":hash_password(payload.password)})
+    invalidate_user_tokens(username)
     return {"status":"ok"}
+
+@app.post("/api/auth/force-logout/{username}")
+@limiter.limit("10/minute", key_func=_user_or_ip_rate_key)
+async def force_logout_user(request: Request, username: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user = get_current_user(credentials)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Apenas admins")
+    invalidate_user_tokens(username)
+    return {"status": "ok", "message": f"Tokens de {username} invalidados"}
 
 @app.get("/api/auth/me")
 @limiter.limit("60/minute", key_func=_user_or_ip_rate_key)
