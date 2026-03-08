@@ -16,7 +16,7 @@
 | Em progresso | 0 |
 | Pendentes | 22 |
 | **Progresso** | **45%** |
-| **Risk Score actual estimado** | **~2.6/10** |
+| **Risk Score actual estimado** | **~2.5/10** |
 
 ---
 
@@ -103,6 +103,8 @@
 | Security hardening — secrets in logs | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. 15 tests novos. PR #6 merged. |
 | Code Interpreter hardening | 2026-03-08 | PATH minimal, `resource.setrlimit()` CPU/mem, symlink validation, AST ImportFrom + getattr/setattr/delattr blocking. PR #6 merged. |
 | Token blacklist + auth hardening | 2026-03-08 | JWT jti/iat claims, in-memory blacklist, user-level invalidation, account lockout (5/15min), force-logout endpoint. 13 tests. PR #7 merged. |
+| Email tools + tabular loader + chart tool | 2026-03-08 | `prepare_outlook_draft`, `classify_uploaded_emails`, `tabular_loader.py`, `chart_uploaded_table`, XLSB support, per-extension upload limits, frontend UX. 245 tests. PR #8 merged. |
+| Refactoring fixes (review findings) | 2026-03-08 | conv_id injection for chart tool, `_TOOLS_NEEDING_CONV_CONTEXT` consolidation, chart spec column validation, dedup parsing via tabular_loader, TSV/XLSB email classification support. PR #8. |
 
 ---
 
