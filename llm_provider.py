@@ -28,6 +28,7 @@ from config import (
     MODEL_ROUTER_NON_PROD_ONLY, IS_PRODUCTION,
     DEBUG_LOG_SIZE,
 )
+from http_helpers import _sanitize_error_response
 from models import LLMResponse, LLMToolCall, StreamEvent
 from pii_shield import PIIMaskingContext, mask_messages, PII_ENABLED
 from prompt_shield import check_messages, PROMPT_SHIELD_ENABLED
@@ -361,7 +362,10 @@ class AzureOpenAIProvider(LLMProvider):
                     raise
                 await asyncio.sleep(3 * (attempt + 1))
             except httpx.HTTPStatusError as e:
-                _log(f"Azure OpenAI HTTP {e.response.status_code}: {e.response.text[:200]}")
+                _log(
+                    f"Azure OpenAI HTTP {e.response.status_code}: "
+                    f"{_sanitize_error_response(e.response.text, 200)}"
+                )
                 raise
 
         raise RuntimeError("Azure OpenAI: max retries exceeded")
@@ -540,7 +544,10 @@ class AnthropicProvider(LLMProvider):
                     raise
                 await asyncio.sleep(3 * (attempt + 1))
             except httpx.HTTPStatusError as e:
-                _log(f"Anthropic HTTP {e.response.status_code}: {e.response.text[:300]}")
+                _log(
+                    f"Anthropic HTTP {e.response.status_code}: "
+                    f"{_sanitize_error_response(e.response.text, 300)}"
+                )
                 raise
 
         raise RuntimeError("Anthropic: max retries exceeded")
@@ -582,7 +589,7 @@ class AnthropicProvider(LLMProvider):
                 logger.warning(
                     "Anthropic streaming failed (status=%d), falling back to non-streaming. Body: %s",
                     resp.status_code,
-                    body_preview,
+                    _sanitize_error_response(body_preview, 300),
                 )
                 # Fallback to non-streaming
                 body.pop("stream")

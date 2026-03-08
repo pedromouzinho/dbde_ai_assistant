@@ -86,7 +86,9 @@ async def _request_with_retry(
                     continue
 
                 if resp.status_code >= 400:
-                    return {"error": f"{log_prefix} {resp.status_code}: {resp.text[:200]}"}
+                    return {
+                        "error": f"{log_prefix} {resp.status_code}: {_sanitize_error_response(resp.text, 200)}"
+                    }
 
                 if not resp.content:
                     return {}

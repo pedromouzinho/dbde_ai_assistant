@@ -13,6 +13,7 @@ from urllib.parse import quote
 import httpx
 
 from config import FIGMA_ACCESS_TOKEN
+from http_helpers import _sanitize_error_response
 from tool_registry import register_tool
 
 _FIGMA_API_BASE = "https://api.figma.com/v1"
@@ -89,7 +90,9 @@ async def _figma_get(path: str, params=None):
                 await asyncio.sleep(attempt)
                 continue
             if resp.status_code >= 400:
-                return {"error": f"Figma {resp.status_code}: {resp.text[:200]}"}
+                return {
+                    "error": f"Figma {resp.status_code}: {_sanitize_error_response(resp.text, 200)}"
+                }
             return resp.json()
         except httpx.TimeoutException:
             if attempt == 3:
