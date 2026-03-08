@@ -8,6 +8,9 @@ import json
 import base64
 import secrets
 import logging
+import threading
+import time
+import uuid
 import hmac as _hmac
 import hashlib as _hashlib
 from contextvars import ContextVar, Token
@@ -19,6 +22,19 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from config import JWT_SECRET, JWT_SECRET_PREVIOUS, JWT_EXPIRATION_HOURS, AUTH_COOKIE_NAME
 logger = logging.getLogger(__name__)
+_MAX_LOGIN_ATTEMPTS = 5
+_LOCKOUT_DURATION_MINUTES = 15
+
+# Token blacklist — in-memory, auto-cleanup de tokens expirados
+_token_blacklist: dict[str, datetime] = {}
+_blacklist_lock = threading.Lock()
+
+# User-level invalidation — todos os tokens emitidos antes deste timestamp sao invalidos
+_user_invalidated_before: dict[str, datetime] = {}
+_user_invalidated_lock = threading.Lock()
+
+_login_attempts: dict[str, list[float]] = {}
+_login_attempts_lock = threading.Lock()
 
 
 # =============================================================================
@@ -41,6 +57,10 @@ def jwt_encode(payload: dict, secret: str = JWT_SECRET) -> str:
     data = dict(payload or {})
     if "exp" not in data:
         data["exp"] = (datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)).isoformat()
+    if "iat" not in data:
+        data["iat"] = datetime.now(timezone.utc).isoformat()
+    if "jti" not in data:
+        data["jti"] = uuid.uuid4().hex
     header = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     pay = _b64url_encode(json.dumps(data, default=str).encode())
     sig_input = f"{header}.{pay}".encode()
@@ -84,7 +104,106 @@ def _jwt_decode_single(token: str, secret: str) -> dict:
         exp = exp.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > exp:
         raise ValueError("Token expired")
+
+    jti = payload.get("jti")
+    if jti and is_token_blacklisted(str(jti)):
+        raise ValueError("Token revoked")
+
+    sub = str(payload.get("sub", "") or "")
+    iat_raw = payload.get("iat")
+    if sub and iat_raw and isinstance(iat_raw, str):
+        iat = datetime.fromisoformat(iat_raw)
+        if iat.tzinfo is None:
+            iat = iat.replace(tzinfo=timezone.utc)
+        if is_user_token_invalidated(sub, iat):
+            raise ValueError("Token invalidated by admin")
     return payload
+
+
+def blacklist_token(jti: str, exp: datetime) -> None:
+    """Adiciona um token (por jti) a blacklist ate expirar."""
+    if not jti:
+        return
+    expiry = exp
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    with _blacklist_lock:
+        _token_blacklist[jti] = expiry
+
+
+def is_token_blacklisted(jti: str) -> bool:
+    """Verifica se um token esta na blacklist."""
+    if not jti:
+        return False
+    with _blacklist_lock:
+        return jti in _token_blacklist
+
+
+def invalidate_user_tokens(username: str) -> None:
+    """Invalida todos os tokens de um user emitidos antes de agora."""
+    if not username:
+        return
+    with _user_invalidated_lock:
+        _user_invalidated_before[username] = datetime.now(timezone.utc)
+
+
+def is_user_token_invalidated(username: str, iat: datetime) -> bool:
+    """Verifica se o token de um user foi invalidado globalmente."""
+    if not username:
+        return False
+    issued_at = iat
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    with _user_invalidated_lock:
+        cutoff = _user_invalidated_before.get(username)
+    if cutoff is None:
+        return False
+    return issued_at <= cutoff
+
+
+def cleanup_blacklist() -> int:
+    """Remove tokens expirados da blacklist. Retorna numero de removidos."""
+    now = datetime.now(timezone.utc)
+    removed = 0
+    with _blacklist_lock:
+        expired_jtis = [jti for jti, exp in _token_blacklist.items() if now > exp]
+        for jti in expired_jtis:
+            del _token_blacklist[jti]
+            removed += 1
+    return removed
+
+
+def record_login_failure(username: str) -> None:
+    """Regista uma tentativa falhada de login."""
+    if not username:
+        return
+    now = time.time()
+    with _login_attempts_lock:
+        attempts = _login_attempts.setdefault(username, [])
+        attempts.append(now)
+        cutoff = now - (_LOCKOUT_DURATION_MINUTES * 60)
+        _login_attempts[username] = [t for t in attempts if t > cutoff]
+
+
+def is_account_locked(username: str) -> bool:
+    """Verifica se a conta esta bloqueada por tentativas falhadas."""
+    if not username:
+        return False
+    now = time.time()
+    cutoff = now - (_LOCKOUT_DURATION_MINUTES * 60)
+    with _login_attempts_lock:
+        attempts = _login_attempts.get(username, [])
+        recent = [t for t in attempts if t > cutoff]
+        _login_attempts[username] = recent
+        return len(recent) >= _MAX_LOGIN_ATTEMPTS
+
+
+def clear_login_attempts(username: str) -> None:
+    """Limpa tentativas falhadas apos login bem sucedido."""
+    if not username:
+        return
+    with _login_attempts_lock:
+        _login_attempts.pop(username, None)
 
 
 # =============================================================================
