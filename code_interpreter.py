@@ -48,7 +48,7 @@ ALLOWED_IMPORTS = {
     "random", "hashlib", "uuid",
     "pandas", "numpy", "matplotlib", "matplotlib.pyplot",
     "seaborn", "plotly", "plotly.express", "plotly.graph_objects",
-    "openpyxl", "xlsxwriter",
+    "openpyxl", "pyxlsb", "xlrd", "xlsxwriter",
     "io", "base64", "copy", "pprint", "typing",
 }
 
@@ -161,6 +161,8 @@ def _guess_mime(filename: str) -> str:
         return "text/csv"
     if fname.endswith(".xlsx"):
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if fname.endswith(".xlsb"):
+        return "application/vnd.ms-excel.sheet.binary.macroenabled.12"
     if fname.endswith(".xls"):
         return "application/vnd.ms-excel"
     if fname.endswith(".json"):
