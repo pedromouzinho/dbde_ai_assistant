@@ -12,11 +12,11 @@
 | Metrica | Valor |
 |---|---|
 | Total de itens identificados | 40 |
-| Concluidos | 17 |
+| Concluidos | 18 |
 | Em progresso | 0 |
-| Pendentes | 23 |
-| **Progresso** | **42%** |
-| **Risk Score actual estimado** | **~2.8/10** |
+| Pendentes | 22 |
+| **Progresso** | **45%** |
+| **Risk Score actual estimado** | **~2.6/10** |
 
 ---
 
@@ -46,7 +46,7 @@
 | W3 | App Insights ingestao desactivada | ALTO | ✅ FEITO | 2026-03-07 | `ingestionMode=LogAnalytics`, workspace `dbde-ai-logs`. = Rec 1. |
 | W4 | Health Check Path null | ALTO | ✅ FEITO | 2026-03-07 | `healthCheckPath=/health`. = Rec 1. |
 | W5 | AI Search no tier Free | MEDIO | ⏸️ ADIADO | — | Tier Free suficiente para uso actual. Reavaliar quando necessario. = Rec 5. |
-| W6 | Sem token blacklist / refresh | MEDIO | 🔄 CODEX | 2026-03-08 | Instrucoes Codex em `CODEX-TOKEN-BLACKLIST.md`. Token blacklist, account lockout, force-logout. |
+| W6 | Sem token blacklist / refresh | MEDIO | ✅ FEITO | 2026-03-08 | Token blacklist in-memory (jti), user-level invalidation, account lockout (5 tentativas/15 min), force-logout admin. PR #7 merged. |
 | W7 | Logging pode expor secrets | ALTO | ✅ FEITO | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. PR #6 merged. = Rec 8. |
 | W8 | PII Shield overlapping + HTTP client | ALTO | ✅ FEITO | 2026-03-07 | Phase 1: overlapping resolution, regex pre-mask. Phase 2: shared httpx client, audit logging. PR #3 + PR #4. |
 | W9 | Recursos potencialmente orfaos | BAIXO | ⚠️ PARCIAL | 2026-03-07 | 3/5 apagados. Restam CosmosDB + deployment gpt-4o. = Rec 6. |
@@ -102,6 +102,7 @@
 | Concurrency locks implementation | 2026-03-07 | 17 race conditions corrigidas em agent.py + llm_provider.py. 12 tests novos. PR #5 merged. |
 | Security hardening — secrets in logs | 2026-03-08 | `_sanitize_error_response()` com 4 regex patterns. 14 pontos em 6 ficheiros. 15 tests novos. PR #6 merged. |
 | Code Interpreter hardening | 2026-03-08 | PATH minimal, `resource.setrlimit()` CPU/mem, symlink validation, AST ImportFrom + getattr/setattr/delattr blocking. PR #6 merged. |
+| Token blacklist + auth hardening | 2026-03-08 | JWT jti/iat claims, in-memory blacklist, user-level invalidation, account lockout (5/15min), force-logout endpoint. 13 tests. PR #7 merged. |
 
 ---
 
@@ -118,7 +119,7 @@
 ### Prioridade 3 — Medio impacto (dias)
 - [ ] ~~**Rec 5 / W5**: Upgrade AI Search para Basic~~ ⏸️ ADIADO — Free suficiente
 - [ ] ~~**Rec 10 / O5**: Testar gpt-5.3-chat + Model Router~~ ⏸️ ADIADO — nao certificados para dados confidenciais
-- [ ] **W6**: Token blacklist + rate limiting em auth
+- [x] **W6**: Token blacklist + account lockout ✅ PR #7 merged
 - [x] **W10**: Code Interpreter hardening (PATH, CPU/mem, symlinks) ✅ PR #6 merged
 
 ### Prioridade 4 — Esforco significativo (semanas)
