@@ -11,6 +11,10 @@ import base64
 import json
 import logging
 import os
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on some platforms
+    resource = None
 import sys
 import tempfile
 import textwrap
@@ -30,6 +34,9 @@ RESULT_MARKER = "__CODE_RESULT__:"
 MAX_CODE_CHARS = 20000
 MAX_RETURN_FILE_BYTES = 10_000_000
 MAX_UPLOADED_FILE_BYTES = CODE_INTERPRETER_MAX_INPUT_FILE_BYTES
+_MINIMAL_PATH = "/usr/local/bin:/usr/bin:/bin"
+_CODE_CPU_LIMIT_SECONDS = 120
+_CODE_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
 # Imports seguros permitidos.
 ALLOWED_IMPORTS = {
@@ -154,6 +161,35 @@ def _guess_mime(filename: str) -> str:
     if fname.endswith(".html") or fname.endswith(".htm"):
         return "text/html"
     return "application/octet-stream"
+
+
+def _build_subprocess_env(tmpdir: str) -> Dict[str, str]:
+    return {
+        "PATH": _MINIMAL_PATH,
+        "HOME": tmpdir,
+        "TMPDIR": tmpdir,
+        "PYTHONPATH": "",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MPLCONFIGDIR": tmpdir,
+    }
+
+
+def _set_resource_limits() -> None:
+    """Limit CPU time and virtual memory for the child process."""
+    if resource is None:
+        return
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_CPU,
+            (_CODE_CPU_LIMIT_SECONDS, _CODE_CPU_LIMIT_SECONDS),
+        )
+        if hasattr(resource, "RLIMIT_AS"):
+            resource.setrlimit(
+                resource.RLIMIT_AS,
+                (_CODE_MEMORY_LIMIT_BYTES, _CODE_MEMORY_LIMIT_BYTES),
+            )
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 def _runner_script(tmpdir: str, code_b64: str) -> str:
@@ -337,14 +373,8 @@ async def execute_code(code: str, uploaded_files: Optional[Dict[str, bytes]] = N
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=tmpdir,
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    "HOME": tmpdir,
-                    "TMPDIR": tmpdir,
-                    "PYTHONPATH": "",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "MPLCONFIGDIR": tmpdir,
-                },
+                env=_build_subprocess_env(tmpdir),
+                preexec_fn=_set_resource_limits if os.name != "nt" else None,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=CODE_INTERPRETER_TIMEOUT)
