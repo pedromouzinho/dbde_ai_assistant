@@ -64,8 +64,13 @@ BLOCKED_IMPORTS = {
     "webbrowser", "antigravity",
 }
 
+_BLOCKED_IMPORT_NAMES = {
+    "system", "popen", "exec", "eval", "remove", "unlink", "rmdir",
+    "rmtree", "Popen", "run", "call", "check_output", "check_call",
+}
 _BLOCKED_CALLS = {
     "exec", "eval", "compile", "__import__", "globals", "locals",
+    "getattr", "setattr", "delattr",
 }
 _BLOCKED_ATTR_CALLS = {
     "os.system", "os.popen", "os.remove", "os.unlink", "os.rmdir",
@@ -118,6 +123,10 @@ def _validate_code(code: str) -> Optional[str]:
             mod = str(node.module or "").strip()
             if not _is_import_allowed(mod):
                 return f"Import bloqueado por seguranca: {mod}"
+            for alias in node.names or []:
+                name = str(alias.name or "").strip()
+                if name in _BLOCKED_IMPORT_NAMES:
+                    return f"Import de funcao bloqueada por seguranca: from {mod} import {name}"
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
             if name in _BLOCKED_CALLS:
@@ -192,6 +201,18 @@ def _set_resource_limits() -> None:
         pass
 
 
+def _path_within_root(path: str, root: str) -> bool:
+    real_path = os.path.realpath(path)
+    real_root = os.path.realpath(root)
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _is_safe_symlink_source(path: str, root: str) -> bool:
+    if not os.path.islink(path):
+        return True
+    return _path_within_root(path, root)
+
+
 def _runner_script(tmpdir: str, code_b64: str) -> str:
     # Wrapper em subprocess isolado; bloqueia path absoluto e serializa resultado final.
     return textwrap.dedent(
@@ -208,9 +229,13 @@ def _runner_script(tmpdir: str, code_b64: str) -> str:
         TMPDIR = {tmpdir!r}
         os.chdir(TMPDIR)
         os.makedirs(os.path.join(TMPDIR, "mnt", "data"), exist_ok=True)
+        _real_root = os.path.realpath(TMPDIR)
         for _name in list(os.listdir(TMPDIR)):
             _src = os.path.join(TMPDIR, _name)
             if not os.path.isfile(_src) or _name.startswith("_"):
+                continue
+            _real_src = os.path.realpath(_src)
+            if os.path.islink(_src) and not (_real_src == _real_root or _real_src.startswith(_real_root + os.sep)):
                 continue
             _dst = os.path.join(TMPDIR, "mnt", "data", _name)
             try:
