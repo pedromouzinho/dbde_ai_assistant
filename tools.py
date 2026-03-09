@@ -2,9 +2,9 @@
 # tools.py — Tool definitions, implementations e system prompts v7.2
 # =============================================================================
 
-import json, base64, asyncio, logging, uuid, re, math, unicodedata, io, csv, statistics
+import json, base64, asyncio, logging, re, math, unicodedata, io, csv, statistics
 from datetime import datetime, timezone
-from collections import deque, Counter
+from collections import Counter
 from urllib.parse import quote
 from typing import Optional
 import httpx
@@ -18,7 +18,7 @@ from config import (
     EXPORT_ASYNC_THRESHOLD_ROWS,
     RERANK_ENABLED, RERANK_ENDPOINT, RERANK_API_KEY, RERANK_MODEL,
     RERANK_TOP_N, RERANK_TIMEOUT_SECONDS, RERANK_AUTH_MODE,
-    UPLOAD_INDEX_TOP, GENERATED_FILES_BLOB_CONTAINER,
+    UPLOAD_INDEX_TOP,
     VISION_ENABLED,
     CODE_INTERPRETER_MAX_MOUNT_BYTES,
 )
@@ -28,10 +28,7 @@ from storage import (
     table_query,
     table_insert,
     table_merge,
-    blob_upload_bytes,
-    blob_upload_json,
     blob_download_bytes,
-    blob_download_json,
     parse_blob_ref,
 )
 from tool_registry import (
@@ -48,10 +45,15 @@ from tools_devops import (
     tool_compute_kpi,
     tool_create_workitem,
     tool_refine_workitem,
+    _devops_debug_log,
+    get_devops_debug_log,
+    _devops_headers,
+    _devops_url,
+    US_PREFERRED_VOCAB,
 )
 from tools_knowledge import tool_search_workitems, tool_search_website, tool_search_web
 from tools_upload import tool_search_uploaded_document
-from tools_export import tool_generate_chart, tool_generate_file
+from tools_export import tool_generate_chart, tool_generate_file, _store_generated_file, get_generated_file
 from tools_email import tool_prepare_outlook_draft, tool_classify_uploaded_emails
 from tools_learning import tool_get_writer_profile, tool_save_writer_profile
 from structured_schemas import SCREENSHOT_USER_STORIES_SCHEMA
@@ -63,188 +65,11 @@ from data_dictionary import (
 )
 from utils import odata_escape
 
-_devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
-def get_devops_debug_log(): return list(_devops_debug_log)
 def _log(msg):
     _devops_debug_log.append({"ts": datetime.now(timezone.utc).isoformat(), "msg": msg})
     logging.info("[Tools] %s", msg)
 
-_generated_files_store = {}
-_generated_files_lock = asyncio.Lock()
-_GENERATED_FILE_TTL_SECONDS = 30 * 60
-_GENERATED_FILE_MAX = 100
-_GENERATED_FILE_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB
 CHART_MAX_POINTS = 10_000  # limite de pontos no payload chart_ready (render)
-
-US_PREFERRED_VOCAB = [
-    "CTA",
-    "Label",
-    "Card",
-    "Stepper",
-    "Modal",
-    "Toast",
-    "Dropdown",
-    "Input",
-    "Toggle",
-    "Header",
-    "Tab",
-    "Breadcrumb",
-    "Sidebar",
-]
-
-def _as_dt(value):
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-    txt = str(value or "").strip()
-    if not txt:
-        return None
-    try:
-        dt = datetime.fromisoformat(txt)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def _generated_blob_paths(download_id: str, fmt: str = "") -> tuple[str, str]:
-    safe_id = "".join(c if c.isalnum() else "_" for c in str(download_id or "").strip())[:80] or "file"
-    ext = "".join(c if c.isalnum() else "" for c in str(fmt or "").lower())[:10]
-    ext = ext or "bin"
-    base = f"generated/{safe_id}"
-    return f"{base}/content.{ext}", f"{base}/meta.json"
-
-
-async def _cleanup_generated_files() -> None:
-    async with _generated_files_lock:
-        now = datetime.now(timezone.utc)
-        expired_ids = [
-            fid for fid, meta in _generated_files_store.items()
-            if (
-                (now - (_as_dt(meta.get("created_at")) or now)).total_seconds()
-                > _GENERATED_FILE_TTL_SECONDS
-            )
-        ]
-        for fid in expired_ids:
-            _generated_files_store.pop(fid, None)
-
-        def _total_bytes() -> int:
-            total = 0
-            for meta in _generated_files_store.values():
-                content = meta.get("content", b"")
-                if isinstance(content, (bytes, bytearray)):
-                    total += len(content)
-            return total
-
-        while (
-            len(_generated_files_store) > _GENERATED_FILE_MAX
-            or _total_bytes() > _GENERATED_FILE_MAX_TOTAL_BYTES
-        ):
-            oldest_id = min(
-                _generated_files_store.items(),
-                key=lambda item: item[1].get("created_at", now),
-            )[0]
-            _generated_files_store.pop(oldest_id, None)
-
-
-async def _store_generated_file(content: bytes, mime_type: str, filename: str, fmt: str) -> str:
-    if len(content) > _GENERATED_FILE_MAX_TOTAL_BYTES:
-        logging.error(
-            "[Tools] generated file too large: %s bytes (max %s)",
-            len(content),
-            _GENERATED_FILE_MAX_TOTAL_BYTES,
-        )
-        return ""
-    await _cleanup_generated_files()
-    fid = uuid.uuid4().hex
-    async with _generated_files_lock:
-        _generated_files_store[fid] = {
-            "content": content,
-            "mime_type": mime_type,
-            "filename": filename,
-            "format": fmt,
-            "created_at": datetime.now(timezone.utc),
-        }
-    try:
-        content_blob_name, meta_blob_name = _generated_blob_paths(fid, fmt)
-        await blob_upload_bytes(
-            GENERATED_FILES_BLOB_CONTAINER,
-            content_blob_name,
-            content,
-            content_type=mime_type or "application/octet-stream",
-        )
-        await blob_upload_json(
-            GENERATED_FILES_BLOB_CONTAINER,
-            meta_blob_name,
-            {
-                "download_id": fid,
-                "filename": filename,
-                "mime_type": mime_type,
-                "format": fmt,
-                "size_bytes": len(content),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "ttl_seconds": _GENERATED_FILE_TTL_SECONDS,
-                "content_blob_name": content_blob_name,
-            },
-        )
-    except Exception as e:
-        logging.warning("[Tools] persistent generated file store failed for %s: %s", fid, e)
-    await _cleanup_generated_files()
-    return fid
-
-
-async def get_generated_file(download_id: str):
-    await _cleanup_generated_files()
-    entry = _generated_files_store.get(download_id)
-    if entry:
-        created_at = _as_dt(entry.get("created_at")) or datetime.now(timezone.utc)
-        if (datetime.now(timezone.utc) - created_at).total_seconds() <= _GENERATED_FILE_TTL_SECONDS:
-            return entry
-        async with _generated_files_lock:
-            _generated_files_store.pop(download_id, None)
-
-    # Cross-instance fallback: load metadata/content from Blob Storage.
-    try:
-        _, meta_blob_name = _generated_blob_paths(download_id)
-        meta = await blob_download_json(GENERATED_FILES_BLOB_CONTAINER, meta_blob_name)
-        if not isinstance(meta, dict) or not meta:
-            return None
-
-        created_at = _as_dt(meta.get("created_at"))
-        ttl_seconds = int(meta.get("ttl_seconds", _GENERATED_FILE_TTL_SECONDS) or _GENERATED_FILE_TTL_SECONDS)
-        if created_at and (datetime.now(timezone.utc) - created_at).total_seconds() > max(60, ttl_seconds):
-            return None
-
-        blob_name = str(meta.get("content_blob_name", "") or "")
-        if not blob_name:
-            fmt = str(meta.get("format", "") or "")
-            blob_name, _ = _generated_blob_paths(download_id, fmt)
-        content = await blob_download_bytes(GENERATED_FILES_BLOB_CONTAINER, blob_name)
-        if not content:
-            return None
-
-        hydrated = {
-            "content": content,
-            "mime_type": str(meta.get("mime_type", "") or "application/octet-stream"),
-            "filename": str(meta.get("filename", "") or f"download-{download_id}"),
-            "format": str(meta.get("format", "") or ""),
-            "created_at": created_at or datetime.now(timezone.utc),
-        }
-        async with _generated_files_lock:
-            _generated_files_store[download_id] = hydrated
-        await _cleanup_generated_files()
-        return hydrated
-    except Exception as e:
-        logging.warning("[Tools] get_generated_file persistent fallback failed for %s: %s", download_id, e)
-        return None
-
-def _devops_headers():
-    return {"Authorization": f"Basic {base64.b64encode(f':{DEVOPS_PAT}'.encode()).decode()}", "Content-Type": "application/json"}
-
-def _devops_url(path):
-    return f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_apis/{path}"
 
 async def get_embedding(text):
     try:

@@ -173,12 +173,17 @@ UPLOAD_WORKER_PID_FILE = os.getenv("UPLOAD_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/
 EXPORT_WORKER_PID_FILE = os.getenv("EXPORT_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/export-worker.pid")
 _inline_worker_task: Optional[asyncio.Task] = None
 _inline_export_worker_task: Optional[asyncio.Task] = None
+_CONV_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 
 
 def _client_ip(request: Request) -> str:
+    # Use the rightmost entry in X-Forwarded-For: that is what the nearest trusted
+    # proxy (Azure Front Door / App Service) appended and cannot be spoofed by the client.
     xff = (request.headers.get("x-forwarded-for") or "").strip()
     if xff:
-        return xff.split(",")[0].strip() or "unknown"
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1] or "unknown"
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
@@ -555,6 +560,14 @@ async def _resolve_export_payload(export_request: ExportRequest, user: dict) -> 
             raise HTTPException(400, "Conversa não indicada para export.")
 
         messages = conversations.get(conv_id, [])
+        if messages:
+            # Verify ownership: ensure this in-memory conversation belongs to the requesting user.
+            current_user_sub = str((user or {}).get("sub") or "")
+            is_admin = (user or {}).get("role") == "admin"
+            if current_user_sub and not is_admin:
+                owner_sub = str(conversation_meta.get(conv_id, {}).get("user_sub") or "")
+                if owner_sub and owner_sub != current_user_sub:
+                    messages = []
         if not messages:
             messages = await _load_conversation_messages_for_export(conv_id, user)
         if not messages:
@@ -1346,7 +1359,7 @@ async def _append_uploaded_entry_safe(conv_id: str, store_entry: dict) -> list:
 def _cleanup_upload_jobs() -> None:
     now = datetime.now(timezone.utc)
     expired = []
-    for job_id, meta in upload_jobs_store.items():
+    for job_id, meta in list(upload_jobs_store.items()):
         updated_at = meta.get("updated_at", meta.get("created_at"))
         if not updated_at:
             continue
@@ -2901,6 +2914,9 @@ async def export_chat(request: Request, credentials: HTTPAuthorizationCredential
     format_type = str(body.get("format", "html") or "html").strip().lower()
     title = str(body.get("title", "Chat Export") or "Chat Export")
 
+    if format_type not in {"html", "pdf"}:
+        return JSONResponse({"error": f"Formato inválido: {format_type!r}. Válidos: html, pdf"}, status_code=400)
+
     if not isinstance(messages, list) or not messages:
         return JSONResponse({"error": "Sem mensagens para exportar"}, status_code=400)
 
@@ -3215,6 +3231,8 @@ async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizat
 @limiter.limit("60/minute", key_func=_user_or_ip_rate_key)
 async def get_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
+    if not _CONV_ID_RE.match(conversation_id):
+        raise HTTPException(400, "conversation_id inválido")
     uid = user.get("sub") if user.get("role")!="admin" else user_id
     safe_uid = odata_escape(uid)
     safe_conv = odata_escape(conversation_id)
@@ -3226,6 +3244,8 @@ async def get_chat(request: Request, user_id: str, conversation_id: str, credent
 @limiter.limit("30/minute", key_func=_user_or_ip_rate_key)
 async def delete_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
+    if not _CONV_ID_RE.match(conversation_id):
+        raise HTTPException(400, "conversation_id inválido")
     uid = user.get("sub") if user.get("role")!="admin" else user_id
     await table_delete("ChatHistory", uid, conversation_id)
     return {"status":"ok"}

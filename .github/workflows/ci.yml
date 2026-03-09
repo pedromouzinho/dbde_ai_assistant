@@ -30,10 +30,20 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check . --select E,F,W --ignore E501
+
+      - name: SAST with bandit
+        run: |
+          pip install bandit
+          bandit -r . --exclude antenv,tests,frontend -ll -q
+
       - name: Audit Python dependencies
         run: |
           pip install pip-audit
-          pip-audit -r requirements.txt --desc on 2>&1 || true
+          pip-audit -r requirements.txt --desc on
 
       - name: Run tests
         run: python -m pytest tests/ -x --tb=short -q
@@ -46,14 +56,14 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
           cache: "npm"
 
       - name: Install dependencies
         run: npm ci
 
       - name: Audit npm dependencies
-        run: npm audit --audit-level=high 2>&1 || true
+        run: npm audit --audit-level=high
 
       - name: Build frontend
         run: npm run build
