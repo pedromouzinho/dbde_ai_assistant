@@ -166,6 +166,22 @@ class TestConversationLockSafety:
             assert agent._conversation_locks.get("conv-held") is lock
 
     @pytest.mark.asyncio
+    async def test_locked_conversation_lock_is_cleaned_after_release(self):
+        conv_id = "conv-held-cleanup"
+        lock = await agent._get_conversation_lock(conv_id)
+
+        async with lock:
+            agent._cleanup_conversation_related_state(conv_id)
+            assert agent._conversation_locks.get(conv_id) is lock
+
+        for _ in range(20):
+            if conv_id not in agent._conversation_locks:
+                break
+            await asyncio.sleep(0)
+
+        assert conv_id not in agent._conversation_locks
+
+    @pytest.mark.asyncio
     async def test_cleanup_evicts_unlocked_lock(self):
         lock = await agent._get_conversation_lock("conv-free")
 

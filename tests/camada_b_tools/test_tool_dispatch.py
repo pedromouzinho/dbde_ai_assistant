@@ -26,6 +26,8 @@ EXPECTED_TOOLS = [
     "generate_chart",
     "chart_uploaded_table",
     "run_code",
+    "update_data_dictionary",
+    "get_data_dictionary",
     "generate_file",
 ]
 

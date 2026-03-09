@@ -358,3 +358,18 @@ async def test_classify_uploaded_emails_uses_default_actions_when_none_provided(
 async def test_classify_uploaded_emails_returns_error_without_instructions():
     result = await tools_email.tool_classify_uploaded_emails(instructions="", conv_id="conv-x")
     assert result["error"] == "instructions é obrigatório para classificar emails."
+
+
+def test_classification_prompt_truncates_long_instructions():
+    prompt = tools_email._build_classification_prompt(
+        "x" * 5000,
+        [{"label": "review", "action_type": "none", "target": ""}],
+        "review",
+        [{"row_id": "1", "subject": "Teste", "body": "Corpo"}],
+    )
+
+    start = prompt.index("<user_instructions>") + len("<user_instructions>\n")
+    end = prompt.index("\n</user_instructions>")
+    instructions_block = prompt[start:end]
+
+    assert len(instructions_block) == tools_email._EMAIL_CLASSIFICATION_INSTRUCTIONS_LIMIT

@@ -143,9 +143,11 @@ from llm_provider import llm_simple, get_debug_log as get_llm_debug_log, close_a
 from rate_limit_storage import TableStorageRateLimit
 from tabular_loader import (
     TabularLoaderError,
+    detect_polymorphic_schema,
     get_tabular_upload_limit_bytes,
     get_tabular_upload_limits,
     is_tabular_filename,
+    load_tabular_dataset,
     load_tabular_preview,
 )
 from job_store import PersistentJobStore
@@ -1222,7 +1224,7 @@ async def chat_with_file(request: Request, chat_request: AgentChatRequest, crede
 @app.post("/api/mode/switch", response_model=ModeSwitchResponse)
 async def switch_mode(request: ModeSwitchRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     get_current_user(credentials)
-    ok = switch_conversation_mode(request.conversation_id, request.mode)
+    ok = await switch_conversation_mode(request.conversation_id, request.mode)
     return ModeSwitchResponse(
         success=ok,
         message=f"Modo alterado para {request.mode}" if ok else "Conversa não encontrada",
@@ -1291,6 +1293,8 @@ def _normalize_uploaded_conv_entry(conv_id: str) -> dict:
 
 
 def _file_entry_summary(entry: dict) -> dict:
+    polymorphic_schema = entry.get("polymorphic_schema")
+    is_polymorphic = bool(isinstance(polymorphic_schema, dict) and polymorphic_schema.get("is_polymorphic"))
     return {
         "filename": entry.get("filename", ""),
         "rows": entry.get("row_count", 0),
@@ -1299,6 +1303,9 @@ def _file_entry_summary(entry: dict) -> dict:
         "uploaded_at": entry.get("uploaded_at", ""),
         "has_chunks": isinstance(entry.get("chunks"), list) and len(entry.get("chunks", [])) > 0,
         "is_image": bool(entry.get("image_base64")),
+        "polymorphic": is_polymorphic,
+        "pivot_column": polymorphic_schema.get("pivot_column", "") if is_polymorphic else "",
+        "pivot_values_count": int(polymorphic_schema.get("pivot_values_count", 0) or 0) if is_polymorphic else 0,
     }
 
 
@@ -1547,6 +1554,7 @@ async def _list_upload_index(conv_id: str, user_sub: str = "", top: int = UPLOAD
 def _upload_index_row_to_memory_entry(row: dict) -> dict:
     col_names = []
     col_analysis = []
+    polymorphic_schema = None
     try:
         col_names = json.loads(row.get("ColNamesJson", "[]") or "[]")
     except Exception:
@@ -1555,6 +1563,22 @@ def _upload_index_row_to_memory_entry(row: dict) -> dict:
         col_analysis = json.loads(row.get("ColAnalysisJson", "[]") or "[]")
     except Exception:
         col_analysis = []
+    try:
+        parsed_schema = json.loads(row.get("PolymorphicSchemaJson", "") or "")
+        if isinstance(parsed_schema, dict) and parsed_schema.get("is_polymorphic"):
+            polymorphic_schema = parsed_schema
+    except Exception:
+        polymorphic_schema = None
+    if polymorphic_schema is None:
+        poly_summary = str(row.get("PolymorphicSummary", "") or "").strip()
+        pivot_column = str(row.get("PivotColumn", "") or "").strip()
+        if poly_summary:
+            polymorphic_schema = {
+                "is_polymorphic": True,
+                "summary_text": poly_summary,
+                "pivot_column": pivot_column,
+                "pivot_values_count": int(row.get("PivotValuesCount", 0) or 0),
+            }
     return {
         "filename": row.get("Filename", ""),
         "data_text": row.get("PreviewText", ""),
@@ -1566,6 +1590,7 @@ def _upload_index_row_to_memory_entry(row: dict) -> dict:
         "has_chunks": str(row.get("HasChunks", "")).lower() in ("true", "1"),
         "chunks_blob_ref": row.get("ChunksBlobRef", ""),
         "extracted_blob_ref": row.get("ExtractedBlobRef", ""),
+        "polymorphic_schema": polymorphic_schema,
     }
 
 
@@ -1749,6 +1774,7 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     data_text, row_count, col_names, truncated = "", 0, [], False
     semantic_chunks = None
     col_analysis = []
+    polymorphic_schema = None
     doc_intel_meta = {}
     image_base64 = None
     image_content_type = None
@@ -1800,7 +1826,30 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         data_text = str(preview.get("data_text", "") or "")
         detected_delimiter = str(preview.get("delimiter", "\t") or "\t")
         col_analysis = list(preview.get("col_analysis") or [])
+        polymorphic_schema = detect_polymorphic_schema(
+            col_names,
+            list(preview.get("sample_records") or []),
+            dict(preview.get("column_types") or {}),
+            row_count,
+        )
         truncated = bool(preview.get("truncated", False))
+        if row_count > 0:
+            try:
+                full_dataset = load_tabular_dataset(content, filename_lower)
+                full_records = list(full_dataset.get("records") or [])
+                if full_records and col_names:
+                    full_lines = [detected_delimiter.join(col_names)]
+                    for rec in full_records:
+                        full_lines.append(
+                            detected_delimiter.join(str(rec.get(column, "")) for column in col_names)
+                        )
+                    full_text = "\n".join(full_lines)
+                else:
+                    full_text = data_text
+            except Exception:
+                full_text = data_text
+        else:
+            full_text = data_text
     elif filename_lower.endswith(".pdf"):
         used_doc_intel = False
         if DOC_INTEL_ENABLED:
@@ -1913,7 +1962,8 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         row_count = data_text.count("\n")
         col_names = ["texto"]
 
-    full_text = data_text
+    if not is_tabular_filename(filename_lower):
+        full_text = data_text
     if not image_base64 and len(full_text) > 50000:
         semantic_chunks = await _build_semantic_chunks(full_text)
 
@@ -1938,6 +1988,8 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
         store_entry["document_intelligence"] = doc_intel_meta
     if is_tabular_filename(filename_lower):
         store_entry["col_analysis"] = col_analysis
+        if polymorphic_schema:
+            store_entry["polymorphic_schema"] = polymorphic_schema
 
     response_payload = {
         "filename": filename,
@@ -1949,6 +2001,10 @@ async def _extract_upload_entry(filename: str, content: bytes, content_type: str
     }
     if doc_intel_meta:
         response_payload["document_intelligence"] = doc_intel_meta
+    if polymorphic_schema:
+        response_payload["polymorphic"] = True
+        response_payload["pivot_column"] = str(polymorphic_schema.get("pivot_column", "") or "")
+        response_payload["pivot_values_count"] = int(polymorphic_schema.get("pivot_values_count", 0) or 0)
     return store_entry, response_payload
 
 
@@ -2032,6 +2088,7 @@ async def _process_upload_job(job: dict) -> None:
 
     col_names = store_entry.get("col_names", [])
     col_analysis = store_entry.get("col_analysis", [])
+    polymorphic_schema = store_entry.get("polymorphic_schema") if isinstance(store_entry.get("polymorphic_schema"), dict) else None
     upload_index_entity = {
         "PartitionKey": conv_id,
         "RowKey": str(job.get("job_id", "")),
@@ -2049,6 +2106,10 @@ async def _process_upload_job(job: dict) -> None:
         "ExtractedBlobRef": extracted_blob_ref,
         "ChunksBlobRef": chunks_blob_ref,
         "RawBlobRef": raw_blob_ref,
+        "PolymorphicSummary": str((polymorphic_schema or {}).get("summary_text", "") or "")[:4000],
+        "PivotColumn": str((polymorphic_schema or {}).get("pivot_column", "") or "")[:240],
+        "PivotValuesCount": int((polymorphic_schema or {}).get("pivot_values_count", 0) or 0),
+        "PolymorphicSchemaJson": json.dumps(polymorphic_schema, ensure_ascii=False)[:32000] if polymorphic_schema else "",
     }
     await _upsert_upload_index(upload_index_entity)
 
@@ -2206,8 +2267,9 @@ async def _upload_worker_loop() -> None:
 async def upload_file(request: Request, file: UploadFile = File(...), conversation_id: Optional[str] = Form(None), credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     conv_id = conversation_id or str(uuid.uuid4())
-    content = await _read_upload_with_limit(file, MAX_UPLOAD_FILE_BYTES)
     filename = file.filename or "unknown"
+    max_bytes = _max_upload_bytes_for_file(filename)
+    content = await _read_upload_with_limit(file, max_bytes)
     user_sub = str(user.get("sub", "") or "")
     reserved_slots = await _count_reserved_slots_for_conversation(conv_id, user_sub=user_sub)
     if reserved_slots >= MAX_FILES_PER_CONVERSATION:
@@ -2251,8 +2313,9 @@ async def upload_file_async(
 ):
     user = get_current_user(credentials)
     conv_id = conversation_id or str(uuid.uuid4())
-    content = await _read_upload_with_limit(file, MAX_UPLOAD_FILE_BYTES)
     filename = file.filename or "unknown"
+    max_bytes = _max_upload_bytes_for_file(filename)
+    content = await _read_upload_with_limit(file, max_bytes)
 
     user_sub = str(user.get("sub", "") or "")
     reserved_slots = await _count_reserved_slots_for_conversation(conv_id, user_sub=user_sub)

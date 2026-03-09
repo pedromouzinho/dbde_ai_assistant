@@ -8,6 +8,7 @@ import pii_shield
 from pii_shield import (
     PIIMaskingContext,
     _CONFIDENCE_THRESHOLDS,
+    _get_non_overlapping_segments,
     _regex_pre_mask,
     _resolve_overlapping_entities,
     mask_pii,
@@ -163,6 +164,18 @@ class TestOverlappingEntityResolution:
         entities = [{"offset": 0, "length": 5, "category": "Person", "confidenceScore": 0.9}]
         result = _resolve_overlapping_entities(entities)
         assert len(result) == 1
+
+    def test_non_overlapping_segments_split_partial_overlap(self):
+        segments = _get_non_overlapping_segments(5, 25, [(10, 25)])
+        assert segments == [(5, 10), (25, 30)]
+
+    def test_non_overlapping_segments_returns_empty_when_fully_covered(self):
+        segments = _get_non_overlapping_segments(10, 10, [(5, 30)])
+        assert segments == []
+
+    def test_non_overlapping_segments_returns_original_when_disjoint(self):
+        segments = _get_non_overlapping_segments(10, 10, [(50, 60)])
+        assert segments == [(10, 20)]
 
 
 class TestMaskPiiIntegration:
