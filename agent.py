@@ -1034,6 +1034,158 @@ def _normalize_request_text(value: str) -> str:
     return clean
 
 
+def _iter_recent_assistant_tool_calls(conv_id: str):
+    for msg in reversed(conversations.get(conv_id, [])):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in reversed(msg.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = str(fn.get("name", "") or "").strip()
+            raw_args = fn.get("arguments", {})
+            args = {}
+            if isinstance(raw_args, dict):
+                args = raw_args
+            elif isinstance(raw_args, str):
+                try:
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except Exception:
+                    args = {}
+            if name:
+                yield name, args
+
+
+def _latest_query_workitems_args(conv_id: str) -> Dict[str, Any]:
+    for name, args in _iter_recent_assistant_tool_calls(conv_id):
+        if name != "query_workitems":
+            continue
+        wiql_where = str(args.get("wiql_where", "") or "").strip()
+        if wiql_where:
+            return {
+                "wiql_where": wiql_where,
+                "fields": args.get("fields"),
+                "top": args.get("top", 200),
+            }
+    return {}
+
+
+def _extract_likely_person_name(question: str) -> str:
+    raw = re.sub(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b", " ", str(question or ""))
+    preferred_patterns = [
+        r"(?i)\b(?:criadas?|feitas?|abertas?)\s+(?:por|pelo|pela)\s+([A-ZÀ-Ý][\wÀ-ÿ'.-]+(?:\s+[A-ZÀ-Ý][\wÀ-ÿ'.-]+){1,3})\b",
+        r"(?i)\b(?:do|da|de)\s+([A-ZÀ-Ý][\wÀ-ÿ'.-]+(?:\s+[A-ZÀ-Ý][\wÀ-ÿ'.-]+){1,3})\b",
+    ]
+    for pattern in preferred_patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return str(match.group(1) or "").strip()
+
+    stop_terms = {
+        "user stories",
+        "azure devops",
+        "millennium bcp",
+        "revamp fee",
+        "nova conversa",
+        "assistente ai",
+    }
+    for candidate in re.findall(r"\b([A-ZÀ-Ý][\wÀ-ÿ'.-]+(?:\s+[A-ZÀ-Ý][\wÀ-ÿ'.-]+){1,3})\b", raw):
+        cleaned = str(candidate or "").strip()
+        norm = _normalize_request_text(cleaned)
+        if norm and norm not in stop_terms:
+            return cleaned
+    return ""
+
+
+def _detect_person_filter_field(question: str, wiql_where: str) -> str:
+    safe_where = str(wiql_where or "")
+    norm = _normalize_request_text(question)
+    if re.search(r"\[System\.CreatedBy\]", safe_where, re.IGNORECASE):
+        return "created_by"
+    if re.search(r"\[System\.AssignedTo\]", safe_where, re.IGNORECASE):
+        return "assigned_to"
+    if re.search(r"\b(assigned|assignee|atribu|responsavel|responsável)\b", norm):
+        return "assigned_to"
+    if re.search(r"\b(criad|autor|criador|feito por|feitas por|aberto por|abertas por)\b", norm):
+        return "created_by"
+    if re.search(r"\b(s[oó]|apenas|somente)\s+as?\s+d[oa]\b", norm):
+        return "created_by"
+    return ""
+
+
+def _replace_person_filter_in_wiql(wiql_where: str, field: str, person_name: str) -> str:
+    safe_where = str(wiql_where or "").strip()
+    safe_name = str(person_name or "").strip().replace("'", "''")
+    if not safe_where or not safe_name:
+        return safe_where
+
+    system_field = "System.CreatedBy" if field == "created_by" else "System.AssignedTo"
+    clause_pattern = re.compile(
+        rf"(?i)(?:^|\s+AND\s+)\[{re.escape(system_field)}\]\s+(?:=|CONTAINS)\s+'(?:[^']|'')*'"
+    )
+    updated = clause_pattern.sub("", safe_where).strip()
+    updated = re.sub(r"(?i)^\s*AND\s+", "", updated)
+    updated = re.sub(r"(?i)\s+AND\s*$", "", updated)
+    updated = re.sub(r"(?i)\s+AND\s+AND\s+", " AND ", updated)
+    updated = re.sub(r"\s+", " ", updated).strip()
+    new_clause = f"[{system_field}] CONTAINS '{safe_name}'"
+    return f"{updated} AND {new_clause}" if updated else new_clause
+
+
+def _looks_like_workitem_filter_followup(question: str) -> bool:
+    norm = _normalize_request_text(question)
+    has_refinement_hint = bool(
+        re.search(r"\b(s[oó]|apenas|somente|filtra|filtrar|mantem|mantém|troca|agora|em vez)\b", norm)
+    )
+    has_recipient_hint = "@" in str(question or "")
+    return has_refinement_hint or has_recipient_hint
+
+
+async def _run_forced_workitem_filter_followup(
+    question: str,
+    conv_id: str,
+    user_sub: str = "",
+) -> tuple[List[str], List[Dict]]:
+    if not _looks_like_workitem_filter_followup(question):
+        return [], []
+
+    previous_query = _latest_query_workitems_args(conv_id)
+    if not previous_query:
+        return [], []
+
+    person_name = _extract_likely_person_name(question)
+    if not person_name:
+        return [], []
+
+    field = _detect_person_filter_field(question, previous_query.get("wiql_where", ""))
+    if field not in {"created_by", "assigned_to"}:
+        return [], []
+
+    updated_where = _replace_person_filter_in_wiql(previous_query.get("wiql_where", ""), field, person_name)
+    if not updated_where or updated_where == previous_query.get("wiql_where", ""):
+        return [], []
+
+    forced_call = LLMToolCall(
+        id=f"forced_qw_refine_{uuid.uuid4().hex[:8]}",
+        name="query_workitems",
+        arguments={
+            "wiql_where": updated_where,
+            "fields": previous_query.get("fields"),
+            "top": previous_query.get("top", 200),
+        },
+    )
+    logger.info(
+        "[Agent] forcing query_workitems refresh for follow-up filter (conv=%s, field=%s, person=%s)",
+        conv_id,
+        field,
+        person_name,
+    )
+    conversations[conv_id].append(_make_tool_calls_assistant_message([forced_call]))
+    return await _execute_tool_calls([forced_call], conv_id, user_sub=user_sub)
+
+
 async def _latest_polymorphic_upload_context(conv_id: str) -> Dict[str, Any]:
     for file_data in reversed(await _get_uploaded_files_async(conv_id)):
         schema = file_data.get("polymorphic_schema")
@@ -1852,6 +2004,20 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                                 has_exportable = True
                                 export_idx = batch_start + local_idx
 
+                    forced_fu, forced_fd = await _run_forced_workitem_filter_followup(
+                        effective_question,
+                        conv_id,
+                        user_sub=str((user or {}).get("sub", "") or ""),
+                    )
+                    if forced_fd:
+                        tools_used.extend(forced_fu)
+                        tool_details.extend(forced_fd)
+                        batch_start = len(tool_details) - len(forced_fd)
+                        for local_idx, d in enumerate(forced_fd):
+                            if d["result_summary"].get("items_returned", 0) > 0:
+                                has_exportable = True
+                                export_idx = batch_start + local_idx
+
                     # Agent loop
                     ephemeral = await _build_llm_messages(
                         conv_id,
@@ -2049,6 +2215,19 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                     tools_used.extend(forced_tu)
                     tool_details.extend(forced_td)
                     for d in forced_td:
+                        yield _sse({"type": "tool_start", "tool": d["tool"], "text": f"🔍 {d['tool']} (forced)..."})
+                        count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
+                        yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
+
+                forced_fu, forced_fd = await _run_forced_workitem_filter_followup(
+                    effective_question,
+                    conv_id,
+                    user_sub=str((user or {}).get("sub", "") or ""),
+                )
+                if forced_fd:
+                    tools_used.extend(forced_fu)
+                    tool_details.extend(forced_fd)
+                    for d in forced_fd:
                         yield _sse({"type": "tool_start", "tool": d["tool"], "text": f"🔍 {d['tool']} (forced)..."})
                         count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
                         yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})

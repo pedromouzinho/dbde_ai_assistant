@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -258,6 +259,88 @@ async def test_prepare_polymorphic_followup_question_rewrites_short_reply():
     assert clarification == ""
     assert "transaction_Id=871" in rewritten
     assert meta.get(agent._PENDING_POLYMORPHIC_SELECTION_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_run_forced_workitem_filter_followup_refreshes_created_by_query(monkeypatch):
+    captured = {}
+
+    async def fake_execute_tool_calls(tool_calls, conv_id, user_sub=""):
+        captured["tool_calls"] = tool_calls
+        captured["conv_id"] = conv_id
+        captured["user_sub"] = user_sub
+        return ["query_workitems"], [
+            {
+                "tool": "query_workitems",
+                "arguments": tool_calls[0].arguments,
+                "result_summary": {"total_count": 6, "items_returned": 6, "has_error": False},
+            }
+        ]
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", fake_execute_tool_calls)
+
+    conv_id = "conv-workitem-followup"
+    agent.conversations[conv_id] = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-prev",
+                    "type": "function",
+                    "function": {
+                        "name": "query_workitems",
+                        "arguments": json.dumps(
+                            {
+                                "wiql_where": "[System.WorkItemType] = 'User Story' AND [System.CreatedDate] >= '2026-03-09' AND [System.CreatedBy] CONTAINS 'Jorge Lerias'",
+                                "fields": ["System.Id", "System.Title", "System.CreatedBy"],
+                                "top": 200,
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+    ]
+    try:
+        tools_used, tool_details = await agent._run_forced_workitem_filter_followup(
+            "Só as do Pedro Mousinho e para jorge.rodrigues@millenniumbcp.pt",
+            conv_id,
+            user_sub="user-123",
+        )
+    finally:
+        agent.conversations.pop(conv_id, None)
+
+    assert tools_used == ["query_workitems"]
+    assert tool_details[0]["arguments"]["top"] == 200
+    updated_where = tool_details[0]["arguments"]["wiql_where"]
+    assert "Pedro Mousinho" in updated_where
+    assert "Jorge Lerias" not in updated_where
+    assert "[System.CreatedBy] CONTAINS 'Pedro Mousinho'" in updated_where
+    assert captured["conv_id"] == conv_id
+    assert captured["user_sub"] == "user-123"
+
+
+@pytest.mark.asyncio
+async def test_run_forced_workitem_filter_followup_skips_without_prior_query(monkeypatch):
+    async def fake_execute_tool_calls(*_args, **_kwargs):
+        raise AssertionError("Should not execute tool calls without prior query context")
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", fake_execute_tool_calls)
+
+    conv_id = "conv-workitem-no-context"
+    agent.conversations[conv_id] = [{"role": "user", "content": "olá"}]
+    try:
+        tools_used, tool_details = await agent._run_forced_workitem_filter_followup(
+            "Só as do Pedro Mousinho",
+            conv_id,
+            user_sub="user-123",
+        )
+    finally:
+        agent.conversations.pop(conv_id, None)
+
+    assert tools_used == []
+    assert tool_details == []
 
 
 @pytest.mark.asyncio

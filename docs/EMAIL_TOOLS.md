@@ -25,6 +25,7 @@ Esta capability cobre dois fluxos principais no agente:
 - `Escreve-me um email para o cliente a explicar o atraso da entrega.`
 - `Mantém tom formal e curto.`
 - `Está bom. Faz-me o rascunho Outlook para joao@empresa.pt com cc para maria@empresa.pt.`
+- Se estiveres a gerar um email a partir de User Stories/bugs do DevOps e disseres algo como `Só as do Pedro Mousinho`, o agente deve refrescar a query antes de reescrever o email.
 
 ### Triagem inbox
 
