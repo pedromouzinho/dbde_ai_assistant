@@ -1,3 +1,4 @@
+import base64
 import csv
 import html
 import io
@@ -6,7 +7,6 @@ import logging
 import re
 from collections import Counter
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 
 from llm_provider import llm_simple
@@ -602,16 +602,16 @@ foreach ($row in $rows) {{
 """
 
 
-def _build_outlook_draft_powershell(payload_filename: str) -> str:
+def _build_outlook_draft_powershell(payload: Dict[str, Any], msg_filename: str) -> str:
+    payload_b64 = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
     return f"""param(
-    [string]$PayloadPath = "$(Join-Path $PSScriptRoot '{payload_filename}')"
+    [string]$OutputPath = "$(Join-Path $PSScriptRoot '{msg_filename}')"
 )
 
-if (-not (Test-Path $PayloadPath)) {{
-    throw "Payload do draft não encontrado: $PayloadPath"
-}}
-
-$payload = Get-Content -Path $PayloadPath -Raw | ConvertFrom-Json
+$payloadJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{payload_b64}'))
+$payload = $payloadJson | ConvertFrom-Json
 $outlook = New-Object -ComObject Outlook.Application
 $mail = $outlook.CreateItem(0)
 $mail.To = [string]$payload.to
@@ -628,33 +628,23 @@ foreach ($attachment in $payload.attachments) {{
         $null = $mail.Attachments.Add($attachment)
     }}
 }}
+if ([string]::IsNullOrWhiteSpace([string]$OutputPath)) {{
+    throw "OutputPath inválido para o draft MSG."
+}}
+if (([string]$OutputPath).ToLowerInvariant().EndsWith('.msg') -eq $false) {{
+    $OutputPath = [string]$OutputPath + '.msg'
+}}
+if (Test-Path $OutputPath) {{
+    Remove-Item -Path $OutputPath -Force
+}}
+try {{
+    $mail.SaveAs($OutputPath, 9)
+}} catch {{
+    $mail.SaveAs($OutputPath, 3)
+}}
 $mail.Display()
+Write-Host ("Draft MSG criado em: {{0}}" -f $OutputPath)
 """
-
-
-def _email_message_bytes(
-    subject: str,
-    body: str,
-    to_list: List[str],
-    cc_list: List[str],
-    bcc_list: List[str],
-    body_format: str,
-) -> bytes:
-    msg = EmailMessage()
-    if to_list:
-        msg["To"] = ", ".join(to_list)
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
-    if bcc_list:
-        msg["Bcc"] = ", ".join(bcc_list)
-    msg["Subject"] = subject
-    msg["Date"] = _now_utc().strftime("%a, %d %b %Y %H:%M:%S %z")
-    if str(body_format or "").lower() == "html":
-        msg.set_content(_html_to_text(body) or subject)
-        msg.add_alternative(body, subtype="html")
-    else:
-        msg.set_content(body)
-    return msg.as_bytes()
 
 
 async def _store_downloads(files: List[dict]) -> List[dict]:
@@ -703,6 +693,7 @@ async def tool_prepare_outlook_draft(
     attachment_list = _as_list(attachments)
 
     base_name = _safe_name(safe_subject, "email_draft")
+    msg_filename = f"{base_name}.msg"
     payload = {
         "subject": safe_subject,
         "to": "; ".join(to_list),
@@ -716,26 +707,12 @@ async def tool_prepare_outlook_draft(
     downloads = await _store_downloads(
         [
             {
-                "label": "Abrir draft no Outlook (.ps1)",
-                "description": "Descarrega e executa localmente para abrir a janela de compose no Outlook.",
+                "label": "Gerar .msg e abrir draft no Outlook (.ps1)",
+                "description": "Script PowerShell auto-suficiente que cria um ficheiro .msg local e abre o draft no Outlook.",
                 "primary": True,
                 "filename": f"Open_{base_name}.ps1",
                 "mime_type": "text/plain",
-                "content": _build_outlook_draft_powershell(f"{base_name}.draft.json").encode("utf-8"),
-            },
-            {
-                "label": "Mensagem pronta (.eml)",
-                "description": "Alternativa simples para abrir o draft como mensagem email.",
-                "filename": f"{base_name}.eml",
-                "mime_type": "message/rfc822",
-                "content": _email_message_bytes(safe_subject, safe_body, to_list, cc_list, bcc_list, body_format),
-            },
-            {
-                "label": "Payload do draft (.json)",
-                "description": "Metadados usados pelo script PowerShell.",
-                "filename": f"{base_name}.draft.json",
-                "mime_type": "application/json",
-                "content": json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                "content": _build_outlook_draft_powershell(payload, msg_filename).encode("utf-8"),
             },
         ]
     )
@@ -750,7 +727,7 @@ async def tool_prepare_outlook_draft(
         "attachments": attachment_list,
         "summary": (
             "Rascunho preparado para Outlook. "
-            "O .eml abre o conteúdo; o .ps1 abre uma janela de compose no Outlook usando o payload JSON."
+            "O .ps1 gera um ficheiro .msg local e abre o draft no Outlook."
         ),
         "items": [
             {
@@ -758,6 +735,7 @@ async def tool_prepare_outlook_draft(
                 "subject": safe_subject,
                 "to": ", ".join(to_list),
                 "body_preview": (_html_to_text(safe_body) or safe_body)[:240],
+                "generated_file": msg_filename,
             }
         ],
         "total_count": 1,

@@ -1,6 +1,8 @@
+import base64
 import csv
 import io
 import json
+import re
 
 import openpyxl
 import pytest
@@ -94,7 +96,7 @@ def test_outlook_action_script_contains_expected_operations():
 
 
 @pytest.mark.asyncio
-async def test_prepare_outlook_draft_generates_eml_json_and_ps1(monkeypatch):
+async def test_prepare_outlook_draft_generates_msg_script(monkeypatch):
     capture = _DownloadCapture()
     monkeypatch.setattr(tools_email, "_store_generated_file", capture)
 
@@ -106,16 +108,17 @@ async def test_prepare_outlook_draft_generates_eml_json_and_ps1(monkeypatch):
     )
 
     assert result["status"] == "ok"
-    assert len(result["_auto_file_downloads"]) == 3
-    assert result["_auto_file_downloads"][0]["label"] == "Abrir draft no Outlook (.ps1)"
+    assert len(result["_auto_file_downloads"]) == 1
+    assert result["_auto_file_downloads"][0]["label"] == "Gerar .msg e abrir draft no Outlook (.ps1)"
     assert result["_auto_file_downloads"][0]["primary"] is True
-    eml = capture.find(".eml")["content"].decode("utf-8", errors="replace")
-    payload = json.loads(capture.find(".draft.json")["content"].decode("utf-8"))
     script = capture.find(".ps1")["content"].decode("utf-8")
-    assert "Resposta ao cliente" in eml
-    assert "cliente@empresa.pt" in eml
+    payload_b64 = re.search(r"FromBase64String\('([^']+)'\)", script)
+    assert payload_b64 is not None
+    payload = json.loads(base64.b64decode(payload_b64.group(1)).decode("utf-8"))
     assert payload["to"] == "cliente@empresa.pt; apoio@empresa.pt"
     assert "CreateItem(0)" in script
+    assert ".SaveAs(" in script
+    assert "Resposta ao cliente.msg" in script
     assert ".Display()" in script
 
 
