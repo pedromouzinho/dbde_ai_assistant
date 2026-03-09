@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs, unquote
 
 import httpx
 
@@ -33,6 +33,67 @@ def _get_figma_token() -> str:
 
 def _cache_key(query: str, file_key: str, node_id: str) -> str:
     return f"{(query or '').strip().lower()}|{(file_key or '').strip()}|{(node_id or '').strip()}"
+
+
+def _parse_figma_url(raw: str) -> dict:
+    candidate = str(raw or "").strip()
+    if not candidate or "figma.com" not in candidate.lower():
+        return {}
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return {}
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 2:
+        return {}
+    if path_parts[0] not in {"file", "design", "proto"}:
+        return {}
+
+    file_key = path_parts[1].strip()
+    if not file_key:
+        return {}
+
+    query = parse_qs(parsed.query or "")
+    node_id = ""
+    for key in ("node-id", "node_id", "starting-point-node-id"):
+        values = query.get(key) or []
+        if values:
+            node_id = unquote(str(values[0] or "")).strip()
+            break
+    node_id = node_id.replace("-", ":") if node_id.count("-") == 1 and ":" not in node_id else node_id
+    return {
+        "file_key": file_key,
+        "node_id": node_id,
+    }
+
+
+def _normalize_figma_inputs(
+    query: str = "",
+    file_key: str = "",
+    node_id: str = "",
+    figma_url: str = "",
+) -> tuple[str, str, str]:
+    q = str(query or "").strip()
+    fk = str(file_key or "").strip()
+    nid = str(node_id or "").strip()
+    raw_url = str(figma_url or "").strip()
+
+    parsed = _parse_figma_url(raw_url)
+    if not parsed and "figma.com" in fk.lower():
+        parsed = _parse_figma_url(fk)
+        if parsed:
+            fk = ""
+    if not parsed and "figma.com" in q.lower():
+        parsed = _parse_figma_url(q)
+        if parsed and q.strip() == raw_url.strip():
+            q = ""
+
+    if parsed:
+        fk = str(parsed.get("file_key", "") or fk).strip()
+        if not nid:
+            nid = str(parsed.get("node_id", "") or "").strip()
+
+    return q, fk, nid
 
 
 def _cache_get(key: str):
@@ -250,8 +311,9 @@ async def tool_analyze_figma_flow(
     start_node_id: str = "",
     include_branches: bool = True,
     max_steps: int = 15,
+    figma_url: str = "",
 ) -> dict:
-    fk = str(file_key or "").strip()
+    _, fk, parsed_node_id = _normalize_figma_inputs("", file_key, start_node_id, figma_url)
     if not fk:
         return {"error": "file_key é obrigatório para analisar fluxo Figma."}
 
@@ -264,7 +326,7 @@ async def tool_analyze_figma_flow(
     safe_max_steps = min(safe_max_steps, 50)
 
     normalized_node_ids = _normalize_node_ids(node_ids)
-    start_node = str(start_node_id or "").strip()
+    start_node = str(parsed_node_id or start_node_id or "").strip()
     if not normalized_node_ids and not start_node:
         return {
             "source": "figma",
@@ -488,13 +550,11 @@ async def tool_analyze_figma_flow(
     }
 
 
-async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = ""):
+async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = "", figma_url: str = ""):
     if not _get_figma_token():
         return {"error": "Integração Figma não configurada (token em falta)"}
 
-    q = (query or "").strip()
-    fk = (file_key or "").strip()
-    nid = (node_id or "").strip()
+    q, fk, nid = _normalize_figma_inputs(query, file_key, node_id, figma_url)
 
     cache_key = _cache_key(q, fk, nid)
     cached = _cache_get(cache_key)
@@ -530,6 +590,8 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
                             "type": document.get("type", "NODE"),
                             "file_key": fk,
                             "file_name": file_name,
+                            "ui_components": _collect_ui_components(document),
+                            "transition_targets": _extract_transition_targets(document),
                             "thumbnail_url": thumbnail_url,
                             "last_modified": last_modified,
                             "url": _figma_file_url(fk, node_key),
@@ -559,6 +621,8 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
                             "type": page.get("type", "PAGE"),
                             "file_key": fk,
                             "file_name": file_name,
+                            "ui_components": _collect_ui_components(page),
+                            "transition_targets": _extract_transition_targets(page),
                             "thumbnail_url": thumbnail_url,
                             "last_modified": last_modified,
                             "url": _figma_file_url(fk, page_id),
@@ -576,6 +640,8 @@ async def tool_search_figma(query: str = "", file_key: str = "", node_id: str = 
                                 "file_key": fk,
                                 "file_name": file_name,
                                 "page_name": page_name,
+                                "ui_components": _collect_ui_components(frame),
+                                "transition_targets": _extract_transition_targets(frame),
                                 "thumbnail_url": thumbnail_url,
                                 "last_modified": last_modified,
                                 "url": _figma_file_url(fk, frame_id),
@@ -627,6 +693,7 @@ _SEARCH_FIGMA_DEFINITION = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Texto de pesquisa em nomes de ficheiro/frame."},
+                "figma_url": {"type": "string", "description": "URL completa do Figma (opcional). O tool extrai file_key e node_id automaticamente."},
                 "file_key": {"type": "string", "description": "Figma file key para detalhar um ficheiro especifico."},
                 "node_id": {"type": "string", "description": "Node/frame id para detalhe especifico dentro do ficheiro."},
             },
@@ -643,6 +710,7 @@ _ANALYZE_FIGMA_FLOW_DEFINITION = {
             "type": "object",
             "properties": {
                 "file_key": {"type": "string", "description": "Figma file key."},
+                "figma_url": {"type": "string", "description": "URL completa do Figma (opcional). O tool extrai file_key e start_node_id automaticamente."},
                 "node_ids": {"type": "string", "description": "IDs de frames em CSV (ex: 1:2,1:3) ou JSON list string."},
                 "start_node_id": {"type": "string", "description": "Node inicial opcional para seguir ligações de protótipo."},
                 "include_branches": {"type": "boolean", "description": "Incluir branches de erro/fallback/cancel. Default true."},
@@ -661,6 +729,7 @@ def _register_figma_tool() -> None:
             query=args.get("query", ""),
             file_key=args.get("file_key", ""),
             node_id=args.get("node_id", ""),
+            figma_url=args.get("figma_url", ""),
         ),
         definition=_SEARCH_FIGMA_DEFINITION,
     )
@@ -672,6 +741,7 @@ def _register_figma_tool() -> None:
             start_node_id=args.get("start_node_id", ""),
             include_branches=args.get("include_branches", True),
             max_steps=args.get("max_steps", 15),
+            figma_url=args.get("figma_url", ""),
         ),
         definition=_ANALYZE_FIGMA_FLOW_DEFINITION,
     )

@@ -67,6 +67,7 @@ _TOOLS_NEEDING_CONV_CONTEXT = {
     "run_code",
     "classify_uploaded_emails",
     "chart_uploaded_table",
+    "screenshot_to_us",
     "update_data_dictionary",
     "get_data_dictionary",
 }
@@ -1275,6 +1276,50 @@ async def _has_tabular_uploads_async(conv_id: str) -> bool:
     return False
 
 
+async def _has_visual_uploads_async(conv_id: str) -> bool:
+    for file_data in await _get_uploaded_files_async(conv_id):
+        filename = str(file_data.get("filename", "") or "").lower()
+        if file_data.get("image_base64") or filename.endswith(".svg"):
+            return True
+    return False
+
+
+def _looks_like_visual_userstory_request(question: str) -> bool:
+    norm = _normalize_request_text(question)
+    has_story_intent = bool(
+        re.search(r"\b(user stor(?:y|ies)|gera(?:r)?\s+us|gera(?:r)?\s+uma\s+us|gera(?:r)?\s+uma\s+user story|descrev(?:e|er)\s+este\s+ecra)\b", norm)
+    )
+    has_visual_hint = bool(
+        re.search(r"\b(ecra|screen|mockup|wireframe|screenshot|imagem|png|jpg|jpeg|svg|figma|frame|ui)\b", norm)
+    )
+    return has_story_intent and has_visual_hint
+
+
+async def _run_forced_visual_userstory(
+    question: str,
+    conv_id: str,
+    user_sub: str = "",
+) -> tuple[List[str], List[Dict]]:
+    if not _looks_like_visual_userstory_request(question):
+        return [], []
+    if not await _has_visual_uploads_async(conv_id):
+        return [], []
+
+    forced_call = LLMToolCall(
+        id=f"forced_visual_us_{uuid.uuid4().hex[:8]}",
+        name="screenshot_to_us",
+        arguments={
+            "context": question,
+        },
+    )
+    logger.info(
+        "[Agent] forcing screenshot_to_us for visual user story request (conv=%s)",
+        conv_id,
+    )
+    conversations[conv_id].append(_make_tool_calls_assistant_message([forced_call]))
+    return await _execute_tool_calls([forced_call], conv_id, user_sub=user_sub)
+
+
 def _extract_forced_uploaded_table_calls(
     question: str,
     conv_id: str,
@@ -1779,6 +1824,20 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                 should_persist = True
             else:
                 try:
+                    forced_vu, forced_vd = await _run_forced_visual_userstory(
+                        effective_question,
+                        conv_id,
+                        user_sub=str((user or {}).get("sub", "") or ""),
+                    )
+                    if forced_vd:
+                        tools_used.extend(forced_vu)
+                        tool_details.extend(forced_vd)
+                        batch_start = len(tool_details) - len(forced_vd)
+                        for local_idx, d in enumerate(forced_vd):
+                            if d["result_summary"].get("items_returned", 0) > 0:
+                                has_exportable = True
+                                export_idx = batch_start + local_idx
+
                     forced_tu, forced_td = await _run_forced_dual_hierarchy(
                         effective_question,
                         conv_id,
@@ -1967,6 +2026,20 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 return
 
             try:
+                forced_vu, forced_vd = await _run_forced_visual_userstory(
+                    effective_question,
+                    conv_id,
+                    user_sub=str((user or {}).get("sub", "") or ""),
+                )
+                if forced_vd:
+                    tools_used.extend(forced_vu)
+                    tool_details.extend(forced_vd)
+                    batch_start = len(tool_details) - len(forced_vd)
+                    for local_idx, d in enumerate(forced_vd):
+                        if d["result_summary"].get("items_returned", 0) > 0:
+                            has_exportable = True
+                            export_idx = batch_start + local_idx
+
                 forced_tu, forced_td = await _run_forced_dual_hierarchy(
                     effective_question,
                     conv_id,

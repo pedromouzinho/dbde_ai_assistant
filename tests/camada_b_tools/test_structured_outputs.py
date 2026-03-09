@@ -35,7 +35,30 @@ def test_screenshot_schema_shape():
     assert js["additionalProperties"] is False
     assert "stories" in js["properties"]
     story_item = js["properties"]["stories"]["items"]
-    assert set(story_item["required"]) == {"title", "description", "acceptance_criteria"}
+    assert set(story_item["required"]) == {
+        "title",
+        "description",
+        "provenance",
+        "conditions",
+        "composition_and_behavior",
+        "acceptance_criteria",
+        "test_scenarios",
+        "test_data",
+        "observations",
+        "clarification_questions",
+    }
+    ac_item = story_item["properties"]["acceptance_criteria"]["items"]
+    assert ac_item["required"] == ["id", "text"]
+    scenario_item = story_item["properties"]["test_scenarios"]["items"]
+    assert set(scenario_item["required"]) == {
+        "id",
+        "title",
+        "category",
+        "preconditions",
+        "test_data",
+        "steps",
+        "covers",
+    }
 
 
 @pytest.mark.asyncio
@@ -140,4 +163,3 @@ async def test_azure_chat_adds_response_format_without_tools(monkeypatch):
         response_format=fmt,
     )
     assert "response_format" not in payloads[-1]
-

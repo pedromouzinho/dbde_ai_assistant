@@ -66,6 +66,34 @@ async def test_dictionary_tools_receive_conv_context(monkeypatch, tool_name):
 
 
 @pytest.mark.asyncio
+async def test_screenshot_to_us_receives_conv_context(monkeypatch):
+    captured = {}
+
+    async def fake_execute_tool(name, args):
+        captured["name"] = name
+        captured["args"] = dict(args)
+        return {"stories": []}
+
+    async def fake_uploaded_files(_conv_id):
+        return [{"filename": "screen.png", "image_base64": "abc"}]
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+    monkeypatch.setattr(agent, "_get_uploaded_files_async", fake_uploaded_files)
+
+    conv_id = "conv-screenshot-injection"
+    agent.conversations[conv_id] = [{"role": "user", "content": "faz-me uma user story para este ecrã"}]
+    try:
+        tool_call = LLMToolCall(id="tool-ss", name="screenshot_to_us", arguments={})
+        await agent._execute_tool_calls([tool_call], conv_id=conv_id, user_sub="user-123")
+    finally:
+        agent.conversations.pop(conv_id, None)
+
+    assert captured["name"] == "screenshot_to_us"
+    assert captured["args"]["conv_id"] == conv_id
+    assert captured["args"]["user_sub"] == "user-123"
+
+
+@pytest.mark.asyncio
 async def test_execute_tool_calls_handles_non_dict_results(monkeypatch):
     async def fake_execute_tool(_name, _args):
         return "plain-text-result"

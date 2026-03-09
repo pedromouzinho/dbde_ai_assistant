@@ -6,6 +6,7 @@
 # =============================================================================
 
 import json
+import re
 import asyncio
 import inspect
 import uuid
@@ -78,6 +79,89 @@ def _openai_tools_to_anthropic(tools: List[dict]) -> List[dict]:
     return anthropic_tools
 
 
+_ANTHROPIC_IMAGE_DATA_URL_RE = re.compile(
+    r"^data:(?P<media_type>[^;,]+);base64,(?P<data>.+)$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_ANTHROPIC_IMAGE_MEDIA_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+}
+
+
+def _openai_content_to_anthropic(content: Any) -> Any:
+    """Converte content blocks OpenAI para o formato esperado pelo Anthropic."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    converted: List[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            text = str(block or "").strip()
+            if text:
+                converted.append({"type": "text", "text": text})
+            continue
+
+        block_type = str(block.get("type", "") or "").strip()
+        if block_type == "text":
+            converted.append({"type": "text", "text": str(block.get("text", "") or "")})
+            continue
+
+        if block_type == "image_url":
+            image_url = block.get("image_url", {})
+            raw_url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            raw_url = str(raw_url or "").strip()
+            if not raw_url:
+                continue
+
+            match = _ANTHROPIC_IMAGE_DATA_URL_RE.match(raw_url)
+            if not match:
+                converted.append(
+                    {
+                        "type": "text",
+                        "text": "[Imagem omitida: URL externa não suportada pelo provider Anthropic.]",
+                    }
+                )
+                continue
+
+            media_type = match.group("media_type").strip().lower()
+            data = match.group("data").strip()
+            if media_type == "image/jpg":
+                media_type = "image/jpeg"
+
+            if media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
+                converted.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "[Imagem omitida: formato não suportado pelo provider Anthropic "
+                            f"({media_type}).]"
+                        ),
+                    }
+                )
+                continue
+
+            converted.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                }
+            )
+            continue
+
+        converted.append(block)
+
+    return converted
+
+
 def _openai_messages_to_anthropic(messages: List[dict]) -> tuple[str, List[dict]]:
     """Converte messages de formato OpenAI → Anthropic.
     
@@ -106,8 +190,7 @@ def _openai_messages_to_anthropic(messages: List[dict]) -> tuple[str, List[dict]
             if isinstance(content, str):
                 anthropic_msgs.append({"role": "user", "content": content})
             else:
-                # Content blocks (imagens, etc.) — passar como está
-                anthropic_msgs.append({"role": "user", "content": content})
+                anthropic_msgs.append({"role": "user", "content": _openai_content_to_anthropic(content)})
             i += 1
             continue
         
@@ -115,8 +198,11 @@ def _openai_messages_to_anthropic(messages: List[dict]) -> tuple[str, List[dict]
         if role == "assistant":
             content_blocks = []
             text = msg.get("content")
-            if text:
-                content_blocks.append({"type": "text", "text": text})
+            if isinstance(text, str):
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
+            elif isinstance(text, list):
+                content_blocks.extend(_openai_content_to_anthropic(text))
             
             # Converter tool_calls do formato OpenAI → Anthropic tool_use blocks
             tool_calls = msg.get("tool_calls", [])

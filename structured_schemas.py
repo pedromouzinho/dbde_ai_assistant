@@ -172,9 +172,62 @@ SCREENSHOT_USER_STORIES_SCHEMA = {
                         "properties": {
                             "title": {"type": "string"},
                             "description": {"type": "string"},
-                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                            "provenance": {"type": "string"},
+                            "conditions": {"type": "array", "items": {"type": "string"}},
+                            "composition_and_behavior": {"type": "array", "items": {"type": "string"}},
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "text": {"type": "string"},
+                                    },
+                                    "required": ["id", "text"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "test_scenarios": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "title": {"type": "string"},
+                                        "category": {"type": "string"},
+                                        "preconditions": {"type": "string"},
+                                        "test_data": {"type": "string"},
+                                        "steps": {"type": "array", "items": {"type": "string"}},
+                                        "covers": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                    "required": [
+                                        "id",
+                                        "title",
+                                        "category",
+                                        "preconditions",
+                                        "test_data",
+                                        "steps",
+                                        "covers",
+                                    ],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "test_data": {"type": "array", "items": {"type": "string"}},
+                            "observations": {"type": "array", "items": {"type": "string"}},
+                            "clarification_questions": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["title", "description", "acceptance_criteria"],
+                        "required": [
+                            "title",
+                            "description",
+                            "provenance",
+                            "conditions",
+                            "composition_and_behavior",
+                            "acceptance_criteria",
+                            "test_scenarios",
+                            "test_data",
+                            "observations",
+                            "clarification_questions",
+                        ],
                         "additionalProperties": False,
                     },
                 }
@@ -184,4 +237,3 @@ SCREENSHOT_USER_STORIES_SCHEMA = {
         },
     },
 }
-

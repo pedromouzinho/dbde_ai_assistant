@@ -729,6 +729,155 @@ async def _resolve_uploaded_tabular_source(
     }
 
 
+def _guess_visual_content_type(filename: str, content_type: str = "") -> str:
+    raw_content_type = str(content_type or "").strip().lower()
+    if raw_content_type.startswith("image/"):
+        if raw_content_type == "image/jpg":
+            return "image/jpeg"
+        return raw_content_type
+
+    lowered = str(filename or "").strip().lower()
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".bmp"):
+        return "image/bmp"
+    if lowered.endswith(".svg"):
+        return "image/svg+xml"
+    return "image/png"
+
+
+def _extract_svg_visible_text(svg_markup: str, max_items: int = 80) -> list[str]:
+    svg_text = str(svg_markup or "")
+    if not svg_text.strip():
+        return []
+
+    items: list[str] = []
+    patterns = (
+        r"<text\b[^>]*>(.*?)</text>",
+        r"<title\b[^>]*>(.*?)</title>",
+        r"<desc\b[^>]*>(.*?)</desc>",
+    )
+    for pattern in patterns:
+        for raw in re.findall(pattern, svg_text, flags=re.IGNORECASE | re.DOTALL):
+            cleaned = re.sub(r"<[^>]+>", " ", str(raw or ""))
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                items.append(cleaned)
+            if len(items) >= max_items:
+                return items[:max_items]
+    return items[:max_items]
+
+
+async def _resolve_uploaded_visual_source(
+    conv_id: str,
+    user_sub: str = "",
+    filename: str = "",
+) -> dict:
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    if not safe_conv:
+        return {"error": "conv_id é obrigatório para analisar ficheiros visuais carregados."}
+
+    odata_conv = odata_escape(safe_conv)
+    try:
+        rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
+    except Exception as exc:
+        return {"error": f"Falha a carregar UploadIndex: {str(exc)}"}
+    if not rows:
+        return {"error": "Não foram encontrados ficheiros carregados nesta conversa."}
+
+    wanted_filename = _normalize_lookup_key(filename)
+    candidates = []
+    for row in rows:
+        owner_sub = str(row.get("UserSub", "") or "")
+        if safe_user and owner_sub and owner_sub != safe_user:
+            continue
+        fname = str(row.get("Filename", "") or "")
+        raw_blob_ref = str(row.get("RawBlobRef", "") or "")
+        if not fname or not raw_blob_ref:
+            continue
+
+        content_type = _guess_visual_content_type(fname, str(row.get("ContentType", "") or ""))
+        is_svg = fname.lower().endswith(".svg") or content_type == "image/svg+xml"
+        is_raster = content_type in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+        if not is_svg and not is_raster:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return {"error": "Não há imagens, screenshots ou SVG nesta conversa."}
+
+    candidates.sort(key=lambda r: str(r.get("UploadedAt", "")), reverse=True)
+    selected = None
+    if wanted_filename:
+        for row in candidates:
+            norm = _normalize_lookup_key(str(row.get("Filename", "") or ""))
+            if norm == wanted_filename or wanted_filename in norm:
+                selected = row
+                break
+        if selected is None:
+            return {"error": f"Ficheiro visual '{filename}' não encontrado nesta conversa."}
+    else:
+        selected = candidates[0]
+
+    selected_filename = str(selected.get("Filename", "") or "")
+    content_type = _guess_visual_content_type(selected_filename, str(selected.get("ContentType", "") or ""))
+    raw_blob_ref = str(selected.get("RawBlobRef", "") or "")
+    container, blob_name = parse_blob_ref(raw_blob_ref)
+    if not container or not blob_name:
+        return {"error": "RawBlobRef inválido para o ficheiro visual selecionado."}
+
+    try:
+        raw_bytes = await blob_download_bytes(container, blob_name)
+    except Exception as exc:
+        return {"error": f"Falha ao descarregar ficheiro visual: {str(exc)}"}
+    if not raw_bytes:
+        return {"error": "Ficheiro visual vazio para o upload selecionado."}
+
+    if content_type == "image/svg+xml":
+        svg_markup = raw_bytes.decode("utf-8", errors="replace")
+        return {
+            "filename": selected_filename,
+            "content_type": content_type,
+            "svg_markup": svg_markup,
+            "visible_text": _extract_svg_visible_text(svg_markup),
+            "upload_row": selected,
+        }
+
+    return {
+        "filename": selected_filename,
+        "content_type": content_type,
+        "image_base64": base64.b64encode(raw_bytes).decode("ascii"),
+        "upload_row": selected,
+    }
+
+
+def _parse_screenshot_us_answer(answer: str) -> Optional[list]:
+    raw_answer = str(answer or "")
+    parsed = None
+    try:
+        parsed = json.loads(raw_answer)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\"stories\"[\s\S]*\}", raw_answer)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except Exception:
+                parsed = None
+
+    if isinstance(parsed, dict):
+        stories = parsed.get("stories")
+        if isinstance(stories, list):
+            return stories
+    return None
+
+
 async def tool_analyze_uploaded_table(
     query: str = "",
     conv_id: str = "",
@@ -2113,41 +2262,86 @@ async def tool_screenshot_to_us(
     image_base64: str = "",
     context: str = "",
     author_style: str = "",
+    conv_id: str = "",
+    user_sub: str = "",
+    filename: str = "",
 ) -> dict:
-    """Analisa screenshot de UI e gera User Stories estruturadas com modelo vision-capable."""
+    """Analisa screenshot/UI carregado e gera User Stories estruturadas."""
     if not VISION_ENABLED:
         return {"error": "Vision feature is disabled. Set VISION_ENABLED=true to enable."}
 
     raw_b64 = str(image_base64 or "").strip()
-    if not raw_b64:
-        return {"error": "image_base64 e obrigatorio. Enviar screenshot em base64."}
-
-    if len(raw_b64) > 14_000_000:
-        return {"error": "Imagem demasiado grande para analise (max ~10MB)."}
-
+    safe_conv = str(conv_id or "").strip()
+    safe_user = str(user_sub or "").strip()
+    selected_filename = str(filename or "").strip()
     content_type = "image/png"
-    b64_payload = raw_b64
-    if raw_b64.startswith("data:") and "," in raw_b64:
-        header, payload = raw_b64.split(",", 1)
-        b64_payload = payload.strip()
-        m = re.match(r"data:([^;]+);base64", header, flags=re.I)
-        if m:
-            content_type = m.group(1).strip().lower() or content_type
+    b64_payload = ""
+    svg_markup = ""
+    svg_visible_text: list[str] = []
 
-    try:
-        base64.b64decode(b64_payload, validate=True)
-    except Exception:
-        return {"error": "image_base64 invalido (nao e base64 valido)."}
+    if raw_b64:
+        b64_payload = raw_b64
+        if raw_b64.startswith("data:") and "," in raw_b64:
+            header, payload = raw_b64.split(",", 1)
+            b64_payload = payload.strip()
+            m = re.match(r"data:([^;]+);base64", header, flags=re.I)
+            if m:
+                content_type = m.group(1).strip().lower() or content_type
+        if len(raw_b64) > 14_000_000:
+            return {"error": "Imagem demasiado grande para analise (max ~10MB)."}
+        try:
+            base64.b64decode(b64_payload, validate=True)
+        except Exception:
+            b64_payload = ""
+
+    if content_type == "image/svg+xml" and b64_payload:
+        try:
+            svg_markup = base64.b64decode(b64_payload, validate=True).decode("utf-8", errors="replace")
+            svg_visible_text = _extract_svg_visible_text(svg_markup)
+            b64_payload = ""
+        except Exception:
+            svg_markup = ""
+
+    if not b64_payload and not svg_markup and safe_conv:
+        uploaded = await _resolve_uploaded_visual_source(
+            safe_conv,
+            user_sub=safe_user,
+            filename=selected_filename,
+        )
+        if uploaded.get("error") and not raw_b64:
+            return uploaded
+        if not uploaded.get("error"):
+            selected_filename = str(uploaded.get("filename", "") or selected_filename)
+            content_type = str(uploaded.get("content_type", "") or content_type)
+            if content_type == "image/svg+xml":
+                svg_markup = str(uploaded.get("svg_markup", "") or "")
+                svg_visible_text = list(uploaded.get("visible_text") or [])
+            else:
+                b64_payload = str(uploaded.get("image_base64", "") or "")
+
+    if raw_b64 and not b64_payload and not svg_markup and content_type == "image/svg+xml":
+        try:
+            svg_markup = base64.b64decode(raw_b64.split(",", 1)[-1] if "," in raw_b64 else raw_b64).decode("utf-8", errors="replace")
+            svg_visible_text = _extract_svg_visible_text(svg_markup)
+        except Exception:
+            svg_markup = ""
+
+    if not b64_payload and not svg_markup:
+        return {
+            "error": (
+                "Não foi possível obter uma imagem/SVG válido para análise. "
+                "Carrega PNG/JPG/WebP/GIF/BMP ou um SVG legível, ou indica o ficheiro visual da conversa."
+            )
+        }
 
     prompt_parts = [
-        "Analisa este screenshot de interface de utilizador.",
-        "Identifica elementos visiveis de UI (inputs, labels, CTAs, tabelas, modais, toasts, menus, validacoes).",
-        "Gera User Stories estruturadas no formato MSE com titulo, descricao e criterios de aceitacao testaveis.",
-        (
-            "Retorna JSON no formato: "
-            '{"stories":[{"title":"...","description":"...","acceptance_criteria":["..."]}]}.'
-        ),
-        "Nao inventes APIs/endpoints de backend sem evidencia visual ou contexto explicito.",
+        "Analisa este ecrã de interface bancária e gera User Stories completas e testáveis.",
+        "Identifica elementos visíveis de UI: H1/H2, labels, textos, CTAs, links, cards, listas, tabelas, dropdowns, toggles, modais, toasts e estados vazios.",
+        "Mantém PT-PT e descreve também texto EN quando visível no ecrã; deixa EN em branco quando não existir.",
+        "Retorna JSON no formato: "
+        '{"stories":[{"title":"...","description":"...","provenance":"...","conditions":["..."],"composition_and_behavior":["..."],"acceptance_criteria":[{"id":"CA-01","text":"..."}],"test_scenarios":[{"id":"CT-01","title":"...","category":"...","preconditions":"...","test_data":"...","steps":["Dado ...","Quando ...","Então ..."],"covers":["CA-01"]}],"test_data":["..."],"observations":["..."],"clarification_questions":["..."]}]}.',
+        "Não inventes APIs/endpoints de backend sem evidência visual ou contexto explícito.",
+        "Inclui foco visível, ordem de leitura, navegação por teclado e mensagens claras sem citar normas técnicas.",
     ]
     ctx = str(context or "").strip()
     if ctx:
@@ -2155,12 +2349,25 @@ async def tool_screenshot_to_us(
     style = str(author_style or "").strip()
     if style:
         prompt_parts.append(f"Estilo de escrita preferido: {style}")
-    vision_prompt = "\n".join(prompt_parts)
+    if selected_filename:
+        prompt_parts.append(f"Nome do ficheiro analisado: {selected_filename}")
 
-    content_blocks = [
-        {"type": "text", "text": vision_prompt},
-        {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{b64_payload}"}},
-    ]
+    if svg_markup:
+        preview_text = "\n".join(f"- {item}" for item in svg_visible_text[:40])
+        svg_prompt = prompt_parts + [
+            "O input é um SVG textual. Interpreta-o como mockup/ecrã.",
+            "Texto visível extraído do SVG:",
+            preview_text or "- (sem texto visível extraído)",
+            "Markup SVG (truncado):",
+            svg_markup[:120000],
+        ]
+        content_blocks = "\n".join(svg_prompt)
+    else:
+        vision_prompt = "\n".join(prompt_parts)
+        content_blocks = [
+            {"type": "text", "text": vision_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{b64_payload}"}},
+        ]
 
     try:
         llm_resp = await llm_with_fallback(
@@ -2173,30 +2380,22 @@ async def tool_screenshot_to_us(
         if not answer and isinstance(llm_resp, dict):
             answer = str(llm_resp.get("content", "") or "")
 
-        parsed = None
-        try:
-            parsed = json.loads(answer)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\"stories\"[\s\S]*\}", answer)
-            if match:
-                try:
-                    parsed = json.loads(match.group(0))
-                except Exception:
-                    parsed = None
-
-        if isinstance(parsed, dict):
-            stories = parsed.get("stories")
-            if isinstance(stories, list):
-                return {
-                    "stories": stories,
-                    "raw_analysis": answer[:2000],
-                    "source": "vision_llm",
-                }
+        stories = _parse_screenshot_us_answer(answer)
+        if isinstance(stories, list):
+            return {
+                "stories": stories,
+                "raw_analysis": answer[:2000],
+                "source": "vision_llm" if not svg_markup else "svg_llm",
+                "input_type": "image" if not svg_markup else "svg",
+                "filename": selected_filename,
+            }
 
         return {
             "stories": [],
             "raw_analysis": answer[:4000],
-            "source": "vision_llm",
+            "source": "vision_llm" if not svg_markup else "svg_llm",
+            "input_type": "image" if not svg_markup else "svg",
+            "filename": selected_filename,
             "note": "Resposta nao estruturada como JSON. Ver raw_analysis.",
         }
     except Exception as e:
@@ -2275,7 +2474,7 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"generate_user_stories","description":"Gera USs NOVAS baseadas em padrões reais. USA SEMPRE quando pedirem criar/gerar USs.","parameters":{"type":"object","properties":{"topic":{"type":"string","description":"Tema das USs."},"context":{"type":"string","description":"Contexto: Miro, Figma, requisitos."},"num_stories":{"type":"integer","description":"Nº USs. Default: 3."},"reference_area":{"type":"string"},"reference_author":{"type":"string"},"reference_topic":{"type":"string"}},"required":["topic"]}}},
     {"type":"function","function":{"name":"get_writer_profile","description":"Carrega perfil de escrita de um autor para personalizar user stories. Usar quando o utilizador mencionar um autor específico.","parameters":{"type":"object","properties":{"author_name":{"type":"string","description":"Nome do autor (ex: 'Pedro Mousinho')."}},"required":["author_name"]}}},
     {"type":"function","function":{"name":"save_writer_profile","description":"Guarda perfil de escrita após analisar padrões de um autor.","parameters":{"type":"object","properties":{"author_name":{"type":"string","description":"Nome do autor."},"analysis":{"type":"string","description":"Análise do estilo de escrita."},"preferred_vocabulary":{"type":"string","description":"Vocabulário preferido do autor."},"title_pattern":{"type":"string","description":"Padrão de títulos."},"ac_structure":{"type":"string","description":"Estrutura de critérios de aceitação."}},"required":["author_name","analysis"]}}},
-    {"type":"function","function":{"name":"screenshot_to_us","description":"Analisa screenshot de UI e gera User Stories estruturadas (titulo, descricao, criterios de aceitacao). Usar quando o utilizador enviar imagem/screenshot e pedir criação de user stories.","parameters":{"type":"object","properties":{"image_base64":{"type":"string","description":"Screenshot em base64."},"context":{"type":"string","description":"Contexto adicional (projeto, área funcional, requisitos)."},"author_style":{"type":"string","description":"Estilo de escrita a seguir (opcional)."}},"required":["image_base64"]}}},
+    {"type":"function","function":{"name":"screenshot_to_us","description":"Analisa screenshot, mockup PNG/JPG/WebP/GIF/BMP ou SVG carregado e gera User Stories estruturadas com critérios e cenários de teste. Usa quando o utilizador enviar um ecrã e pedir criação de user stories.","parameters":{"type":"object","properties":{"image_base64":{"type":"string","description":"Screenshot em base64 (opcional se existir upload visual na conversa)."},"context":{"type":"string","description":"Contexto adicional (projeto, área funcional, requisitos)."},"author_style":{"type":"string","description":"Estilo de escrita a seguir (opcional)."},"conv_id":{"type":"string","description":"ID da conversa (autopreenchido pelo agente para usar o upload visual real)."},"user_sub":{"type":"string","description":"Sub do utilizador para filtrar uploads da conversa (interno)."},"filename":{"type":"string","description":"Nome do ficheiro visual a usar, se houver vários uploads."}}}}},
     {"type":"function","function":{"name":"query_hierarchy","description":"Query hierárquica parent/child. OBRIGATÓRIO para 'Epic', 'dentro de', 'filhos de'.","parameters":{"type":"object","properties":{"parent_id":{"type":"integer","description":"ID do pai."},"parent_type":{"type":"string","description":"Default: 'Epic'."},"child_type":{"type":"string","description":"Default: 'User Story'."},"area_path":{"type":"string"},"title_contains":{"type":"string","description":"Filtro opcional por título (contains, case/accent-insensitive). Ex: 'Créditos Consultar Carteira'"},"parent_title_hint":{"type":"string","description":"(Interno) dica de título do parent para resolução quando parent_id não for fornecido."}}}}},
     {"type":"function","function":{"name":"compute_kpi","description":"Calcula KPIs (até 1000 items). OBRIGATÓRIO para rankings, distribuições, tendências.","parameters":{"type":"object","properties":{"wiql_where":{"type":"string"},"group_by":{"type":"string","description":"'state','type','assigned_to','created_by','area'"},"kpi_type":{"type":"string","description":"'count','timeline','distribution'"}},"required":["wiql_where"]}}},
     {"type":"function","function":{"name":"create_workitem","description":"Cria um Work Item no Azure DevOps. USA APENAS quando o utilizador CONFIRMAR explicitamente a criação. PERGUNTA SEMPRE antes de criar.","parameters":{"type":"object","properties":{"work_item_type":{"type":"string","description":"Tipo: 'User Story', 'Bug', 'Task', 'Feature'. Default: 'User Story'."},"title":{"type":"string","description":"Título do Work Item."},"description":{"type":"string","description":"Descrição em HTML. Usa formato MSE."},"acceptance_criteria":{"type":"string","description":"Critérios de aceitação em HTML."},"area_path":{"type":"string","description":"AreaPath. Ex: 'IT.DIT\\\\DIT\\\\ADMChannels\\\\DBKS\\\\AM24\\\\RevampFEE MVP2'"},"assigned_to":{"type":"string","description":"Nome completo da pessoa. Ex: 'Pedro Mousinho'"},"tags":{"type":"string","description":"Tags separadas por ';'. Ex: 'MVP2;FEE;Sprint23'"},"confirmed":{"type":"boolean","description":"true apenas após confirmação explícita do utilizador (ex: 'confirmo')."}},"required":["title"]}}},
@@ -2393,6 +2592,9 @@ def _tool_dispatch() -> dict:
             arguments.get("image_base64", ""),
             arguments.get("context", ""),
             arguments.get("author_style", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+            arguments.get("filename", ""),
         ),
         "generate_workitem": lambda arguments: tool_generate_user_stories(arguments.get("topic",""), arguments.get("requirements",""), reference_area=arguments.get("reference_area"), reference_author=arguments.get("reference_author")),
         "query_hierarchy": lambda arguments: tool_query_hierarchy(
@@ -2500,6 +2702,7 @@ _SEARCH_FIGMA_PROXY_DEFINITION = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Texto de pesquisa em nomes de ficheiro/frame."},
+                "figma_url": {"type": "string", "description": "URL completa do Figma (opcional). O tool extrai file_key/node_id automaticamente."},
                 "file_key": {"type": "string", "description": "Figma file key para detalhar um ficheiro especifico."},
                 "node_id": {"type": "string", "description": "Node/frame id para detalhe especifico dentro do ficheiro."},
             },
@@ -2516,12 +2719,12 @@ _ANALYZE_FIGMA_FLOW_PROXY_DEFINITION = {
             "type": "object",
             "properties": {
                 "file_key": {"type": "string", "description": "Figma file key."},
+                "figma_url": {"type": "string", "description": "URL completa do Figma (opcional). O tool extrai file_key/start_node_id automaticamente."},
                 "node_ids": {"type": "string", "description": "IDs de frames em CSV ou lista JSON serializada."},
                 "start_node_id": {"type": "string", "description": "Node inicial opcional para seguir fluxo de protótipo."},
                 "include_branches": {"type": "boolean", "description": "Incluir branches de erro/fallback/cancel."},
                 "max_steps": {"type": "integer", "description": "Máximo de steps a processar."},
             },
-            "required": ["file_key"],
         },
     },
 }
@@ -2550,6 +2753,7 @@ async def _search_figma_proxy(arguments):
             query=(arguments or {}).get("query", ""),
             file_key=(arguments or {}).get("file_key", ""),
             node_id=(arguments or {}).get("node_id", ""),
+            figma_url=(arguments or {}).get("figma_url", ""),
         )
     except Exception as e:
         logging.error("[Tools] search_figma proxy failed: %s", e, exc_info=True)
@@ -2566,6 +2770,7 @@ async def _analyze_figma_flow_proxy(arguments):
             start_node_id=(arguments or {}).get("start_node_id", ""),
             include_branches=(arguments or {}).get("include_branches", True),
             max_steps=(arguments or {}).get("max_steps", 15),
+            figma_url=(arguments or {}).get("figma_url", ""),
         )
     except Exception as e:
         logging.error("[Tools] analyze_figma_flow proxy failed: %s", e, exc_info=True)
@@ -2635,6 +2840,7 @@ def get_agent_system_prompt():
     uploaded_doc_enabled = has_tool("search_uploaded_document")
     uploaded_table_enabled = has_tool("analyze_uploaded_table")
     uploaded_table_chart_enabled = has_tool("chart_uploaded_table")
+    visual_userstory_enabled = has_tool("screenshot_to_us")
 
     def _join_with_ou(parts):
         if not parts:
@@ -2648,6 +2854,8 @@ def get_agent_system_prompt():
         data_sources.append("documento carregado")
     if uploaded_table_enabled:
         data_sources.append("ficheiro tabular carregado (CSV/Excel)")
+    if visual_userstory_enabled:
+        data_sources.append("screenshot/mockup carregado")
     if figma_enabled:
         data_sources.append("Figma")
     if miro_enabled:
@@ -2666,6 +2874,10 @@ def get_agent_system_prompt():
     if uploaded_table_chart_enabled:
         gate_priority_hints.append(
             "- Se o utilizador pedir gráfico de CSV/Excel carregado, usa chart_uploaded_table como primeira tentativa."
+        )
+    if visual_userstory_enabled:
+        gate_priority_hints.append(
+            "- Se o utilizador pedir user stories a partir de screenshot/mockup/SVG carregado, usa screenshot_to_us."
         )
     if has_tool("prepare_outlook_draft"):
         gate_priority_hints.append(
@@ -2697,6 +2909,8 @@ def get_agent_system_prompt():
         exception_targets.append("documento carregado")
     if uploaded_table_enabled:
         exception_targets.append("ficheiro tabular carregado")
+    if visual_userstory_enabled:
+        exception_targets.append("screenshot/mockup carregado")
     if figma_enabled:
         exception_targets.append("Figma")
     if miro_enabled:
@@ -2797,6 +3011,14 @@ def get_agent_system_prompt():
             "   REGRA: Usa sempre o ficheiro carregado da conversa; não inventes EntryIDs nem ações fora das labels permitidas."
         )
         next_rule += 1
+    if visual_userstory_enabled:
+        routing_rules.append(
+            f"{next_rule}. Para USER STORIES baseadas em screenshot, mockup, PNG/JPG/WebP/GIF/BMP ou SVG carregado -> usa screenshot_to_us (OBRIGATORIO)\n"
+            "   Exemplos: \"faz-me uma user story para este ecrã\", \"gera US deste mockup\", \"descreve este screenshot\".\n"
+            "   REGRA: Se houver ficheiro visual carregado e o pedido for descrever um ecrã, usa screenshot_to_us em vez de responder apenas com texto.\n"
+            "   REGRA: screenshot_to_us usa automaticamente o upload visual da conversa; não inventes base64."
+        )
+        next_rule += 1
     if has_tool("update_data_dictionary") and has_tool("get_data_dictionary"):
         routing_rules.append(
             f"{next_rule}. Para DADOS POLIMÓRFICOS (campo_N/field_N cujo significado muda por pivot) -> segue este fluxo\n"
@@ -2813,8 +3035,9 @@ def get_agent_system_prompt():
     if figma_enabled:
         routing_rules.append(
             f"{next_rule}. Para DESIGN, MOCKUPS, ECRAS UI e PROTOTIPOS FIGMA -> usa search_figma (OBRIGATORIO)\n"
-            "   Exemplos: \"mostra os designs recentes\", \"abre o ficheiro figma X\", \"que frames existem no mockup?\"\n"
-            "   REGRA: Nao usar search_website para pedidos de Figma. Usa sempre search_figma."
+            "   Exemplos: \"mostra os designs recentes\", \"abre o ficheiro figma X\", \"que frames existem no mockup?\", \"analisa este URL Figma\"\n"
+            "   REGRA: Nao usar search_website para pedidos de Figma. Usa sempre search_figma.\n"
+            "   REGRA: Se o utilizador fornecer URL Figma, passa-o como figma_url ou extrai file_key/node_id."
         )
         next_rule += 1
     if miro_enabled:
@@ -2865,11 +3088,19 @@ def get_agent_system_prompt():
                 "- \"Gera histograma do Close no CSV\" -> chart_uploaded_table",
             ]
         )
+    if visual_userstory_enabled:
+        usage_examples.extend(
+            [
+                "- \"Faz-me uma user story para este screenshot\" -> screenshot_to_us",
+                "- \"Gera US deste SVG carregado\" -> screenshot_to_us",
+            ]
+        )
     if figma_enabled:
         usage_examples.extend(
             [
                 "- \"Mostra os ficheiros recentes do Figma\" -> search_figma",
                 "- \"Detalha os frames do ficheiro Figma ABC\" -> search_figma com file_key",
+                "- \"Analisa este URL Figma\" -> search_figma com figma_url",
             ]
         )
     if miro_enabled:
@@ -2973,9 +3204,15 @@ def get_userstory_system_prompt():
             "- Se o utilizador fornecer um fluxo Figma com múltiplos ecrãs/frames, usa analyze_figma_flow "
             "para decompor em steps antes de gerar US.\n"
         )
+    screenshot_instruction = ""
+    if has_tool("screenshot_to_us"):
+        screenshot_instruction = (
+            "- Se houver screenshot/mockup/SVG carregado e o pedido for descrever um ecrã, usa screenshot_to_us "
+            "para analisar o input visual antes de consolidar a resposta final.\n"
+        )
     return f"""Tu és PO Sénior especialista no MSE (Millennium Site Empresas).
 Objetivo: transformar pedidos em User Stories rigorosas, refinadas iterativamente.
-DATA: {datetime.now().strftime('%Y-%m-%d')}
+DATA: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
 MODO OBRIGATÓRIO: DRAFT → REVIEW → FINAL
 1) DRAFT: gera primeiro uma versão inicial (clara e completa) com base no pedido.
@@ -2992,6 +3229,7 @@ FERRAMENTA OBRIGATÓRIA:
 - Quando o utilizador pedir "como o [autor] escreve", passa reference_author para aproveitar WriterProfiles.
 - Se o utilizador referir uma US existente por ID e pedir alteração, usa refine_workitem para criar o draft de revisão antes do final.
 {figma_flow_instruction}
+{screenshot_instruction}
 
 PARSING DE INPUT (PRIORIDADE):
 - Texto: extrair objetivo, regras e restrições.
@@ -3004,17 +3242,47 @@ REGRA DE VISUAL PARSING:
 - Se forem fornecidas 2 imagens no mesmo pedido, assume: Imagem 1 = ANTES e Imagem 2 = DEPOIS; gera ACs específicos por cada diferença visual detectada.
 - Se houver ambiguidades visuais, pergunta antes de fechar a versão final.
 
+REGRA DE DETALHE EM COMPOSIÇÃO & COMPORTAMENTO:
+- Enumerar TODOS os elementos visuais do ecrã, um por um: H1, H2, body text, cards, CTAs, links, listas, tabelas, dropdowns, toggles, tabs, steppers, modais, toasts, badges, FAQs, ícones e empty states.
+- Para cada texto visível, apresentar PT e EN: 'Confirmar' / 'Confirm'. Se EN não existir, deixar EN em branco.
+- Explicar comportamento esperado para cada elemento interativo: ação do utilizador -> resposta do sistema.
+- Incluir estados condicionais: enabled/disabled, show/hide, serviço indisponível, sem resultados, sessão expirada, timeout, offline.
+- Acessibilidade natural: ordem de leitura, navegação por teclado, foco visível, rótulos claros e mensagens compreensíveis, sem citar normas.
+
+PERGUNTAS DE CLARIFICAÇÃO (levantar quando faltar contexto):
+- Quais são os fluxos alternativos ou exceções esperadas?
+- Existem limites de montante, regras de arredondamento ou taxas?
+- Que mensagens de erro devem ser mostradas e onde?
+- O ecrã deve funcionar offline? Como indicar progresso/erro?
+- Há requisitos específicos de privacidade (mascarar dados, timeouts)?
+- Quais são os estados vazios e o que mostrar em cada um?
+- Idiomas suportados e necessidades de formatação (moeda, data)?
+- Dispositivos-alvo e orientações (mobile/tablet/desktop)?
+
 ESTRUTURA OBRIGATÓRIA:
 Título: MSE | [Domínio] | [Jornada/Subárea] | [Fluxo/Step] | [Detalhe da Alteração]
 - 4 a 6 segmentos separados por " | "
 - Se o domínio não for inferível, usar "Transversal"
-Descrição: <div>Eu como <b>[Persona]</b>, quero <b>[ação]</b>, para <b>[benefício de negócio/utilizador]</b>.</div>
-AC (ordem obrigatória):
-- <b>Proveniência</b> + <ul><li>...</li></ul>
-- <b>Condições</b> + <ul><li>...</li></ul>
-- <b>Composição</b> + <ul><li>...</li></ul>
-- <b>Comportamento</b> + <ul><li>...</li></ul>
+Descrição: <div>Como cliente do banco com interesse em <b>[objetivo]</b>, quero <b>[ação/ecrã desejado]</b>, para que <b>[benefício ou resultado esperado]</b>.</div>
+Secções obrigatórias:
+- <b>Proveniência</b> + <ul><li>Trajeto do utilizador até ao ecrã.</li></ul>
+- <b>Condições</b> + <ul><li>Pré-requisitos de acesso. Usar 'NA' se não houver.</li></ul>
+- <b>Composição &amp; Comportamento</b> + <ul><li>Estrutura visual, PT/EN, hierarquia H1/H2/body, interações, estados condicionais e acessibilidade natural.</li></ul>
+- <b>Critérios de Aceitação</b> + <ul><li>Critérios claros, mensuráveis e ligados a IDs CA-01, CA-02, ...</li></ul>
+- <b>Cenários de Teste</b> + <ul><li>Cenários CT-01, CT-02, ... com categoria, pré-condições, dados de teste, passos Dado/Quando/Então e cobertura dos CAs relevantes.</li></ul>
+- <b>Dados de Teste</b> + <ul><li>Exemplos e limites relevantes (montantes, IBAN, datas, sessão, conectividade).</li></ul>
+- <b>Observações, Assunções e Riscos</b> + <ul><li>Dependências, flags, riscos conhecidos e restrições.</li></ul>
 - <b>Mockup</b> + <ul><li>Mockup a confirmar com UX.</li></ul>
+
+COBERTURA MÍNIMA DOS CENÁRIOS:
+- 1 cenário de fluxo principal.
+- 1+ cenários de validações de dados críticos.
+- 1+ cenários de erros/estados vazios.
+- 1+ cenários de acessibilidade.
+- 1 cenário de segurança/privacidade.
+- 1 cenário de internacionalização/formatação.
+- 1 cenário de navegação.
+- 1 cenário de desempenho/resiliência.
 
 QUALIDADE:
 - HTML limpo apenas (<b>, <ul>, <li>, <br>, <div>), sem HTML sujo nem HTML escapado.
@@ -3025,6 +3293,7 @@ QUALIDADE:
 - Quando faltar contexto de negócio, acrescentar secção <b>Assunções</b> no fim dos AC.
 - Prioridade template > WriterProfile: usar perfil histórico apenas para vocabulário/nível de detalhe, nunca para estrutura de secções.
 - Política de detalhe: por defeito seguir template canónico; se o utilizador pedir formato explícito, seguir o formato pedido.
+- Ligar sempre cenários de teste aos critérios de aceitação relevantes (ex.: "Cobre CA-01, CA-03").
 
 VOCABULÁRIO PREFERENCIAL:
 {", ".join(US_PREFERRED_VOCAB)}
