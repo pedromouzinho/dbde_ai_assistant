@@ -4,10 +4,10 @@
 
 import json
 import base64
-import asyncio
 import logging
 import re
 import unicodedata
+import httpx
 from datetime import datetime, timezone
 from urllib.parse import quote
 from typing import Optional
@@ -76,6 +76,57 @@ def _devops_headers():
 
 def _devops_url(path):
     return f"https://dev.azure.com/{DEVOPS_ORG}/{DEVOPS_PROJECT}/_apis/{path}"
+
+
+async def _fetch_workitem_details(
+    ids,
+    fields,
+    headers,
+    *,
+    client: httpx.AsyncClient,
+    timeout: int = 60,
+    retry_individual_failures: bool = False,
+):
+    """Fetch work item details using a shared client and no artificial sleeps."""
+    all_details = []
+    failed_ids = []
+    if not ids:
+        return all_details, failed_ids
+
+    for i in range(0, len(ids), 100):
+        batch = ids[i : i + 100]
+        response = await devops_request_with_retry(
+            "POST",
+            _devops_url("wit/workitemsbatch?api-version=7.1"),
+            headers,
+            {"ids": batch, "fields": fields},
+            timeout=timeout,
+            client=client,
+        )
+        if "error" in response:
+            failed_ids.extend(batch)
+            continue
+        all_details.extend(response.get("value", []))
+
+    if retry_individual_failures and failed_ids and len(failed_ids) <= 50:
+        fl = ",".join(fields)
+        remaining = []
+        for fid in failed_ids:
+            response = await devops_request_with_retry(
+                "GET",
+                _devops_url(f"wit/workitems/{fid}?fields={fl}&api-version=7.1"),
+                headers,
+                max_retries=3,
+                timeout=timeout,
+                client=client,
+            )
+            if "error" not in response and "id" in response:
+                all_details.append(response)
+            else:
+                remaining.append(fid)
+        failed_ids = remaining
+
+    return all_details, failed_ids
 
 def _format_wi(item):
     f = item.get("fields", {})
@@ -616,54 +667,33 @@ async def tool_query_workitems(wiql_where, fields=None, top=200):
         f"AND {safe_where} ORDER BY [System.ChangedDate] DESC"
     )
     headers = _devops_headers()
-    resp = await devops_request_with_retry(
-        "POST",
-        _devops_url("wit/wiql?api-version=7.1"),
-        headers,
-        {"query": wiql},
-        timeout=60,
-    )
-    if "error" in resp:
-        return resp
-    work_items = resp.get("workItems", [])
-    total_count = len(work_items)
-    if top == 0:
-        return {"total_count": total_count, "items": []}
-    work_items = work_items[: min(top, 1000) if top > 0 else total_count]
-    if not work_items:
-        return {"total_count": 0, "items": []}
-    await asyncio.sleep(0.5)
-    all_details, failed_ids, ids = [], [], [wi["id"] for wi in work_items]
-    for i in range(0, len(ids), 100):
-        batch = ids[i : i + 100]
-        r = await devops_request_with_retry(
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await devops_request_with_retry(
             "POST",
-            _devops_url("wit/workitemsbatch?api-version=7.1"),
+            _devops_url("wit/wiql?api-version=7.1"),
             headers,
-            {"ids": batch, "fields": use_fields},
+            {"query": wiql},
             timeout=60,
+            client=client,
         )
-        if "error" in r:
-            failed_ids.extend(batch)
-            await asyncio.sleep(3)
-            continue
-        all_details.extend(r.get("value", []))
-        await asyncio.sleep(0.5)
-    if failed_ids and len(failed_ids) <= 50:
-        await asyncio.sleep(2)
-        fl = ",".join(use_fields)
-        for fid in failed_ids[:]:
-            r = await devops_request_with_retry(
-                "GET",
-                _devops_url(f"wit/workitems/{fid}?fields={fl}&api-version=7.1"),
-                headers,
-                max_retries=3,
-                timeout=60,
-            )
-            if "error" not in r and "id" in r:
-                all_details.append(r)
-                failed_ids.remove(fid)
-            await asyncio.sleep(0.3)
+        if "error" in resp:
+            return resp
+        work_items = resp.get("workItems", [])
+        total_count = len(work_items)
+        if top == 0:
+            return {"total_count": total_count, "items": []}
+        work_items = work_items[: min(top, 1000) if top > 0 else total_count]
+        if not work_items:
+            return {"total_count": 0, "items": []}
+        ids = [wi["id"] for wi in work_items]
+        all_details, failed_ids = await _fetch_workitem_details(
+            ids,
+            use_fields,
+            headers,
+            client=client,
+            timeout=60,
+            retry_individual_failures=True,
+        )
     items = [_format_wi(it) for it in all_details]
     if failed_ids and not items:
         items = [
@@ -1150,48 +1180,43 @@ async def tool_query_hierarchy(
             "MODE (Recursive)"
         )
 
-    resp = await devops_request_with_retry(
-        "POST",
-        _devops_url("wit/wiql?api-version=7.1"),
-        headers,
-        {"query": wiql},
-        timeout=60,
-    )
-    if "error" in resp:
-        return resp
-    rels = resp.get("workItemRelations", [])
-    tids = list(set(r["target"]["id"] for r in rels if r.get("target") and r.get("rel")))
-    if not tids:
-        tids = [wi["id"] for wi in resp.get("workItems", [])]
-    total_raw = len(tids)
-    if not tids:
-        return {
-            "total_count": 0,
-            "total_raw_count": 0,
-            "items_returned": 0,
-            "items": [],
-            "parent_id": safe_parent_id if safe_parent_id else parent_id,
-            "parent_type": safe_parent_type,
-            "child_type": safe_child_type,
-            "title_contains": child_title_filter,
-            "parent_title_hint": parent_hint,
-        }
-    flds = DEVOPS_FIELDS + ["System.Parent"]
-    all_det, failed = [], []
-    for i in range(0, len(tids), 100):
-        batch = tids[i : i + 100]
-        r = await devops_request_with_retry(
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await devops_request_with_retry(
             "POST",
-            _devops_url("wit/workitemsbatch?api-version=7.1"),
+            _devops_url("wit/wiql?api-version=7.1"),
             headers,
-            {"ids": batch, "fields": flds},
+            {"query": wiql},
             timeout=60,
+            client=client,
         )
-        if "error" not in r:
-            all_det.extend(r.get("value", []))
-        else:
-            failed.extend(batch)
-        await asyncio.sleep(0.5)
+        if "error" in resp:
+            return resp
+        rels = resp.get("workItemRelations", [])
+        tids = list(set(r["target"]["id"] for r in rels if r.get("target") and r.get("rel")))
+        if not tids:
+            tids = [wi["id"] for wi in resp.get("workItems", [])]
+        total_raw = len(tids)
+        if not tids:
+            return {
+                "total_count": 0,
+                "total_raw_count": 0,
+                "items_returned": 0,
+                "items": [],
+                "parent_id": safe_parent_id if safe_parent_id else parent_id,
+                "parent_type": safe_parent_type,
+                "child_type": safe_child_type,
+                "title_contains": child_title_filter,
+                "parent_title_hint": parent_hint,
+            }
+        flds = DEVOPS_FIELDS + ["System.Parent"]
+        all_det, failed = await _fetch_workitem_details(
+            tids,
+            flds,
+            headers,
+            client=client,
+            timeout=60,
+            retry_individual_failures=False,
+        )
     items = []
     for it in all_det:
         fi = _format_wi(it)

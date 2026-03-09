@@ -148,6 +148,74 @@ class TestDevOpsTools:
         assert "items" in result
         assert "total_count" in result
 
+    async def test_query_workitems_reuses_http_client(self, monkeypatch):
+        import tools_devops
+
+        client_ids = []
+
+        async def _fake_request(method, url, headers=None, json_body=None, **kwargs):
+            _ = (method, headers)
+            client = kwargs.get("client")
+            assert client is not None
+            client_ids.append(id(client))
+            if "wit/wiql" in url:
+                return {"workItems": [{"id": 1001}, {"id": 1002}]}
+            if "wit/workitemsbatch" in url:
+                return _mock_batch_items()
+            return {"error": f"unexpected url: {url}"}
+
+        monkeypatch.setattr(tools_devops, "devops_request_with_retry", _fake_request)
+        monkeypatch.setattr(tools_devops, "_attach_auto_csv_export", _noop_attach)
+
+        result = await tools_devops.tool_query_workitems("[System.WorkItemType] = 'Bug'", top=10)
+        assert result["items_returned"] == 2
+        assert len(set(client_ids)) == 1
+
+    async def test_query_hierarchy_reuses_http_client(self, monkeypatch):
+        import tools_devops
+
+        client_ids = []
+
+        async def _fake_request(method, url, headers=None, json_body=None, **kwargs):
+            _ = (method, headers)
+            client = kwargs.get("client")
+            assert client is not None
+            client_ids.append(id(client))
+            if "wit/wiql" in url:
+                return {"workItemRelations": [{"rel": "System.LinkTypes.Hierarchy-Forward", "target": {"id": 1001}}]}
+            if "wit/workitemsbatch" in url:
+                return {
+                    "value": [
+                        {
+                            "id": 1001,
+                            "fields": {
+                                "System.Title": "Filho",
+                                "System.State": "Active",
+                                "System.WorkItemType": "User Story",
+                                "System.AreaPath": "IT.DIT\\DBDE",
+                                "System.CreatedDate": "2026-02-01T10:00:00Z",
+                                "System.Parent": 999,
+                            },
+                        }
+                    ]
+                }
+            return {"error": f"unexpected url: {url}"}
+
+        monkeypatch.setattr(tools_devops, "devops_request_with_retry", _fake_request)
+        monkeypatch.setattr(tools_devops, "_attach_auto_csv_export", _noop_attach)
+
+        result = await tools_devops.tool_query_hierarchy(parent_id=999, child_type="User Story")
+        assert result["items_returned"] == 1
+        assert len(set(client_ids)) == 1
+
+    async def test_agent_system_prompt_does_not_reask_full_names_or_hardcode_ids(self):
+        import tools
+
+        prompt = tools.get_agent_system_prompt()
+        assert "Dois ou mais tokens com aspeto de nome completo" in prompt
+        assert "Não peças confirmação redundante de nome completo" in prompt
+        assert "US 912700" not in prompt
+
     async def test_scenarios_contract(self, monkeypatch, tool_scenarios):
         import tools_devops
 
