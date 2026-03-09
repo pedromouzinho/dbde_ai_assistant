@@ -48,6 +48,7 @@ REQUIRED_TABLES = [
     "UploadIndex",
     "ExportJobs",
     "RateLimits",
+    "DataDictionary",
 ]
 BLOB_API_VERSION = "2021-12-02"
 BLOB_SERVICE_BASE_URL = f"https://{STORAGE_ACCOUNT}.blob.core.windows.net"
