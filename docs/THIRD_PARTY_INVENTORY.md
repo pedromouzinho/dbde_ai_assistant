@@ -14,11 +14,11 @@ Inventário de integrações externas, com finalidade, dados trocados, risco de 
 - Jurisdição: região Azure configurada (preferencialmente EU).
 - Env vars: `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, `CHAT_DEPLOYMENT`, `LLM_TIER_*`.
 
-### 2.2 Anthropic (opcional)
-- Finalidade: fallback provider LLM.
+### 2.2 Anthropic via Azure AI Foundry
+- Finalidade: tiers `standard` e `pro` do LLM.
 - Dados enviados/recebidos: mensagens e respostas.
 - PII potencial: média/alta.
-- Jurisdição: depende do endpoint (API direta vs Foundry).
+- Jurisdição: Sweden Central quando configurado via Azure AI Foundry.
 - Env vars: `ANTHROPIC_API_KEY`, `ANTHROPIC_API_BASE`, `ANTHROPIC_FOUNDRY_RESOURCE`.
 
 ### 2.3 Azure AI Search

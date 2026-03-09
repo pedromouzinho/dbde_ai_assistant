@@ -13,7 +13,7 @@ class TestClientErrorModel:
             message="Cannot read property 'map' of undefined",
             stack="TypeError: Cannot read...\n    at App (index.html:123)",
             component="ChatMessage",
-            url="https://dbdeai.pt/",
+            url="https://millennium-ai-assistant.azurewebsites.net/",
             timestamp="2026-02-28T10:00:00Z",
         )
         assert report.error_type == "uncaught_error"

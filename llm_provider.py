@@ -489,6 +489,7 @@ class AnthropicProvider(LLMProvider):
     
     def _headers(self) -> dict:
         return {
+            # Azure AI Foundry Claude accepts Anthropic-compatible headers with the resource key.
             "x-api-key": self.api_key,
             "anthropic-version": self.API_VERSION,
             "content-type": "application/json",
