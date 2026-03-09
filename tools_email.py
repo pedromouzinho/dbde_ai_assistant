@@ -606,10 +606,12 @@ def _build_outlook_draft_powershell(payload: Dict[str, Any], msg_filename: str) 
     payload_b64 = base64.b64encode(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
-    return f"""param(
-    [string]$OutputPath = "$(Join-Path $PSScriptRoot '{msg_filename}')"
-)
+    return f"""$draftDir = [string]$env:DBDE_DRAFT_DIR
+if ([string]::IsNullOrWhiteSpace($draftDir)) {{
+    $draftDir = (Get-Location).Path
+}}
 
+$OutputPath = Join-Path $draftDir '{msg_filename}'
 $payloadJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{payload_b64}'))
 $payload = $payloadJson | ConvertFrom-Json
 $outlook = New-Object -ComObject Outlook.Application
@@ -644,6 +646,26 @@ try {{
 }}
 $mail.Display()
 Write-Host ("Draft MSG criado em: {{0}}" -f $OutputPath)
+"""
+
+
+def _build_outlook_draft_cmd(payload: Dict[str, Any], msg_filename: str) -> str:
+    ps_script = _build_outlook_draft_powershell(payload, msg_filename)
+    encoded_ps = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+    return f"""@echo off
+setlocal
+set "DBDE_DRAFT_DIR=%~dp0"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded_ps}
+set "EXITCODE=%ERRORLEVEL%"
+if not "%EXITCODE%"=="0" (
+  echo.
+  echo Falha ao criar ou abrir o draft Outlook.
+  echo.
+  echo Verifica se o Outlook desktop esta instalado e configurado nesta maquina.
+  echo Se o problema persistir, abre Windows PowerShell e executa este ficheiro a partir de la para ver o erro.
+  pause
+)
+exit /b %EXITCODE%
 """
 
 
@@ -707,12 +729,12 @@ async def tool_prepare_outlook_draft(
     downloads = await _store_downloads(
         [
             {
-                "label": "Gerar .msg e abrir draft no Outlook (.ps1)",
-                "description": "Script PowerShell auto-suficiente que cria um ficheiro .msg local e abre o draft no Outlook.",
+                "label": "Gerar .msg e abrir draft no Outlook (.cmd)",
+                "description": "Launcher de um clique que cria um ficheiro .msg local e abre o draft no Outlook.",
                 "primary": True,
-                "filename": f"Open_{base_name}.ps1",
+                "filename": f"Open_{base_name}.cmd",
                 "mime_type": "text/plain",
-                "content": _build_outlook_draft_powershell(payload, msg_filename).encode("utf-8"),
+                "content": _build_outlook_draft_cmd(payload, msg_filename).encode("utf-8"),
             },
         ]
     )
@@ -727,7 +749,7 @@ async def tool_prepare_outlook_draft(
         "attachments": attachment_list,
         "summary": (
             "Rascunho preparado para Outlook. "
-            "O .ps1 gera um ficheiro .msg local e abre o draft no Outlook."
+            "O .cmd gera um ficheiro .msg local e abre o draft no Outlook."
         ),
         "items": [
             {

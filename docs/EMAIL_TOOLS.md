@@ -5,9 +5,10 @@ Esta capability cobre dois fluxos principais no agente:
 1. `prepare_outlook_draft`
    - Objetivo: transformar um email já aprovado num pack pronto para Outlook.
    - Output:
-     - `Open_<nome>.ps1`
+     - `Open_<nome>.cmd`
    - Comportamento:
-     - o `.ps1` gera um ficheiro `<nome>.msg` localmente, no Windows com Outlook
+     - o `.cmd` chama PowerShell com `ExecutionPolicy Bypass`, para não depender de copy/paste manual
+     - o `.cmd` gera um ficheiro `<nome>.msg` localmente, no Windows com Outlook
      - a janela que abre é o compose vivo do Outlook, evitando o comportamento inconsistente de abrir `.msg/.eml` como preview
 
 2. `classify_uploaded_emails`
@@ -44,6 +45,6 @@ O classificador aceita:
 
 - O browser não consegue executar Outlook diretamente por razões de segurança do lado do cliente.
 - O fluxo mais direto é:
-  - no draft: clicar em `Gerar .msg e abrir draft no Outlook (.ps1)`
+  - no draft: clicar em `Gerar .msg e abrir draft no Outlook (.cmd)`
   - na triagem: clicar em `Aplicar ações no Outlook (.ps1)`
 - Os botões do chat usam labels específicas para evitar que o utilizador tenha de adivinhar qual download interessa.

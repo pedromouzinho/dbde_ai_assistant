@@ -96,7 +96,7 @@ def test_outlook_action_script_contains_expected_operations():
 
 
 @pytest.mark.asyncio
-async def test_prepare_outlook_draft_generates_msg_script(monkeypatch):
+async def test_prepare_outlook_draft_generates_msg_launcher(monkeypatch):
     capture = _DownloadCapture()
     monkeypatch.setattr(tools_email, "_store_generated_file", capture)
 
@@ -109,13 +109,18 @@ async def test_prepare_outlook_draft_generates_msg_script(monkeypatch):
 
     assert result["status"] == "ok"
     assert len(result["_auto_file_downloads"]) == 1
-    assert result["_auto_file_downloads"][0]["label"] == "Gerar .msg e abrir draft no Outlook (.ps1)"
+    assert result["_auto_file_downloads"][0]["label"] == "Gerar .msg e abrir draft no Outlook (.cmd)"
     assert result["_auto_file_downloads"][0]["primary"] is True
-    script = capture.find(".ps1")["content"].decode("utf-8")
+    launcher = capture.find(".cmd")["content"].decode("utf-8")
+    encoded_command = re.search(r"-EncodedCommand ([A-Za-z0-9+/=]+)", launcher)
+    assert encoded_command is not None
+    script = base64.b64decode(encoded_command.group(1)).decode("utf-16le")
     payload_b64 = re.search(r"FromBase64String\('([^']+)'\)", script)
     assert payload_b64 is not None
     payload = json.loads(base64.b64decode(payload_b64.group(1)).decode("utf-8"))
     assert payload["to"] == "cliente@empresa.pt; apoio@empresa.pt"
+    assert "ExecutionPolicy Bypass" in launcher
+    assert "DBDE_DRAFT_DIR" in launcher
     assert "CreateItem(0)" in script
     assert ".SaveAs(" in script
     assert "Resposta ao cliente.msg" in script
