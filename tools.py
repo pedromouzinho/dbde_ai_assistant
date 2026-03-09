@@ -1899,6 +1899,72 @@ async def _load_uploaded_files_for_code(
     return uploaded_files
 
 
+def _artifact_download_label(filename: str) -> str:
+    safe_name = str(filename or "").strip()
+    lower_name = safe_name.lower()
+    if lower_name == "uploaded_table_chart.html":
+        return "Abrir gráfico interativo (.html)"
+    if lower_name == "uploaded_table_chart.svg":
+        return "Gráfico vetorial (.svg)"
+    if lower_name == "uploaded_table_chart_data.csv":
+        return "Dados do gráfico (.csv)"
+    if lower_name.endswith(".html"):
+        return f"Abrir {safe_name} (.html)"
+    if safe_name:
+        return f"Descarregar {safe_name}"
+    return "Descarregar ficheiro gerado"
+
+
+def _artifact_download_description(filename: str, mime_type: str) -> str:
+    lower_name = str(filename or "").strip().lower()
+    if lower_name == "uploaded_table_chart.html":
+        return "Grafico interativo HTML para abrir no browser."
+    if lower_name == "uploaded_table_chart.svg":
+        return "Grafico vetorial SVG gerado no sandbox."
+    if lower_name == "uploaded_table_chart_data.csv":
+        return "CSV com os dados usados para o grafico."
+    if str(mime_type or "").startswith("image/"):
+        return "Imagem gerada pelo sandbox."
+    return "Ficheiro gerado automaticamente pelo code interpreter."
+
+
+def _build_generated_artifact_downloads(artifacts: list[dict]) -> list[dict]:
+    downloads = []
+    if not isinstance(artifacts, list):
+        return downloads
+
+    primary_idx = 0
+    for idx, artifact in enumerate(artifacts):
+        if str(artifact.get("format", "") or "").lower() == "html":
+            primary_idx = idx
+            break
+
+    for idx, artifact in enumerate(artifacts):
+        download_id = str(artifact.get("download_id", "") or "").strip()
+        endpoint = str(artifact.get("endpoint", "") or artifact.get("url", "") or "").strip()
+        if not download_id or not endpoint:
+            continue
+        filename = str(artifact.get("filename", "") or "").strip()
+        fmt = str(artifact.get("format", "") or "").strip().lower()
+        mime_type = str(artifact.get("mime_type", "") or "application/octet-stream")
+        downloads.append(
+            {
+                "download_id": download_id,
+                "endpoint": endpoint,
+                "filename": filename,
+                "format": fmt or "bin",
+                "mime_type": mime_type,
+                "size_bytes": int(artifact.get("size", 0) or 0),
+                "expires_in_seconds": _GENERATED_FILE_TTL_SECONDS,
+                "auto_generated": True,
+                "label": _artifact_download_label(filename),
+                "description": _artifact_download_description(filename, mime_type),
+                "primary": idx == primary_idx,
+            }
+        )
+    return downloads
+
+
 async def tool_run_code(
     code: str = "",
     description: str = "",
@@ -1938,13 +2004,17 @@ async def tool_run_code(
         except Exception:
             continue
         fmt = fname.rsplit(".", 1)[-1].lower() if "." in fname else "bin"
-        download_id = await _store_generated_file(content, str(img.get("mime_type", "") or "application/octet-stream"), fname, fmt)
+        mime_type = str(img.get("mime_type", "") or "application/octet-stream")
+        download_id = await _store_generated_file(content, mime_type, fname, fmt)
         artifacts.append(
             {
                 "type": "image",
                 "filename": fname,
                 "size": int(img.get("size", len(content)) or len(content)),
                 "download_id": download_id,
+                "format": fmt,
+                "mime_type": mime_type,
+                "endpoint": f"/api/download/{download_id}" if download_id else "",
                 "url": f"/api/download/{download_id}" if download_id else "",
             }
         )
@@ -1959,13 +2029,17 @@ async def tool_run_code(
         except Exception:
             continue
         fmt = fname.rsplit(".", 1)[-1].lower() if "." in fname else "bin"
-        download_id = await _store_generated_file(content, str(file_obj.get("mime_type", "") or "application/octet-stream"), fname, fmt)
+        mime_type = str(file_obj.get("mime_type", "") or "application/octet-stream")
+        download_id = await _store_generated_file(content, mime_type, fname, fmt)
         artifacts.append(
             {
                 "type": "file",
                 "filename": fname,
                 "size": int(file_obj.get("size", len(content)) or len(content)),
                 "download_id": download_id,
+                "format": fmt,
+                "mime_type": mime_type,
+                "endpoint": f"/api/download/{download_id}" if download_id else "",
                 "url": f"/api/download/{download_id}" if download_id else "",
             }
         )
@@ -1973,6 +2047,7 @@ async def tool_run_code(
     stdout = str(result.get("stdout", "") or "")
     stderr = str(result.get("stderr", "") or "")
     error = str(result.get("error", "") or "")
+    auto_downloads = _build_generated_artifact_downloads(artifacts)
 
     output_parts = []
     if safe_desc:
@@ -1985,7 +2060,12 @@ async def tool_run_code(
         output_parts.append(f"ERROR: {error}")
     if mounted_files:
         output_parts.append(f"Ficheiros montados no sandbox: {', '.join(sorted(mounted_files.keys()))}")
-    if artifacts:
+    if auto_downloads:
+        lines = ["Ficheiros gerados:"]
+        for item in auto_downloads:
+            lines.append(f"- [{item['label']}]({item['endpoint']})")
+        output_parts.append("\n".join(lines))
+    elif artifacts:
         names = [a.get("filename", "") for a in artifacts if a.get("filename")]
         output_parts.append(f"Ficheiros gerados: {', '.join(names)}")
     if not output_parts:
@@ -2001,6 +2081,7 @@ async def tool_run_code(
         "return_code": result.get("return_code"),
         "mounted_files": sorted(mounted_files.keys()),
         "generated_artifacts": artifacts,
+        "_auto_file_downloads": auto_downloads,
         "items": artifacts,
         "total_count": len(artifacts),
         "output_text": "\n\n".join(output_parts)[:12000],
@@ -2871,7 +2952,7 @@ REGRA ANTI-CRASH (IMPORTANTE):
 - Se retornar muitos dados truncados, diz quantos existem no total e mostra os que tens.
 - NUNCA chames a mesma ferramenta com os mesmos argumentos duas vezes seguidas.
 
-RESPOSTA: PT-PT. IDs: [US 912700]. Links DevOps. Contagens EXATAS com total_count. Tabelas markdown quando apropriado. Parágrafos naturais.
+RESPOSTA: PT-PT. Links DevOps. Contagens EXATAS com total_count. Tabelas markdown quando apropriado. Parágrafos naturais.
 
 ÁREAS: RevampFEE MVP2, MDSE, ACEDigital, MSE (sob IT.DIT\\DIT\\ADMChannels\\DBKS\\AM24)
 TIPOS: User Story, Bug, Task, Feature, Epic

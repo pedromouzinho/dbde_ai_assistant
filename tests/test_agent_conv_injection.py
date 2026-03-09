@@ -166,3 +166,92 @@ async def test_agent_chat_returns_generic_error_on_timeout(monkeypatch):
 
     assert response.answer == "Ocorreu um erro inesperado. Por favor tenta novamente."
     assert "sensitive/path/secret" not in response.answer
+
+
+@pytest.mark.asyncio
+async def test_refresh_polymorphic_pending_state_sets_pending_selection(monkeypatch):
+    conv_id = "conv-poly-pending"
+
+    async def fake_uploaded_files(_conv_id):
+        return [
+            {
+                "filename": "Tbl_Contact_Detail.xlsx",
+                "polymorphic_schema": {
+                    "is_polymorphic": True,
+                    "pivot_column": "transaction_Id",
+                    "pivot_profiles": {
+                        "871": {"row_count": 2},
+                        "872": {"row_count": 2},
+                        "873": {"row_count": 2},
+                    },
+                },
+            }
+        ]
+
+    monkeypatch.setattr(agent, "_get_uploaded_files_async", fake_uploaded_files)
+
+    try:
+        await agent._refresh_polymorphic_pending_state(
+            conv_id,
+            "Analisa novamente os dados deste dataset",
+            "Indica qual transaction_Id queres analisar: 871, 872, 873.",
+        )
+        meta = await agent._get_conversation_meta(conv_id)
+    finally:
+        agent.conversation_meta.pop(conv_id, None)
+
+    pending = meta.get(agent._PENDING_POLYMORPHIC_SELECTION_KEY)
+    assert pending["pivot_column"] == "transaction_Id"
+    assert pending["table_name"] == "Tbl_Contact_Detail.xlsx"
+    assert pending["available_values"] == ["871", "872", "873"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_polymorphic_followup_question_rewrites_short_reply():
+    conv_id = "conv-poly-followup"
+    await agent._set_conversation_meta(
+        conv_id,
+        {
+            agent._PENDING_POLYMORPHIC_SELECTION_KEY: {
+                "table_name": "Tbl_Contact_Detail.xlsx",
+                "pivot_column": "transaction_Id",
+                "available_values": ["871", "872", "873"],
+                "original_question": "Analisa novamente os dados do dataset",
+            }
+        },
+    )
+
+    try:
+        rewritten, clarification = await agent._prepare_polymorphic_followup_question(conv_id, "871")
+        meta = await agent._get_conversation_meta(conv_id)
+    finally:
+        agent.conversation_meta.pop(conv_id, None)
+
+    assert clarification == ""
+    assert "transaction_Id=871" in rewritten
+    assert meta.get(agent._PENDING_POLYMORPHIC_SELECTION_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_polymorphic_followup_question_reprompts_invalid_short_reply():
+    conv_id = "conv-poly-invalid"
+    await agent._set_conversation_meta(
+        conv_id,
+        {
+            agent._PENDING_POLYMORPHIC_SELECTION_KEY: {
+                "table_name": "Tbl_Contact_Detail.xlsx",
+                "pivot_column": "transaction_Id",
+                "available_values": ["871", "872"],
+                "original_question": "Analisa novamente os dados do dataset",
+            }
+        },
+    )
+
+    try:
+        rewritten, clarification = await agent._prepare_polymorphic_followup_question(conv_id, "999")
+    finally:
+        agent.conversation_meta.pop(conv_id, None)
+
+    assert rewritten == ""
+    assert "transaction_Id" in clarification
+    assert "871" in clarification

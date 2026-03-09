@@ -36,7 +36,7 @@ AZURE_OPENAI_ENDPOINT = _get_env(
     "https://dbdeaccess.openai.azure.com"
 )
 AZURE_OPENAI_KEY = _get_env("AZURE_OPENAI_KEY", "")
-CHAT_DEPLOYMENT = _get_env("CHAT_DEPLOYMENT", "dbde_access_chatbot")
+CHAT_DEPLOYMENT = _get_env("CHAT_DEPLOYMENT", "gpt-4-1-dz")
 EMBEDDING_DEPLOYMENT = _get_env("EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 API_VERSION_CHAT = _get_env("API_VERSION_CHAT", "2024-10-21")
 API_VERSION_OPENAI = _get_env("API_VERSION_OPENAI", "2023-05-15")
@@ -45,6 +45,8 @@ API_VERSION_OPENAI = _get_env("API_VERSION_OPENAI", "2023-05-15")
 # ANTHROPIC (Claude) — via API directa OU via Azure AI Foundry
 # =============================================================================
 # Se ANTHROPIC_FOUNDRY_RESOURCE estiver definido, usa Azure Foundry.
+# Nesse caso, ANTHROPIC_API_KEY deve apontar para a key do recurso Azure AI Foundry,
+# não para uma API key directa da Anthropic.
 # Caso contrário, usa api.anthropic.com directamente.
 # =============================================================================
 ANTHROPIC_API_KEY = _get_env("ANTHROPIC_API_KEY", "")
@@ -60,6 +62,17 @@ ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-6")
 ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6")
 ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
+
+def _default_standard_tier() -> str:
+    """Prefer Claude Sonnet when Anthropic/Foundry is configured."""
+    if ANTHROPIC_FOUNDRY_RESOURCE or ANTHROPIC_API_KEY:
+        return "anthropic:sonnet"
+    return "azure_openai:gpt-5-mini-dz"
+
+
+def _default_allowed_origins() -> str:
+    return "https://millennium-ai-assistant.azurewebsites.net"
+
 # =============================================================================
 # LLM PROVIDER CONFIG
 # =============================================================================
@@ -69,13 +82,20 @@ LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "standard")
 # Mapping de tiers para providers+modelos
 # Formato: "provider:deployment_name" — o provider resolve internamente
 # DataZone deployments (*-dz): dados ficam na EU (Sweden Central) + Abuse Monitoring Opt-Out activo
-# Pro usa Claude Opus 4.6 via Anthropic — PII Shield mascara antes de enviar
-# NOTA: Para Pro funcionar requer ANTHROPIC_API_KEY ou ANTHROPIC_FOUNDRY_RESOURCE em App Settings
+# Standard prefere Claude Sonnet 4.6 quando Anthropic/Foundry estiver configurado.
+# Pro usa Claude Opus 4.6 via Anthropic — PII Shield mascara antes de enviar.
 LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4-1-dz")          # DataZone, gpt-4.1, 87 TPM
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-5-mini-dz") # DataZone, gpt-5-mini, 30 TPM
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", _default_standard_tier())
 LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "anthropic:opus")                      # Claude Opus 4.6
 LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4-1-dz")      # DataZone, multimodal
 VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"
+
+LEGACY_FAST_DEPLOYMENT = _get_env("FAST_DEPLOYMENT", "")
+if LEGACY_FAST_DEPLOYMENT:
+    logger.warning(
+        "[Config] FAST_DEPLOYMENT=%s está obsoleto e é ignorado. Usa LLM_TIER_FAST.",
+        LEGACY_FAST_DEPLOYMENT,
+    )
 
 # PII Shield (Azure AI Language)
 PII_ENDPOINT = _get_env("PII_ENDPOINT", "")
@@ -133,7 +153,7 @@ TOP_K = int(_get_env("TOP_K", "10"))
 RERANK_ENABLED = _get_env("RERANK_ENABLED", "true").lower() == "true"
 RERANK_ENDPOINT = _get_env("RERANK_ENDPOINT", "")
 RERANK_API_KEY = _get_env("RERANK_API_KEY", "")
-RERANK_MODEL = _get_env("RERANK_MODEL", "cohere-rerank-v4.0-fast")
+RERANK_MODEL = _get_env("RERANK_MODEL", "cohere-rerank-v4-fast")
 RERANK_TOP_N = int(_get_env("RERANK_TOP_N", "15"))
 RERANK_TIMEOUT_SECONDS = float(_get_env("RERANK_TIMEOUT_SECONDS", "15"))
 RERANK_AUTH_MODE = _get_env("RERANK_AUTH_MODE", "api-key").lower()
@@ -227,12 +247,7 @@ AUTH_COOKIE_SECURE = _get_env("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_COOKIE_MAX_AGE_SECONDS = int(_get_env("AUTH_COOKIE_MAX_AGE_SECONDS", "86400"))
 ALLOWED_ORIGINS = _get_env(
     "ALLOWED_ORIGINS",
-    ",".join(
-        [
-            "https://dbdeai.pt",
-            "https://millennium-ai-assistant-epa7d7b4defabwbn.swedencentral-01.azurewebsites.net",
-        ]
-    ),
+    _default_allowed_origins(),
 )
 
 # =============================================================================

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import types
 
@@ -295,3 +296,53 @@ class TestUploadedTableCharting:
         from code_interpreter import _guess_mime
 
         assert _guess_mime("sample.xlsb") == "application/vnd.ms-excel.sheet.binary.macroenabled.12"
+
+    @pytest.mark.asyncio
+    async def test_run_code_exposes_generated_files_as_download_buttons(self, monkeypatch):
+        import code_interpreter
+        import tools
+
+        async def fake_execute_code(*_args, **_kwargs):
+            return {
+                "success": True,
+                "stdout": "",
+                "stderr": "",
+                "error": "",
+                "files": [
+                    {
+                        "filename": "uploaded_table_chart.html",
+                        "mime_type": "text/html",
+                        "data": base64.b64encode(b"<html></html>").decode("ascii"),
+                        "size": 13,
+                    },
+                    {
+                        "filename": "uploaded_table_chart.svg",
+                        "mime_type": "image/svg+xml",
+                        "data": base64.b64encode(b"<svg></svg>").decode("ascii"),
+                        "size": 11,
+                    },
+                    {
+                        "filename": "uploaded_table_chart_data.csv",
+                        "mime_type": "text/csv",
+                        "data": base64.b64encode(b"a,b\n1,2\n").decode("ascii"),
+                        "size": 8,
+                    },
+                ],
+            }
+
+        stored = []
+
+        async def fake_store_generated_file(_content, _mime_type, filename, _fmt):
+            stored.append(filename)
+            return f"download-{len(stored)}"
+
+        monkeypatch.setattr(code_interpreter, "execute_code", fake_execute_code)
+        monkeypatch.setattr(tools, "_store_generated_file", fake_store_generated_file)
+
+        result = await tools.tool_run_code(code="print('ok')", description="gerar chart")
+
+        assert len(result["_auto_file_downloads"]) == 3
+        primary = next(item for item in result["_auto_file_downloads"] if item["primary"])
+        assert primary["filename"] == "uploaded_table_chart.html"
+        assert primary["endpoint"] == "/api/download/download-1"
+        assert "[Abrir gráfico interativo (.html)](/api/download/download-1)" in result["output_text"]
