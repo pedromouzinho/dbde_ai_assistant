@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 import tempfile
+from binascii import Error as BinasciiError
+from base64 import b64decode
 from datetime import date, datetime, time
 from typing import Iterator
 
@@ -20,6 +23,20 @@ TABULAR_PREVIEW_CHAR_LIMIT = 100_000
 TABULAR_PREVIEW_ROW_LIMIT = 200
 TABULAR_RECORD_LIMIT = 500_000
 SUPPORTED_TABULAR_EXTENSIONS = (".csv", ".tsv", ".xlsx", ".xlsb", ".xls")
+_GENERIC_COLUMN_PATTERN = re.compile(
+    r"^(campo|field|col|column|attr|param|value|dado|data|var|prop)[_\s]?\d+$",
+    re.IGNORECASE,
+)
+_UUID_VALUE_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$|^[0-9a-f]{32}$",
+    re.IGNORECASE,
+)
+_BASE64_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9+/]{16,}={0,2}$")
+_BOOLEAN_VALUES = {"true", "false", "yes", "no", "sim", "nao", "1", "0"}
+_POLYMORPHIC_GENERIC_THRESHOLD = 3
+_POLYMORPHIC_PIVOT_MAX_DISTINCT = 50
+_POLYMORPHIC_PIVOT_MIN_FILL = 0.90
+_POLYMORPHIC_EMPTY_COL_THRESHOLD = 0.30
 
 _TABULAR_UPLOAD_LIMITS = {
     ".csv": UPLOAD_MAX_FILE_BYTES_CSV,
@@ -88,6 +105,133 @@ def load_tabular_dataset(
     if ext == ".xls":
         return _load_xls_dataset(raw_bytes, max_rows=max_rows)
     raise TabularLoaderError(f"Formato tabular não suportado: {ext or 'desconhecido'}")
+
+
+def detect_polymorphic_schema(
+    columns: list[str],
+    sample_records: list[dict],
+    column_types: dict[str, str],
+    row_count: int,
+) -> dict | None:
+    if not columns or not sample_records:
+        return None
+
+    generic_columns = [column for column in columns if _GENERIC_COLUMN_PATTERN.match(str(column or "").strip())]
+    if len(generic_columns) < _POLYMORPHIC_GENERIC_THRESHOLD:
+        return None
+
+    empty_columns = [column for column in columns if _sample_fill_rate(sample_records, column) == 0.0]
+    non_generic_columns = [column for column in columns if column not in generic_columns]
+    best_candidate: tuple[float, str, dict[str, list[dict]]] | None = None
+
+    for candidate in non_generic_columns:
+        fill_rate = _sample_fill_rate(sample_records, candidate)
+        values = [str(record.get(candidate, "") or "").strip() for record in sample_records]
+        distinct_values = [value for value in sorted(set(values)) if value]
+        if fill_rate < _POLYMORPHIC_PIVOT_MIN_FILL:
+            continue
+        if not (2 <= len(distinct_values) <= _POLYMORPHIC_PIVOT_MAX_DISTINCT):
+            continue
+
+        groups: dict[str, list[dict]] = {}
+        for record in sample_records:
+            key = str(record.get(candidate, "") or "").strip()
+            if not key:
+                continue
+            groups.setdefault(key, []).append(record)
+        if len(groups) < 2:
+            continue
+
+        fill_variance_hits = 0
+        type_variance_hits = 0
+        for generic_column in generic_columns:
+            fill_rates = []
+            inferred_types = set()
+            for group_rows in groups.values():
+                values_in_group = _non_empty_values(group_rows, generic_column)
+                fill_rates.append(len(values_in_group) / max(1, len(group_rows)))
+                if values_in_group:
+                    inferred_types.add(_infer_generic_value_type(values_in_group))
+            if fill_rates and (max(fill_rates) - min(fill_rates)) >= 0.5:
+                fill_variance_hits += 1
+            if len(inferred_types) > 1:
+                type_variance_hits += 1
+
+        score = float(fill_variance_hits * 2 + type_variance_hits)
+        if score <= 0:
+            continue
+        if best_candidate is None or score > best_candidate[0]:
+            best_candidate = (score, candidate, groups)
+
+    if best_candidate is None:
+        return None
+
+    empty_ratio = len(empty_columns) / max(1, len(columns))
+    score, pivot_column, pivot_groups = best_candidate
+    if empty_ratio < _POLYMORPHIC_EMPTY_COL_THRESHOLD and score < 3:
+        return None
+
+    universal_columns = [
+        column
+        for column in non_generic_columns
+        if all(_sample_fill_rate(rows, column) >= 0.9 for rows in pivot_groups.values())
+    ]
+
+    pivot_profiles: dict[str, dict] = {}
+    for pivot_value, rows in sorted(pivot_groups.items(), key=lambda item: item[0]):
+        filled_generics = {}
+        empty_generics = []
+        for generic_column in generic_columns:
+            values = _non_empty_values(rows, generic_column)
+            if not values:
+                empty_generics.append(generic_column)
+                continue
+            filled_generics[generic_column] = {
+                "fill_pct": round((len(values) / max(1, len(rows))) * 100, 1),
+                "inferred_type": _infer_generic_value_type(values),
+                "samples": _distinct_samples(values, limit=3),
+            }
+        pivot_profiles[pivot_value] = {
+            "row_count": len(rows),
+            "filled_generics": filled_generics,
+            "empty_generics": empty_generics,
+        }
+
+    summary_text = (
+        f"Detetado padrão polimórfico/EAV com pivot '{pivot_column}', "
+        f"{len(generic_columns)} colunas genéricas e {len(pivot_profiles)} perfis de pivot "
+        f"em amostra de {len(sample_records)} linhas (dataset total: {row_count})."
+    )
+    return {
+        "is_polymorphic": True,
+        "pivot_column": pivot_column,
+        "generic_columns": generic_columns,
+        "empty_columns": empty_columns,
+        "universal_columns": universal_columns,
+        "pivot_profiles": pivot_profiles,
+        "pivot_values_count": len(pivot_profiles),
+        "summary_text": summary_text,
+    }
+
+
+def _infer_generic_value_type(values: list[str]) -> str:
+    cleaned = [str(value or "").strip() for value in values if str(value or "").strip()]
+    if not cleaned:
+        return "text"
+    distinct = set(cleaned)
+    if len(distinct) == 1:
+        return "fixed_value"
+    if sum(1 for value in cleaned if _UUID_VALUE_PATTERN.match(value)) / len(cleaned) >= 0.8:
+        return "uuid"
+    if sum(1 for value in cleaned if _looks_like_base64(value)) / len(cleaned) >= 0.8:
+        return "base64_encoded"
+    if len({value.lower() for value in cleaned}) <= 2 and all(value.lower() in _BOOLEAN_VALUES for value in cleaned):
+        return "boolean"
+    if sum(1 for value in cleaned if _parse_float(value) is not None) / len(cleaned) >= 0.8:
+        return "numeric"
+    if sum(1 for value in cleaned if _parse_datetime(value) is not None) / len(cleaned) >= 0.8:
+        return "date"
+    return "text"
 
 
 def _load_delimited_preview(
@@ -356,6 +500,31 @@ def _preview_payload(
     }
 
 
+def _sample_fill_rate(rows: list[dict], column: str) -> float:
+    if not rows:
+        return 0.0
+    return len(_non_empty_values(rows, column)) / len(rows)
+
+
+def _non_empty_values(rows: list[dict], column: str) -> list[str]:
+    values = []
+    for row in rows:
+        value = str((row or {}).get(column, "") or "").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _distinct_samples(values: list[str], limit: int = 3) -> list[str]:
+    seen = []
+    for value in values:
+        if value not in seen:
+            seen.append(value)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def _build_column_analysis(
     columns: list[str],
     sample_rows: list[list[str]],
@@ -478,6 +647,17 @@ def _parse_float(value: str) -> float | None:
         return float(text)
     except Exception:
         return None
+
+
+def _looks_like_base64(value: str) -> bool:
+    raw = str(value or "").strip()
+    if len(raw) < 16 or len(raw) % 4 != 0 or not _BASE64_VALUE_PATTERN.match(raw):
+        return False
+    try:
+        decoded = b64decode(raw, validate=True)
+    except (ValueError, BinasciiError):
+        return False
+    return bool(decoded)
 
 
 def _parse_datetime(value: str) -> datetime | None:

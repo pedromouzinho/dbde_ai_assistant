@@ -5,6 +5,7 @@ import types
 
 import openpyxl
 import pytest
+from fastapi import UploadFile
 
 import app
 import tabular_loader
@@ -113,6 +114,88 @@ class TestUploadLimitsAndExtraction:
         assert store_entry["row_count"] == 2
         assert result_payload["rows"] == 2
 
+    @pytest.mark.asyncio
+    async def test_extract_upload_entry_uses_full_dataset_for_semantic_chunks(self, monkeypatch):
+        captured = {}
+        preview_rows = [f"row-{idx}" for idx in range(200)]
+        full_records = [{"Body": f"line-{idx}-" + ("x" * 260)} for idx in range(300)]
+
+        monkeypatch.setattr(
+            app,
+            "load_tabular_preview",
+            lambda _content, _filename: {
+                "columns": ["Body"],
+                "row_count": 300,
+                "data_text": "Body\n" + "\n".join(preview_rows),
+                "delimiter": "\t",
+                "col_analysis": [{"name": "Body", "type": "text", "sample": ["row-0"]}],
+                "truncated": True,
+            },
+        )
+        monkeypatch.setattr(
+            app,
+            "load_tabular_dataset",
+            lambda _content, _filename: {
+                "columns": ["Body"],
+                "records": full_records,
+                "row_count": 300,
+            },
+        )
+
+        async def _fake_build_semantic_chunks(text):
+            captured["text"] = text
+            return [{"text": "ok"}]
+
+        monkeypatch.setattr(app, "_build_semantic_chunks", _fake_build_semantic_chunks)
+
+        store_entry, _ = await app._extract_upload_entry("sample.csv", b"Body\nx\n", "text/csv")
+
+        assert len(captured["text"].splitlines()) == 301
+        assert store_entry["data_text"].count("\n") < len(captured["text"].splitlines())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route_name", ["upload_file", "upload_file_async"])
+    async def test_single_upload_routes_use_per_extension_limit(self, monkeypatch, route_name):
+        captured = {}
+
+        monkeypatch.setattr(app, "get_current_user", lambda _credentials=None: {"sub": "tester"})
+        monkeypatch.setattr(app, "_max_upload_bytes_for_file", lambda filename: 123 if filename.endswith(".csv") else 50)
+
+        async def _fake_read_upload_with_limit(upload, max_bytes):
+            captured["filename"] = upload.filename
+            captured["max_bytes"] = max_bytes
+            return b"csv-bytes"
+
+        async def _fake_count_reserved_slots(*_args, **_kwargs):
+            return 0
+
+        async def _fake_count_pending_jobs_for_user(*_args, **_kwargs):
+            return 0
+
+        async def _fake_queue_upload_job(conv_id, user_sub, filename, content, content_type):
+            return {
+                "job_id": "job-1",
+                "conversation_id": conv_id,
+                "filename": filename,
+                "size_bytes": len(content),
+                "content_type": content_type,
+                "user_sub": user_sub,
+            }
+
+        monkeypatch.setattr(app, "_read_upload_with_limit", _fake_read_upload_with_limit)
+        monkeypatch.setattr(app, "_count_reserved_slots_for_conversation", _fake_count_reserved_slots)
+        monkeypatch.setattr(app, "_count_pending_jobs_for_user", _fake_count_pending_jobs_for_user)
+        monkeypatch.setattr(app, "_queue_upload_job", _fake_queue_upload_job)
+        monkeypatch.setattr(app, "_cleanup_upload_jobs", lambda: None)
+
+        upload = UploadFile(filename="emails.csv", file=io.BytesIO(b"csv"))
+        route = getattr(app, route_name)
+        result = await route(None, upload, None, None)
+
+        assert result["status"] == "queued"
+        assert captured["filename"] == "emails.csv"
+        assert captured["max_bytes"] == 123
+
 
 class TestUploadedTableCharting:
     def test_chart_tool_is_registered(self):
@@ -201,6 +284,12 @@ class TestUploadedTableCharting:
 
         compile(code, "<chart_template>", "exec")
         assert "sample.csv" in code
+
+    def test_chart_template_is_not_fstring(self):
+        from tools import _CHART_CODE_TEMPLATE
+
+        assert "{{" not in _CHART_CODE_TEMPLATE
+        assert "}}" not in _CHART_CODE_TEMPLATE
 
     def test_code_interpreter_knows_xlsb_mime(self):
         from code_interpreter import _guess_mime

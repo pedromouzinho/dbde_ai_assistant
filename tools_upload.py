@@ -10,9 +10,10 @@ import logging
 from config import UPLOAD_INDEX_TOP
 from storage import table_query, blob_download_json, parse_blob_ref
 from tools_knowledge import get_embedding, _cosine_similarity
+from utils import odata_escape
 
 async def _load_indexed_chunks(conv_id: str, user_sub: str = ""):
-    safe_conv = str(conv_id or "").strip().replace("'", "''")
+    safe_conv = odata_escape(str(conv_id or "").strip())
     if not safe_conv:
         return []
     safe_user = str(user_sub or "").strip()
@@ -143,4 +144,3 @@ async def tool_search_uploaded_document(query: str = "", conv_id: str = "", user
         "total_results": len(top_chunks),
         "items": top_chunks,
     }
-

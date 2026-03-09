@@ -14,7 +14,7 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, AsyncGenerator, Callable, Iterator
+from typing import Any, Dict, List, Optional, AsyncGenerator, Callable, Iterator
 from collections.abc import MutableMapping
 
 from config import (
@@ -53,6 +53,8 @@ from storage import (
 )
 from utils import odata_escape
 from pii_shield import PIIMaskingContext, mask_pii
+from tabular_loader import is_tabular_filename
+from data_dictionary import get_dictionary, format_dictionary_for_prompt
 
 # =============================================================================
 # IN-MEMORY STORES (migra para persistent storage em fase futura)
@@ -65,6 +67,8 @@ _TOOLS_NEEDING_CONV_CONTEXT = {
     "run_code",
     "classify_uploaded_emails",
     "chart_uploaded_table",
+    "update_data_dictionary",
+    "get_data_dictionary",
 }
 
 
@@ -221,8 +225,26 @@ def _cleanup_conversation_related_state(conv_id: str) -> None:
     conversation_meta.pop(conv_id, None)
     uploaded_files_store.pop(conv_id, None)
     lock = _conversation_locks.get(conv_id)
-    if lock and not lock.locked():
+    if lock is None:
+        return
+    if not lock.locked():
         _conversation_locks.pop(conv_id, None)
+        return
+
+    async def _deferred_lock_cleanup(cid: str, held_lock: asyncio.Lock) -> None:
+        try:
+            async with asyncio.timeout(30):
+                async with held_lock:
+                    pass
+        except Exception:
+            pass
+        _conversation_locks.pop(cid, None)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_deferred_lock_cleanup(conv_id, lock))
+    except RuntimeError:
+        pass
 
 
 conversations = ConversationStore(
@@ -327,6 +349,17 @@ async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
         return _conversation_locks[conv_id]
 
 
+async def _mask_pii_structured(data: Any, ctx: PIIMaskingContext) -> Any:
+    """Apply PII masking without breaking the surrounding JSON shape."""
+    if isinstance(data, dict):
+        return {key: await _mask_pii_structured(value, ctx) for key, value in data.items()}
+    if isinstance(data, list):
+        return [await _mask_pii_structured(item, ctx) for item in data]
+    if isinstance(data, str) and len(data) >= 3:
+        return await mask_pii(data, ctx)
+    return data
+
+
 def _create_logged_task(coro, label: str) -> None:
     task = asyncio.create_task(coro)
 
@@ -404,6 +437,7 @@ def _get_uploaded_files_unlocked(conv_id: str) -> List[dict]:
 
 
 def _get_uploaded_files(conv_id: str) -> List[dict]:
+    """Sync compatibility wrapper used by older tests/helpers."""
     return _get_uploaded_files_unlocked(conv_id)
 
 
@@ -466,6 +500,23 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
             full_col_stats = json.loads(row.get("FullColStatsJson", "[]") or "[]")
         except Exception:
             full_col_stats = []
+        polymorphic_schema = None
+        try:
+            parsed_poly = json.loads(row.get("PolymorphicSchemaJson", "") or "")
+            if isinstance(parsed_poly, dict) and parsed_poly.get("is_polymorphic"):
+                polymorphic_schema = parsed_poly
+        except Exception:
+            polymorphic_schema = None
+        if polymorphic_schema is None:
+            poly_summary = str(row.get("PolymorphicSummary", "") or "").strip()
+            pivot_column = str(row.get("PivotColumn", "") or "").strip()
+            if poly_summary:
+                polymorphic_schema = {
+                    "is_polymorphic": True,
+                    "summary_text": poly_summary,
+                    "pivot_column": pivot_column,
+                    "pivot_values_count": int(row.get("PivotValuesCount", 0) or 0),
+                }
         files.append(
             {
                 "filename": row.get("Filename", ""),
@@ -479,6 +530,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
                 "has_chunks": str(row.get("HasChunks", "")).lower() in ("true", "1"),
                 "chunks_blob_ref": row.get("ChunksBlobRef", ""),
                 "extracted_blob_ref": extracted_ref,
+                "polymorphic_schema": polymorphic_schema,
             }
         )
     if files:
@@ -487,7 +539,7 @@ async def _ensure_uploaded_files_loaded(conv_id: str, user_sub: str = "") -> Non
                 return
             uploaded_files_store[conv_id] = {
                 "files": files[-MAX_FILES_CONTEXT:],
-                "uploaded_at": datetime.now().isoformat(),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
                 "from_index": True,
             }
 
@@ -609,15 +661,35 @@ async def _inject_file_context(conv_id: str, messages: List[dict]):
                 "MODO USERSTORY — integra requisitos de todos os anexos numa proposta coerente e sem duplicações."
             )
 
+        polymorphic_blocks = []
         for idx, file_data in enumerate(use_files, 1):
             filename = str(file_data.get("filename", ""))
             filename_lower = filename.lower()
-            is_tabular = filename_lower.endswith((".xlsx", ".xls", ".csv"))
+            is_tabular = is_tabular_filename(filename_lower)
             is_pdf = filename_lower.endswith(".pdf")
             is_pptx = filename_lower.endswith(".pptx")
             is_image = bool(file_data.get("image_base64"))
             cols = file_data.get("col_names", [])
             cols_txt = ", ".join(cols) if isinstance(cols, list) else str(cols or "")
+            polymorphic_schema = file_data.get("polymorphic_schema") if isinstance(file_data.get("polymorphic_schema"), dict) else None
+            dictionary_context = str(file_data.get("dictionary_context", "") or "")
+            if polymorphic_schema and polymorphic_schema.get("is_polymorphic") and not dictionary_context:
+                try:
+                    dictionary_entries = await get_dictionary(filename)
+                    if dictionary_entries:
+                        dictionary_context = format_dictionary_for_prompt(dictionary_entries, table_name=filename)
+                        file_data["dictionary_context"] = dictionary_context
+                except Exception as e:
+                    logger.warning("[Agent] data dictionary lookup failed for %s: %s", filename, e)
+            if polymorphic_schema and polymorphic_schema.get("is_polymorphic"):
+                polymorphic_blocks.append(
+                    "\n".join(
+                        [
+                            f"### {filename} (pivô: {polymorphic_schema.get('pivot_column', '') or '?'})",
+                            str(polymorphic_schema.get("summary_text", "") or "Dataset polimórfico detetado."),
+                        ]
+                    )
+                )
 
             block = [
                 f"[FICHEIRO {idx}] {filename}",
@@ -657,6 +729,17 @@ async def _inject_file_context(conv_id: str, messages: List[dict]):
                     sample = ", ".join((ca.get("sample") or [])[:3])
                     block.append(f"- {ca.get('name','')} ({ca.get('type','text')}): {sample}")
 
+            if polymorphic_schema and polymorphic_schema.get("is_polymorphic"):
+                block.append("PERFIL POLIMÓRFICO DETECTADO:")
+                block.append(str(polymorphic_schema.get("summary_text", "") or "Dataset polimórfico detetado."))
+                if dictionary_context:
+                    block.append(dictionary_context[:4000])
+                else:
+                    block.append(
+                        "Sem dicionário de dados conhecido. Antes de interpretar campo_N/field_N, "
+                        "pede contexto ao utilizador ou consulta get_data_dictionary."
+                    )
+
             if mode == "userstory":
                 if is_tabular:
                     block.append("Interpretar como lista estruturada de requisitos funcionais.")
@@ -680,6 +763,16 @@ async def _inject_file_context(conv_id: str, messages: List[dict]):
                 )
 
             ctx_parts.append("\n".join(block))
+
+        if polymorphic_blocks:
+            ctx_parts.extend(
+                [
+                    "## DATASETS POLIMÓRFICOS DETECTADOS",
+                    "ATENÇÃO: colunas genéricas (campo_N/field_N) podem mudar de significado conforme o pivot.",
+                    "Para cada análise: 1) filtra por pivot value 2) interpreta os campos conforme o perfil desse valor.",
+                    "\n\n".join(polymorphic_blocks),
+                ]
+            )
 
         ctx = "\n\n".join(ctx_parts)[:120000]
         messages.append({"role": "system", "content": ctx})
@@ -721,7 +814,7 @@ async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> b
             conv_id,
             {
                 "mode": stored_mode,
-                "created_at": row.get("CreatedAt", datetime.now().isoformat()),
+                "created_at": row.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
                 "loaded_from_storage": True,
             },
         )
@@ -745,7 +838,7 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
             conversations[conv_id] = [{"role": "system", "content": sp}]
             await _set_conversation_meta(
                 conv_id,
-                {"mode": mode, "created_at": datetime.now().isoformat()},
+                {"mode": mode, "created_at": datetime.now(timezone.utc).isoformat()},
             )
     else:
         conversations.touch(conv_id)
@@ -1037,16 +1130,14 @@ async def _run_forced_dual_hierarchy(
 
 def _has_tabular_uploads(conv_id: str) -> bool:
     for file_data in _get_uploaded_files(conv_id):
-        name = str(file_data.get("filename", "") or "").lower()
-        if name.endswith((".csv", ".xlsx", ".xls")):
+        if is_tabular_filename(str(file_data.get("filename", "") or "").lower()):
             return True
     return False
 
 
 async def _has_tabular_uploads_async(conv_id: str) -> bool:
     for file_data in await _get_uploaded_files_async(conv_id):
-        name = str(file_data.get("filename", "") or "").lower()
-        if name.endswith((".csv", ".xlsx", ".xls")):
+        if is_tabular_filename(str(file_data.get("filename", "") or "").lower()):
             return True
     return False
 
@@ -1056,12 +1147,7 @@ def _extract_forced_uploaded_table_calls(
     conv_id: str,
     already_used: Optional[List[str]] = None,
 ) -> List[LLMToolCall]:
-    if not _has_tabular_uploads(conv_id):
-        return []
-    # Modo agressivo: não forçar analyze_uploaded_table.
-    # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
-    # O fallback para analyze_uploaded_table é tratado no handler de run_code
-    # quando houver erro/timeout.
+    # Compatibility no-op: routing is now handled by the LLM prompt + run_code fallback.
     return []
 
 
@@ -1070,12 +1156,7 @@ async def _extract_forced_uploaded_table_calls_async(
     conv_id: str,
     already_used: Optional[List[str]] = None,
 ) -> List[LLMToolCall]:
-    if not await _has_tabular_uploads_async(conv_id):
-        return []
-    # Modo agressivo: não forçar analyze_uploaded_table.
-    # A primeira tentativa deve ser run_code via decisão do LLM/prompt.
-    # O fallback para analyze_uploaded_table é tratado no handler de run_code
-    # quando houver erro/timeout.
+    # Compatibility no-op: routing is now handled by the LLM prompt + run_code fallback.
     return []
 
 
@@ -1126,8 +1207,8 @@ async def _persist_conversation(conv_id: str, partition_key: str) -> None:
                 "RowKey": conv_id,
                 "Messages": messages_json,
                 "Mode": meta.get("mode", "general"),
-                "CreatedAt": meta.get("created_at", datetime.now().isoformat()),
-                "UpdatedAt": datetime.now().isoformat(),
+                "CreatedAt": meta.get("created_at", datetime.now(timezone.utc).isoformat()),
+                "UpdatedAt": datetime.now(timezone.utc).isoformat(),
                 "MessageCount": len(compact),
             }
 
@@ -1472,14 +1553,7 @@ async def _execute_tool_calls(
             if PII_ENABLED:
                 try:
                     blob_ctx = PIIMaskingContext()
-                    serialized = json.dumps(tool_result, ensure_ascii=False, default=str)
-                    masked_serialized = await mask_pii(serialized, blob_ctx)
-                    try:
-                        blob_payload = json.loads(masked_serialized)
-                    except json.JSONDecodeError:
-                        # Placeholders can turn numeric JSON scalars into strings;
-                        # keep a masked serialized fallback rather than leaking PII.
-                        blob_payload = {"masked_content": masked_serialized}
+                    blob_payload = await _mask_pii_structured(tool_result, blob_ctx)
                 except Exception as mask_err:
                     logger.warning("[Agent] PII masking for blob failed (%s): %s", tc.name, mask_err)
                     # Never fall back to unmasked PII in blob storage.
@@ -1494,13 +1568,22 @@ async def _execute_tool_calls(
             json.dumps(tool_result, ensure_ascii=False, default=str)
         )
 
-        td = {
-            "tool": tc.name, "arguments": tc.arguments,
-            "result_summary": {
+        if isinstance(tool_result, dict):
+            result_summary = {
                 "total_count": tool_result.get("total_count", tool_result.get("total_results", tool_result.get("total_found", "N/A"))),
                 "items_returned": len(tool_result.get("items", tool_result.get("analysis_data", []))),
                 "has_error": "error" in tool_result,
-            },
+            }
+        else:
+            result_summary = {
+                "total_count": "N/A",
+                "items_returned": 0,
+                "has_error": False,
+            }
+
+        td = {
+            "tool": tc.name, "arguments": tc.arguments,
+            "result_summary": result_summary,
             "result_json": serialized_tool_result,
             "result_blob_ref": result_blob_ref,
         }
@@ -1523,7 +1606,7 @@ async def _execute_tool_calls(
 # =============================================================================
 
 async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse:
-    start = datetime.now()
+    start = datetime.now(timezone.utc)
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
@@ -1537,6 +1620,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
     export_idx = None
     should_persist = False
     tool_definitions = get_all_tool_definitions()
+    answer = "Não consegui processar a tua pergunta."
 
     async with await _get_conversation_lock(conv_id):
         await _ensure_conversation(conv_id, mode, partition_key)
@@ -1592,31 +1676,17 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                 iteration = 0
                 while iteration < AGENT_MAX_ITERATIONS:
                     current_calls = list(response.tool_calls or [])
-                    forced_uploaded_table = False
                     if not current_calls:
-                        forced_calls = await _extract_forced_uploaded_table_calls_async(
-                            request.question,
-                            conv_id,
-                            already_used=tools_used,
-                        )
-                        if forced_calls:
-                            forced_uploaded_table = True
-                            current_calls = forced_calls
-                            logger.info(
-                                "[Agent] forcing analyze_uploaded_table for uploaded tabular intent (conv=%s)",
-                                conv_id,
-                            )
-                            conversations[conv_id].append(_make_tool_calls_assistant_message(current_calls))
-                        else:
-                            break
+                        # Removed: forced table-analysis stubs.
+                        # Uploaded table routing is handled by the LLM prompt + run_code fallback.
+                        break
 
                     iteration += 1
 
                     # Add assistant message with tool calls to history
-                    if not forced_uploaded_table:
-                        conversations[conv_id].append(
-                            make_assistant_message_from_response(response)
-                        )
+                    conversations[conv_id].append(
+                        make_assistant_message_from_response(response)
+                    )
 
                     # Execute tools
                     tu, td = await _execute_tool_calls(
@@ -1660,7 +1730,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
             except Exception as e:
                 logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
-                answer = f"Erro: {str(e)}"
+                answer = "Ocorreu um erro inesperado. Por favor tenta novamente."
 
     if should_persist:
         try:
@@ -1669,7 +1739,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_sync_timeout_fallback")
     _record_token_quota(tier, total_usage)
     
-    total_time = int((datetime.now() - start).total_seconds() * 1000)
+    total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     
     return AgentChatResponse(
         answer=answer,
@@ -1691,7 +1761,7 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
 
 async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGenerator[str, None]:
     """SSE streaming — yields 'data: {json}\n\n' strings."""
-    start = datetime.now()
+    start = datetime.now(timezone.utc)
     mode = request.mode or "general"
     tier = request.model_tier or LLM_DEFAULT_TIER
     conv_id = request.conversation_id or str(uuid.uuid4())
@@ -1730,7 +1800,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 "has_exportable_data": False,
                 "export_index": None,
                 "tokens_used": {},
-                "total_time_ms": int((datetime.now() - start).total_seconds() * 1000),
+                "total_time_ms": int((datetime.now(timezone.utc) - start).total_seconds() * 1000),
                 "model_used": "",
                 "conversation_id": conv_id,
             })
@@ -1782,33 +1852,15 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                         total_usage[k] = total_usage.get(k, 0) + v
 
                 current_calls = list(response.tool_calls or [])
-                forced_uploaded_table = False
-                if not current_calls:
-                    forced_calls = await _extract_forced_uploaded_table_calls_async(
-                        request.question,
-                        conv_id,
-                        already_used=tools_used,
-                    )
-                    if forced_calls:
-                        forced_uploaded_table = True
-                        current_calls = forced_calls
-                        logger.info(
-                            "[Agent] forcing analyze_uploaded_table for uploaded tabular intent (stream conv=%s)",
-                            conv_id,
-                        )
-                        conversations[conv_id].append(_make_tool_calls_assistant_message(current_calls))
-
                 if current_calls:
                     # Add assistant msg with tool calls
-                    if not forced_uploaded_table:
-                        conversations[conv_id].append(
-                            make_assistant_message_from_response(response)
-                        )
+                    conversations[conv_id].append(
+                        make_assistant_message_from_response(response)
+                    )
 
                     # Signal tool execution
                     for tc in current_calls:
-                        suffix = " (forced)" if forced_uploaded_table else ""
-                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}{suffix}..."})
+                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
 
                     # Execute tools
                     tu, td = await _execute_tool_calls(
@@ -1886,7 +1938,8 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 should_persist = True
 
         except Exception as e:
-            yield _sse({"type": "error", "text": str(e)})
+            logger.error("[Agent] agent_chat_stream exception: %s", e, exc_info=True)
+            yield _sse({"type": "error", "text": "Ocorreu um erro inesperado. Por favor tenta novamente."})
 
     if should_persist:
         try:
@@ -1895,7 +1948,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
     _record_token_quota(tier, total_usage)
     
-    total_time = int((datetime.now() - start).total_seconds() * 1000)
+    total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
     has_exportable = False
     export_idx = None
     for idx, d in enumerate(tool_details):
@@ -1920,7 +1973,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
 # MODE SWITCHING
 # =============================================================================
 
-def switch_conversation_mode(conv_id: str, new_mode: str) -> bool:
+async def switch_conversation_mode(conv_id: str, new_mode: str) -> bool:
     """Muda o modo de uma conversa existente. Reinjecta system prompt."""
     if conv_id not in conversations:
         return False
@@ -1928,11 +1981,17 @@ def switch_conversation_mode(conv_id: str, new_mode: str) -> bool:
         return False
     
     sp = get_userstory_system_prompt() if new_mode == "userstory" else get_agent_system_prompt()
-    
-    # Replace first system message
-    new_msgs = [{"role": "system", "content": sp}]
-    new_msgs.extend(m for m in conversations[conv_id] if m.get("role") != "system")
-    conversations[conv_id] = new_msgs
-    conversation_meta.setdefault(conv_id, {})["mode"] = new_mode
+
+    async with await _get_conversation_lock(conv_id):
+        if conv_id not in conversations:
+            return False
+        new_msgs = [{"role": "system", "content": sp}]
+        new_msgs.extend(m for m in conversations[conv_id] if m.get("role") != "system")
+        conversations[conv_id] = new_msgs
+
+    async with _conversation_meta_lock:
+        meta = dict(conversation_meta.get(conv_id, {}))
+        meta["mode"] = new_mode
+        conversation_meta[conv_id] = meta
     
     return True

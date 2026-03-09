@@ -250,13 +250,27 @@ def _resolve_overlapping_entities(entities: list[dict]) -> list[dict]:
     return resolved
 
 
-def _span_overlaps_placeholders(offset: int, length: int, placeholder_spans: list[tuple[int, int]]) -> bool:
-    """Ignore Azure detections that hit placeholders created by local masking."""
-    end = offset + length
+def _get_non_overlapping_segments(
+    offset: int,
+    length: int,
+    placeholder_spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return the parts of an Azure span that remain outside local placeholders."""
+    segments = [(offset, offset + length)]
     for placeholder_start, placeholder_end in placeholder_spans:
-        if offset < placeholder_end and end > placeholder_start:
-            return True
-    return False
+        updated_segments: list[tuple[int, int]] = []
+        for start, end in segments:
+            if end <= placeholder_start or start >= placeholder_end:
+                updated_segments.append((start, end))
+                continue
+            if start < placeholder_start:
+                updated_segments.append((start, placeholder_start))
+            if end > placeholder_end:
+                updated_segments.append((placeholder_end, end))
+        segments = updated_segments
+        if not segments:
+            break
+    return segments
 
 
 def _new_placeholder_keys(previous_keys: set[str], context: PIIMaskingContext) -> list[str]:
@@ -376,9 +390,14 @@ async def mask_pii(text: str, context: PIIMaskingContext) -> str:
             length = int(entity.get("length", 0))
             if length <= 0:
                 continue
-            if _span_overlaps_placeholders(offset, length, placeholder_spans):
+            segments = _get_non_overlapping_segments(offset, length, placeholder_spans)
+            if not segments:
                 continue
-            filtered_entities.append(entity)
+            for seg_start, seg_end in segments:
+                seg_entity = dict(entity)
+                seg_entity["offset"] = seg_start
+                seg_entity["length"] = seg_end - seg_start
+                filtered_entities.append(seg_entity)
 
         if not filtered_entities:
             _log_pii_audit(

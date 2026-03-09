@@ -56,11 +56,17 @@ from tools_email import tool_prepare_outlook_draft, tool_classify_uploaded_email
 from tools_learning import tool_get_writer_profile, tool_save_writer_profile
 from structured_schemas import SCREENSHOT_USER_STORIES_SCHEMA
 from tabular_loader import TabularLoaderError, load_tabular_dataset, load_tabular_preview
+from data_dictionary import (
+    format_dictionary_for_prompt as format_data_dictionary_for_prompt,
+    get_dictionary as get_data_dictionary_entries,
+    save_mappings_batch,
+)
+from utils import odata_escape
 
 _devops_debug_log: deque = deque(maxlen=DEBUG_LOG_SIZE)
 def get_devops_debug_log(): return list(_devops_debug_log)
 def _log(msg):
-    _devops_debug_log.append({"ts": datetime.now().isoformat(), "msg": msg})
+    _devops_debug_log.append({"ts": datetime.now(timezone.utc).isoformat(), "msg": msg})
     logging.info("[Tools] %s", msg)
 
 _generated_files_store = {}
@@ -664,7 +670,7 @@ async def _resolve_uploaded_tabular_source(
     if not safe_conv:
         return {"error": "conv_id é obrigatório para analisar ficheiros carregados."}
 
-    odata_conv = safe_conv.replace("'", "''")
+    odata_conv = odata_escape(safe_conv)
     try:
         rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
     except Exception as exc:
@@ -1355,25 +1361,17 @@ def _build_uploaded_table_chart_spec(
     }
 
 
-def _build_uploaded_table_chart_code(filename: str, spec: dict, query: str) -> str:
-    payload = {
-        "filename": filename,
-        "spec": spec,
-        "query": query,
-    }
-    payload_json = json.dumps(payload, ensure_ascii=False)
-    return f"""
-import json
+_CHART_CODE_TEMPLATE = r"""import json
 import math
 from pathlib import Path
 
 import pandas as pd
 
-payload = json.loads({payload_json!r})
+payload = json.loads(__PAYLOAD_JSON__)
 spec = payload["spec"]
 query = payload.get("query", "")
 filename = payload["filename"]
-path = f"/mnt/data/{{filename}}"
+path = f"/mnt/data/{filename}"
 ext = Path(filename).suffix.lower()
 
 def load_frame(file_path, suffix):
@@ -1382,7 +1380,7 @@ def load_frame(file_path, suffix):
     if suffix == ".csv":
         return pd.read_csv(file_path, sep=None, engine="python", encoding_errors="replace")
     if suffix == ".tsv":
-        return pd.read_csv(file_path, sep="\\t", encoding_errors="replace")
+        return pd.read_csv(file_path, sep="\t", encoding_errors="replace")
     if suffix == ".xlsb":
         return pd.read_excel(file_path, engine="pyxlsb")
     return pd.read_excel(file_path)
@@ -1398,7 +1396,7 @@ def clip_points(frame, limit, date_like=False):
 
 def ensure_column(frame, column_name):
     if column_name and column_name not in frame.columns:
-        raise ValueError(f"Coluna '{{column_name}}' não encontrada no ficheiro.")
+        raise ValueError(f"Coluna '{column_name}' não encontrada no ficheiro.")
 
 def normalise_label(value):
     if value is None:
@@ -1444,11 +1442,11 @@ def render_bar_like_svg(labels, values, title, line_mode=False, _normalise_label
     if max_value == min_value:
         max_value = min_value + 1.0
     svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{{width}}" height="{{height}}" viewBox="0 0 {{width}} {{height}}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
-        f'<text x="{{padding_left}}" y="28" font-size="22" font-family="Arial" font-weight="bold">{{_xml_escape(title)}}</text>',
-        f'<line x1="{{padding_left}}" y1="{{padding_top}}" x2="{{padding_left}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
-        f'<line x1="{{padding_left}}" y1="{{padding_top + chart_height}}" x2="{{padding_left + chart_width}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+        f'<text x="{padding_left}" y="28" font-size="22" font-family="Arial" font-weight="bold">{_xml_escape(title)}</text>',
+        f'<line x1="{padding_left}" y1="{padding_top}" x2="{padding_left}" y2="{padding_top + chart_height}" stroke="#334155" stroke-width="1"/>',
+        f'<line x1="{padding_left}" y1="{padding_top + chart_height}" x2="{padding_left + chart_width}" y2="{padding_top + chart_height}" stroke="#334155" stroke-width="1"/>',
     ]
     if not values:
         svg.append('</svg>')
@@ -1465,14 +1463,14 @@ def render_bar_like_svg(labels, values, title, line_mode=False, _normalise_label
             bar_width = max(8, step * 0.7)
             bar_x = x - bar_width / 2
             bar_height = padding_top + chart_height - y
-            svg.append(f'<rect x="{{bar_x:.2f}}" y="{{y:.2f}}" width="{{bar_width:.2f}}" height="{{bar_height:.2f}}" fill="#2563eb" opacity="0.85"/>')
-        svg.append(f'<text x="{{label_x:.2f}}" y="{{padding_top + chart_height + 24}}" font-size="11" font-family="Arial" transform="rotate(35 {{label_x:.2f}} {{padding_top + chart_height + 24}})">{{_xml_escape(labels[idx][:28])}}</text>')
+            svg.append(f'<rect x="{bar_x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" height="{bar_height:.2f}" fill="#2563eb" opacity="0.85"/>')
+        svg.append(f'<text x="{label_x:.2f}" y="{padding_top + chart_height + 24}" font-size="11" font-family="Arial" transform="rotate(35 {label_x:.2f} {padding_top + chart_height + 24})">{_xml_escape(labels[idx][:28])}</text>')
     if line_mode:
-        path = " ".join(f"L {{x:.2f}} {{y:.2f}}" for x, y in points)
+        path = " ".join(f"L {x:.2f} {y:.2f}" for x, y in points)
         first_x, first_y = points[0]
-        svg.append(f'<path d="M {{first_x:.2f}} {{first_y:.2f}} {{path}}" fill="none" stroke="#2563eb" stroke-width="3"/>')
+        svg.append(f'<path d="M {first_x:.2f} {first_y:.2f} {path}" fill="none" stroke="#2563eb" stroke-width="3"/>')
         for x, y in points:
-            svg.append(f'<circle cx="{{x:.2f}}" cy="{{y:.2f}}" r="4" fill="#0f172a"/>')
+            svg.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="#0f172a"/>')
     svg.append('</svg>')
     return ''.join(svg)
 
@@ -1494,16 +1492,16 @@ def render_scatter_svg(xs, ys, title, _to_float_list=to_float_list, _xml_escape=
     if min_y == max_y:
         max_y = min_y + 1.0
     svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{{width}}" height="{{height}}" viewBox="0 0 {{width}} {{height}}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
-        f'<text x="{{padding_left}}" y="28" font-size="22" font-family="Arial" font-weight="bold">{{_xml_escape(title)}}</text>',
-        f'<line x1="{{padding_left}}" y1="{{padding_top}}" x2="{{padding_left}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
-        f'<line x1="{{padding_left}}" y1="{{padding_top + chart_height}}" x2="{{padding_left + chart_width}}" y2="{{padding_top + chart_height}}" stroke="#334155" stroke-width="1"/>',
+        f'<text x="{padding_left}" y="28" font-size="22" font-family="Arial" font-weight="bold">{_xml_escape(title)}</text>',
+        f'<line x1="{padding_left}" y1="{padding_top}" x2="{padding_left}" y2="{padding_top + chart_height}" stroke="#334155" stroke-width="1"/>',
+        f'<line x1="{padding_left}" y1="{padding_top + chart_height}" x2="{padding_left + chart_width}" y2="{padding_top + chart_height}" stroke="#334155" stroke-width="1"/>',
     ]
     for x_value, y_value in zip(xs, ys):
         px = padding_left + ((x_value - min_x) / (max_x - min_x)) * chart_width
         py = padding_top + chart_height - ((y_value - min_y) / (max_y - min_y)) * chart_height
-        svg.append(f'<circle cx="{{px:.2f}}" cy="{{py:.2f}}" r="4.5" fill="#2563eb" opacity="0.8"/>')
+        svg.append(f'<circle cx="{px:.2f}" cy="{py:.2f}" r="4.5" fill="#2563eb" opacity="0.8"/>')
     svg.append('</svg>')
     return ''.join(svg)
 
@@ -1528,7 +1526,7 @@ def render_histogram_svg(values, title, _to_float_list=to_float_list, _render_ba
             count = sum(1 for value in numeric if low <= value <= high)
         else:
             count = sum(1 for value in numeric if low <= value < high)
-        labels.append(f"{{low:.2f}}-{{high:.2f}}")
+        labels.append(f"{low:.2f}-{high:.2f}")
         counts.append(count)
     return _render_bar_like_svg(labels, counts, title)
 
@@ -1536,26 +1534,28 @@ def write_plotly_html(chart_payload, title, _xml_escape=xml_escape):
     import json
     from pathlib import Path
 
-    html_doc = f'''<!doctype html>
+    html_doc = '''<!doctype html>
 <html lang="pt">
 <head>
   <meta charset="utf-8" />
-  <title>{{_xml_escape(title)}}</title>
+  <title>__TITLE__</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-  <style>body {{{{ font-family: Arial, sans-serif; margin: 0; padding: 24px; background: #f8fafc; }}}} #chart {{{{ width: 100%; height: 78vh; }}}}</style>
+  <style>body { font-family: Arial, sans-serif; margin: 0; padding: 24px; background: #f8fafc; } #chart { width: 100%; height: 78vh; }</style>
 </head>
 <body>
   <div id="chart"></div>
   <script>
-    const payload = {{json.dumps(chart_payload, ensure_ascii=False)}};
-    Plotly.newPlot('chart', payload.data, payload.layout, {{{{responsive: true, displaylogo: false}}}});
+    const payload = __PLOTLY_PAYLOAD__;
+    Plotly.newPlot('chart', payload.data, payload.layout, {responsive: true, displaylogo: false});
   </script>
 </body>
 </html>'''
+    html_doc = html_doc.replace("__TITLE__", _xml_escape(title))
+    html_doc = html_doc.replace("__PLOTLY_PAYLOAD__", json.dumps(chart_payload, ensure_ascii=False))
     Path("uploaded_table_chart.html").write_text(html_doc, encoding="utf-8")
 
 df = load_frame(path, ext)
-df.columns = [str(col).strip() if str(col).strip() else f"Col{{idx + 1}}" for idx, col in enumerate(df.columns)]
+df.columns = [str(col).strip() if str(col).strip() else f"Col{idx + 1}" for idx, col in enumerate(df.columns)]
 for column in df.columns:
     if str(df[column].dtype) == "object":
         df[column] = df[column].map(lambda value: str(value).strip() if value is not None and str(value).strip() else None)
@@ -1578,9 +1578,9 @@ if x and x_kind == "date":
 if y:
     df[y] = pd.to_numeric(df[y], errors="coerce")
 
-title = query or f"{{chart_type.title()}} de {{filename}}"
+title = query or f"{chart_type.title()} de {filename}"
 plot_df = pd.DataFrame()
-chart_payload = {{"data": [], "layout": {{"title": title, "template": "plotly_white"}}}}
+chart_payload = {"data": [], "layout": {"title": title, "template": "plotly_white"} }
 svg_markup = ""
 
 if chart_type == "scatter":
@@ -1597,22 +1597,22 @@ if chart_type == "scatter":
     if series and series in plot_df.columns:
         traces = []
         for label, group in plot_df.groupby(series, dropna=False):
-            traces.append({{"type": "scatter", "mode": "markers", "name": normalise_label(label), "x": group[x].tolist(), "y": group[y].tolist()}})
+            traces.append({"type": "scatter", "mode": "markers", "name": normalise_label(label), "x": group[x].tolist(), "y": group[y].tolist()})
         chart_payload["data"] = traces
     else:
-        chart_payload["data"] = [{{"type": "scatter", "mode": "markers", "x": plot_df[x].tolist(), "y": plot_df[y].tolist(), "name": y}}]
-    chart_payload["layout"].update({{"xaxis": {{"title": x}}, "yaxis": {{"title": y}}}})
+        chart_payload["data"] = [{"type": "scatter", "mode": "markers", "x": plot_df[x].tolist(), "y": plot_df[y].tolist(), "name": y}]
+    chart_payload["layout"].update({"xaxis": {"title": x}, "yaxis": {"title": y} })
     svg_markup = render_scatter_svg(plot_df[x].tolist(), plot_df[y].tolist(), title)
 elif chart_type == "histogram":
     target = y or x
     if not target:
         raise ValueError("Histogram requer coluna numérica.")
-    plot_df = pd.DataFrame({{target: pd.to_numeric(df[target], errors="coerce")}}).dropna()
+    plot_df = pd.DataFrame({target: pd.to_numeric(df[target], errors="coerce")}).dropna()
     plot_df = clip_points(plot_df, max_points, date_like=False)
     if plot_df.empty:
         raise ValueError("Sem dados válidos para histogram.")
-    chart_payload["data"] = [{{"type": "histogram", "x": plot_df[target].tolist(), "name": target}}]
-    chart_payload["layout"].update({{"xaxis": {{"title": target}}, "yaxis": {{"title": "Frequência"}}}})
+    chart_payload["data"] = [{"type": "histogram", "x": plot_df[target].tolist(), "name": target}]
+    chart_payload["layout"].update({"xaxis": {"title": target}, "yaxis": {"title": "Frequência"} })
     svg_markup = render_histogram_svg(plot_df[target].tolist(), title)
 elif chart_type == "box":
     target = y or x
@@ -1625,8 +1625,8 @@ elif chart_type == "box":
     plot_df = clip_points(plot_df, max_points, date_like=False)
     if plot_df.empty:
         raise ValueError("Sem dados válidos para box plot.")
-    chart_payload["data"] = [{{"type": "box", "y": plot_df[target].tolist(), "name": target}}]
-    chart_payload["layout"].update({{"yaxis": {{"title": target}}}})
+    chart_payload["data"] = [{"type": "box", "y": plot_df[target].tolist(), "name": target}]
+    chart_payload["layout"].update({"yaxis": {"title": target} })
     svg_markup = render_histogram_svg(plot_df[target].tolist(), title)
 else:
     if not x:
@@ -1647,47 +1647,47 @@ else:
     if plot_df.empty:
         raise ValueError("Sem dados suficientes para o gráfico pedido.")
     if chart_type == "pie":
-        chart_payload["data"] = [{{"type": "pie", "labels": plot_df[x].astype(str).tolist(), "values": plot_df["value"].tolist(), "name": x}}]
+        chart_payload["data"] = [{"type": "pie", "labels": plot_df[x].astype(str).tolist(), "values": plot_df["value"].tolist(), "name": x}]
         svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title)
     elif chart_type == "line":
         if series and series in plot_df.columns:
             traces = []
             for label, group in plot_df.groupby(series, dropna=False):
                 ordered = group.sort_values(x) if x_kind == "date" else group
-                traces.append({{"type": "scatter", "mode": "lines+markers", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()}})
+                traces.append({"type": "scatter", "mode": "lines+markers", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()})
             chart_payload["data"] = traces
         else:
             ordered = plot_df.sort_values(x) if x_kind == "date" else plot_df
-            chart_payload["data"] = [{{"type": "scatter", "mode": "lines+markers", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}}]
+            chart_payload["data"] = [{"type": "scatter", "mode": "lines+markers", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}]
         svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title, line_mode=True)
     elif chart_type == "area":
         if series and series in plot_df.columns:
             traces = []
             for label, group in plot_df.groupby(series, dropna=False):
                 ordered = group.sort_values(x) if x_kind == "date" else group
-                traces.append({{"type": "scatter", "mode": "lines", "fill": "tozeroy", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()}})
+                traces.append({"type": "scatter", "mode": "lines", "fill": "tozeroy", "name": normalise_label(label), "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist()})
             chart_payload["data"] = traces
         else:
             ordered = plot_df.sort_values(x) if x_kind == "date" else plot_df
-            chart_payload["data"] = [{{"type": "scatter", "mode": "lines", "fill": "tozeroy", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}}]
+            chart_payload["data"] = [{"type": "scatter", "mode": "lines", "fill": "tozeroy", "x": ordered[x].astype(str).tolist(), "y": ordered["value"].tolist(), "name": "value"}]
         svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title, line_mode=True)
     else:
         if series and series in plot_df.columns:
             traces = []
             for label, group in plot_df.groupby(series, dropna=False):
-                traces.append({{"type": "bar", "name": normalise_label(label), "x": group[x].astype(str).tolist(), "y": group["value"].tolist()}})
+                traces.append({"type": "bar", "name": normalise_label(label), "x": group[x].astype(str).tolist(), "y": group["value"].tolist()})
             chart_payload["data"] = traces
             chart_payload["layout"]["barmode"] = "group"
         else:
-            chart_payload["data"] = [{{"type": "bar", "x": plot_df[x].astype(str).tolist(), "y": plot_df["value"].tolist(), "name": "value"}}]
+            chart_payload["data"] = [{"type": "bar", "x": plot_df[x].astype(str).tolist(), "y": plot_df["value"].tolist(), "name": "value"}]
         svg_markup = render_bar_like_svg(plot_df[x].astype(str).tolist(), plot_df["value"].tolist(), title)
-    chart_payload["layout"].update({{"xaxis": {{"title": x}}, "yaxis": {{"title": "value"}}}})
+    chart_payload["layout"].update({"xaxis": {"title": x}, "yaxis": {"title": "value"} })
 
 write_plotly_html(chart_payload, title)
 plot_df.to_csv("uploaded_table_chart_data.csv", index=False, encoding="utf-8-sig")
 Path("uploaded_table_chart.svg").write_text(svg_markup or render_bar_like_svg([], [], title), encoding="utf-8")
 
-summary = {{
+summary = {
     "chart_type": chart_type,
     "x_column": x,
     "y_column": y,
@@ -1695,9 +1695,18 @@ summary = {{
     "agg": agg,
     "rows_used": int(len(plot_df)),
     "source_rows": int(len(df)),
-}}
-print(json.dumps(summary, ensure_ascii=False))
-""".strip()
+}
+print(json.dumps(summary, ensure_ascii=False))""".strip()
+
+
+def _build_uploaded_table_chart_code(filename: str, spec: dict, query: str) -> str:
+    payload = {
+        "filename": filename,
+        "spec": spec,
+        "query": query,
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    return _CHART_CODE_TEMPLATE.replace("__PAYLOAD_JSON__", repr(payload_json))
 
 
 async def tool_chart_uploaded_table(
@@ -1779,6 +1788,51 @@ async def tool_chart_uploaded_table(
     return result
 
 
+async def tool_update_data_dictionary(
+    table_name: str = "",
+    pivot_column: str = "",
+    mappings: list | None = None,
+    conv_id: str = "",
+    user_sub: str = "",
+) -> dict:
+    _ = conv_id
+    safe_table = str(table_name or "").strip()
+    if not safe_table:
+        return {"error": "table_name é obrigatório."}
+    if not isinstance(mappings, list) or not mappings:
+        return {"error": "mappings é obrigatório (lista de mapeamentos)."}
+    saved_count = await save_mappings_batch(
+        safe_table,
+        mappings,
+        pivot_column=str(pivot_column or "").strip(),
+        updated_by=str(user_sub or "").strip(),
+    )
+    return {
+        "status": "ok",
+        "saved_count": int(saved_count),
+        "total_submitted": len(mappings),
+        "table_name": safe_table,
+        "pivot_column": str(pivot_column or "").strip(),
+    }
+
+
+async def tool_get_data_dictionary(table_name: str = "", conv_id: str = "", user_sub: str = "") -> dict:
+    _ = (conv_id, user_sub)
+    safe_table = str(table_name or "").strip()
+    if not safe_table:
+        return {"error": "table_name é obrigatório."}
+    entries = await get_data_dictionary_entries(safe_table)
+    if not entries:
+        return {"status": "empty", "message": f"Sem dicionário para '{safe_table}'."}
+    return {
+        "status": "ok",
+        "table_name": safe_table,
+        "entries_count": len(entries),
+        "formatted": format_data_dictionary_for_prompt(entries, table_name=safe_table),
+        "entries": entries,
+    }
+
+
 async def _load_uploaded_files_for_code(
     conv_id: str,
     user_sub: str = "",
@@ -1791,7 +1845,7 @@ async def _load_uploaded_files_for_code(
     if not safe_conv:
         return {}
 
-    odata_conv = safe_conv.replace("'", "''")
+    odata_conv = odata_escape(safe_conv)
     try:
         rows = await table_query("UploadIndex", f"PartitionKey eq '{odata_conv}'", top=max(1, min(UPLOAD_INDEX_TOP, 500)))
     except Exception as e:
@@ -2149,6 +2203,52 @@ _BUILTIN_TOOL_DEFINITIONS = [
     {"type":"function","function":{"name":"run_code","description":"Executa código Python em sandbox seguro para cálculos, análise de dados, manipulação de CSV/Excel e geração de gráficos/ficheiros. Usa quando o pedido exigir computação programática que outras tools não cobrem.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Código Python a executar. Usa print() para output textual. Para gráficos matplotlib, usa plt.show(). Ficheiros guardados no diretório atual serão devolvidos para download."},"description":{"type":"string","description":"Descrição breve do objetivo do código (auditoria/log)."},"filename":{"type":"string","description":"Nome do ficheiro carregado a montar no sandbox (opcional; por omissão usa os mais recentes da conversa)."},"conv_id":{"type":"string","description":"ID da conversa (preenchido automaticamente pelo agente)."},"user_sub":{"type":"string","description":"Sub do utilizador para filtrar uploads da conversa (interno)."}},"required":["code"]}}},
     {"type":"function","function":{"name":"prepare_outlook_draft","description":"Prepara um rascunho para Outlook quando o utilizador aprovar o texto de um email. Gera pack descarregável com .eml, payload JSON e script PowerShell para abrir compose no Outlook já preenchido.","parameters":{"type":"object","properties":{"subject":{"type":"string","description":"Assunto final do email."},"body":{"type":"string","description":"Corpos final do email, em texto ou HTML."},"to":{"type":"string","description":"Destinatários separados por ';'."},"cc":{"type":"string","description":"CC separados por ';'."},"bcc":{"type":"string","description":"BCC separados por ';'."},"body_format":{"type":"string","enum":["html","text"],"description":"Formato do body. Default: html."},"attachments":{"type":"array","items":{"type":"string"},"description":"Paths locais opcionais para anexar quando o .ps1 for executado no Windows."}},"required":["subject","body"]}}},
     {"type":"function","function":{"name":"classify_uploaded_emails","description":"Classifica emails de um CSV/Excel carregado usando critérios dados pelo utilizador no momento e devolve pack pronto para Outlook (XLSX, CSV, JSON e PowerShell de aplicação por EntryID). Usa quando o utilizador pedir triagem, labels, flags, categorias, urgência ou pastas no Outlook.","parameters":{"type":"object","properties":{"instructions":{"type":"string","description":"Critérios e regras de classificação dados pelo utilizador."},"conv_id":{"type":"string","description":"ID da conversa com o ficheiro carregado. Preenchido automaticamente."},"filename":{"type":"string","description":"Nome do ficheiro a usar, se houver vários uploads."},"label_actions":{"type":"array","description":"Lista de labels permitidas e ação Outlook associada.","items":{"type":"object","properties":{"label":{"type":"string"},"action_type":{"type":"string","enum":["move","flag","category","none"]},"target":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"batch_size":{"type":"integer","description":"Tamanho do batch por chamada de classificação. Default: 20."}},"required":["instructions"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "update_data_dictionary",
+            "description": "Guarda mapeamentos de negócio para colunas genéricas de um dataset polimórfico. Usa quando o utilizador explicar o significado de campo_N, field_N ou valores lookup/pivot.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "Nome do ficheiro ou tabela (ex: Tbl_Contact_Detail)"},
+                    "pivot_column": {"type": "string", "description": "Coluna pivot que muda o significado dos campos genéricos (ex: transaction_Id)"},
+                    "mappings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "pivot_value": {"type": "string", "description": "Valor do pivot (ex: '871') ou '__global__'"},
+                                "column_name": {"type": "string", "description": "Nome original da coluna (ex: campo_1)"},
+                                "mapped_name": {"type": "string", "description": "Nome de negócio (ex: session_id)"},
+                                "description": {"type": "string", "description": "Descrição livre do significado"},
+                                "data_type": {"type": "string", "description": "Tipo: uuid, numeric, date, boolean, text, base64_encoded"},
+                            },
+                            "required": ["column_name", "mapped_name"],
+                        },
+                    },
+                    "conv_id": {"type": "string", "description": "ID da conversa (autopreenchido)."},
+                    "user_sub": {"type": "string", "description": "Sub do utilizador (autopreenchido)."},
+                },
+                "required": ["table_name", "mappings"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_data_dictionary",
+            "description": "Consulta o dicionário de dados para um ficheiro/tabela. Usa antes de analisar datasets polimórficos para traduzir colunas genéricas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "Nome do ficheiro ou tabela (ex: Tbl_Contact_Detail)"},
+                    "conv_id": {"type": "string", "description": "ID da conversa (autopreenchido)."},
+                },
+                "required": ["table_name"],
+            },
+        },
+    },
     {"type":"function","function":{"name":"generate_file","description":"Gera ficheiro para download (CSV, XLSX, PDF, DOCX, HTML) quando o utilizador pedir explicitamente para gerar/descarregar ficheiro com dados.","parameters":{"type":"object","properties":{"format":{"type":"string","enum":["csv","xlsx","pdf","docx","html"],"description":"Formato do ficheiro a gerar."},"title":{"type":"string","description":"Título/nome base do ficheiro."},"data":{"type":"array","items":{"type":"object"},"description":"Linhas de dados (array de objetos)."},"columns":{"type":"array","items":{"type":"string"},"description":"Headers/ordem das colunas no ficheiro."}},"required":["format","title","data","columns"]}}},
 ]
 
@@ -2271,6 +2371,18 @@ def _tool_dispatch() -> dict:
             arguments.get("filename", ""),
             arguments.get("label_actions"),
             arguments.get("batch_size", 20),
+        ),
+        "update_data_dictionary": lambda arguments: tool_update_data_dictionary(
+            arguments.get("table_name", ""),
+            arguments.get("pivot_column", ""),
+            arguments.get("mappings"),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
+        ),
+        "get_data_dictionary": lambda arguments: tool_get_data_dictionary(
+            arguments.get("table_name", ""),
+            arguments.get("conv_id", ""),
+            arguments.get("user_sub", ""),
         ),
         "generate_file": lambda arguments: tool_generate_file(
             arguments.get("format", "csv"),
@@ -2482,6 +2594,14 @@ def get_agent_system_prompt():
         gate_priority_hints.append(
             "- Se o utilizador pedir triagem/classificação de emails a partir de CSV/Excel carregado para flags/pastas/categorias Outlook, usa classify_uploaded_emails."
         )
+    if has_tool("update_data_dictionary"):
+        gate_priority_hints.append(
+            "- Se o utilizador explicar o significado de colunas genéricas (campo_N, field_N) ou valores de lookup/pivot, usa update_data_dictionary para guardar o mapeamento."
+        )
+    if has_tool("get_data_dictionary"):
+        gate_priority_hints.append(
+            "- Antes de analisar um dataset polimórfico, usa get_data_dictionary para consultar mapeamentos conhecidos."
+        )
     if figma_enabled:
         gate_priority_hints.append(
             "- Se o utilizador mencionar Figma, design, mockup, ecras UI ou prototipos, usa search_figma (nao responder diretamente)."
@@ -2596,6 +2716,19 @@ def get_agent_system_prompt():
             "   REGRA: Usa sempre o ficheiro carregado da conversa; não inventes EntryIDs nem ações fora das labels permitidas."
         )
         next_rule += 1
+    if has_tool("update_data_dictionary") and has_tool("get_data_dictionary"):
+        routing_rules.append(
+            f"{next_rule}. Para DADOS POLIMÓRFICOS (campo_N/field_N cujo significado muda por pivot) -> segue este fluxo\n"
+            "   a) Primeiro usa get_data_dictionary para ver se já há mapeamentos conhecidos.\n"
+            "   b) Se o utilizador explicar significados, usa update_data_dictionary para guardar.\n"
+            "   c) Para analisar, SEMPRE filtra por pivot value antes de interpretar campos genéricos.\n"
+            "   d) Usa run_code para a análise final — é a tool mais flexível para datasets polimórficos.\n"
+            "   e) Renomeia campos genéricos usando o dicionário antes de apresentar resultados.\n"
+            "   f) NUNCA mistures dados de pivot values diferentes na mesma interpretação.\n"
+            "   g) Apresenta resultados por tipo/pivot value.\n"
+            "   h) Se não existir dicionário, mostra o perfil polimórfico e pede contexto ao utilizador."
+        )
+        next_rule += 1
     if figma_enabled:
         routing_rules.append(
             f"{next_rule}. Para DESIGN, MOCKUPS, ECRAS UI e PROTOTIPOS FIGMA -> usa search_figma (OBRIGATORIO)\n"
@@ -2672,6 +2805,14 @@ def get_agent_system_prompt():
     if has_tool("classify_uploaded_emails"):
         usage_examples.append(
             "- \"Analisa o CSV de emails e marca os urgentes no Outlook\" -> classify_uploaded_emails"
+        )
+    if has_tool("update_data_dictionary") and has_tool("get_data_dictionary"):
+        usage_examples.extend(
+            [
+                "- \"Neste ficheiro, transaction_Id 871 significa login e campo_1 é session_id\" -> update_data_dictionary",
+                "- \"Consulta o dicionário deste dataset antes de analisar\" -> get_data_dictionary",
+                "- \"Analisa este dataset polimórfico por transaction_Id\" -> get_data_dictionary DEPOIS run_code",
+            ]
         )
     usage_examples_text = "\n".join(usage_examples)
 
