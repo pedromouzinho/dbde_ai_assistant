@@ -60,6 +60,13 @@ ANTHROPIC_MODEL_OPUS = _get_env("ANTHROPIC_MODEL_OPUS", "claude-opus-4-6")
 ANTHROPIC_MODEL_SONNET = _get_env("ANTHROPIC_MODEL_SONNET", "claude-sonnet-4-6")
 ANTHROPIC_MODEL_HAIKU = _get_env("ANTHROPIC_MODEL_HAIKU", "claude-haiku-4-5-20251001")
 
+
+def _default_standard_tier() -> str:
+    """Prefer Claude Sonnet when Anthropic/Foundry is configured."""
+    if ANTHROPIC_FOUNDRY_RESOURCE or ANTHROPIC_API_KEY:
+        return "anthropic:sonnet"
+    return "azure_openai:gpt-5-mini-dz"
+
 # =============================================================================
 # LLM PROVIDER CONFIG
 # =============================================================================
@@ -69,10 +76,10 @@ LLM_DEFAULT_TIER = _get_env("LLM_DEFAULT_TIER", "standard")
 # Mapping de tiers para providers+modelos
 # Formato: "provider:deployment_name" — o provider resolve internamente
 # DataZone deployments (*-dz): dados ficam na EU (Sweden Central) + Abuse Monitoring Opt-Out activo
-# Pro usa Claude Opus 4.6 via Anthropic — PII Shield mascara antes de enviar
-# NOTA: Para Pro funcionar requer ANTHROPIC_API_KEY ou ANTHROPIC_FOUNDRY_RESOURCE em App Settings
+# Standard prefere Claude Sonnet 4.6 quando Anthropic/Foundry estiver configurado.
+# Pro usa Claude Opus 4.6 via Anthropic — PII Shield mascara antes de enviar.
 LLM_TIER_FAST = _get_env("LLM_TIER_FAST", "azure_openai:gpt-4-1-dz")          # DataZone, gpt-4.1, 87 TPM
-LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", "azure_openai:gpt-5-mini-dz") # DataZone, gpt-5-mini, 30 TPM
+LLM_TIER_STANDARD = _get_env("LLM_TIER_STANDARD", _default_standard_tier())
 LLM_TIER_PRO = _get_env("LLM_TIER_PRO", "anthropic:opus")                      # Claude Opus 4.6
 LLM_TIER_VISION = _get_env("LLM_TIER_VISION", "azure_openai:gpt-4-1-dz")      # DataZone, multimodal
 VISION_ENABLED = _get_env("VISION_ENABLED", "true").lower() == "true"

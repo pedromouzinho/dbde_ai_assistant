@@ -70,6 +70,7 @@ _TOOLS_NEEDING_CONV_CONTEXT = {
     "update_data_dictionary",
     "get_data_dictionary",
 }
+_PENDING_POLYMORPHIC_SELECTION_KEY = "pending_polymorphic_selection"
 
 
 class ConversationStore(MutableMapping[str, List[dict]]):
@@ -419,6 +420,14 @@ async def _update_conversation_meta(conv_id: str, **updates) -> None:
         conversation_meta[conv_id] = meta
 
 
+async def _remove_conversation_meta_key(conv_id: str, key: str) -> None:
+    async with _conversation_meta_lock:
+        meta = dict(conversation_meta.get(conv_id, {}))
+        if key in meta:
+            meta.pop(key, None)
+            conversation_meta[conv_id] = meta
+
+
 def _normalize_uploaded_files_entry_unlocked(conv_id: str) -> dict:
     current = uploaded_files_store.get(conv_id)
     if isinstance(current, dict) and isinstance(current.get("files"), list):
@@ -583,9 +592,14 @@ def _extract_request_images(request: AgentChatRequest) -> List[dict]:
     return extracted
 
 
-async def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] = None) -> dict:
+async def _build_user_message(
+    request: AgentChatRequest,
+    conv_id: Optional[str] = None,
+    question_override: Optional[str] = None,
+) -> dict:
     """Constrói a mensagem do user (texto puro ou multimodal com 1..MAX_IMAGES_PER_INPUT imagens)."""
     images = _extract_request_images(request)
+    question_text = str(question_override or request.question)
 
     # Fallback: usar imagem previamente carregada via /upload nesta conversa.
     if not images and conv_id:
@@ -604,9 +618,9 @@ async def _build_user_message(request: AgentChatRequest, conv_id: Optional[str] 
         images = uploaded_images[:MAX_IMAGES_PER_INPUT]
 
     if not images:
-        return {"role": "user", "content": request.question}
+        return {"role": "user", "content": question_text}
 
-    content_blocks: List[dict] = [{"type": "text", "text": request.question}]
+    content_blocks: List[dict] = [{"type": "text", "text": question_text}]
     if len(images) == 2:
         content_blocks.append(
             {"type": "text", "text": "Contexto visual: Imagem 1 = ANTES; Imagem 2 = DEPOIS."}
@@ -649,7 +663,7 @@ async def _inject_file_context(conv_id: str, messages: List[dict]):
             "Analisa TODOS os ficheiros listados antes de responder. Não ignores nenhum.",
             "Quando existir secção 'ESTATÍSTICAS COMPLETAS', usa SEMPRE esses valores para min/max/mean/std; "
             "não recalcules a partir da amostra truncada.",
-            "Para pedidos de gráfico sobre ficheiros carregados, usa generate_chart com os dados fornecidos; "
+            "Para pedidos de gráfico sobre ficheiros carregados, usa chart_uploaded_table como primeira tentativa; "
             "se faltar coluna/agregação, pede clarificação objetiva ao utilizador.",
         ]
 
@@ -867,14 +881,14 @@ async def _build_llm_messages(
 
     # Injeta conteúdo multimodal apenas na cópia efémera para evitar bloat no histórico real.
     if request:
-        user_msg = await _build_user_message(request, conv_id=conv_id)
+        user_msg = await _build_user_message(request, conv_id=conv_id, question_override=question)
         if isinstance(user_msg.get("content"), list):
             replaced = False
             for idx in range(len(base) - 1, -1, -1):
                 msg = base[idx]
                 if msg.get("role") != "user":
                     continue
-                if isinstance(msg.get("content"), str) and msg.get("content") == request.question:
+                if isinstance(msg.get("content"), str) and msg.get("content") == question:
                     base[idx] = user_msg
                     replaced = True
                     break
@@ -1017,6 +1031,125 @@ def _normalize_request_text(value: str) -> str:
     clean = clean.replace("|", " ").replace("—", " ").replace("-", " ").replace("_", " ")
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean
+
+
+async def _latest_polymorphic_upload_context(conv_id: str) -> Dict[str, Any]:
+    for file_data in reversed(await _get_uploaded_files_async(conv_id)):
+        schema = file_data.get("polymorphic_schema")
+        if not isinstance(schema, dict) or not schema.get("is_polymorphic"):
+            continue
+        pivot_profiles = schema.get("pivot_profiles") if isinstance(schema.get("pivot_profiles"), dict) else {}
+        available_values = [
+            str(value or "").strip()
+            for value in pivot_profiles.keys()
+            if str(value or "").strip()
+        ]
+        if not available_values:
+            continue
+        return {
+            "table_name": str(file_data.get("filename", "") or "").strip(),
+            "pivot_column": str(schema.get("pivot_column", "") or "").strip(),
+            "available_values": available_values,
+        }
+    return {}
+
+
+def _extract_polymorphic_selection_reply(question: str, pending: Dict[str, Any]) -> str:
+    raw = str(question or "").strip()
+    if not raw:
+        return ""
+    available_values = [
+        str(value or "").strip()
+        for value in (pending.get("available_values") or [])
+        if str(value or "").strip()
+    ]
+    if not available_values:
+        return ""
+
+    allowed_map = {value: value for value in available_values}
+    if raw in allowed_map:
+        return raw
+
+    norm = _normalize_request_text(raw)
+    pivot_norm = _normalize_request_text(str(pending.get("pivot_column", "") or ""))
+    for value in available_values:
+        value_norm = _normalize_request_text(value)
+        if norm == value_norm:
+            return value
+        if pivot_norm and re.fullmatch(rf"{re.escape(pivot_norm)}\s*=?\s*{re.escape(value_norm)}", norm):
+            return value
+        if len(norm.split()) <= 6 and re.search(rf"\b{re.escape(value_norm)}\b", norm):
+            return value
+    return ""
+
+
+async def _prepare_polymorphic_followup_question(conv_id: str, question: str) -> tuple[str, str]:
+    meta = await _get_conversation_meta(conv_id)
+    pending = meta.get(_PENDING_POLYMORPHIC_SELECTION_KEY)
+    if not isinstance(pending, dict) or not pending:
+        return str(question or ""), ""
+
+    selected = _extract_polymorphic_selection_reply(question, pending)
+    if selected:
+        await _remove_conversation_meta_key(conv_id, _PENDING_POLYMORPHIC_SELECTION_KEY)
+        pivot_column = str(pending.get("pivot_column", "") or "pivot").strip() or "pivot"
+        table_name = str(pending.get("table_name", "") or "ficheiro carregado").strip() or "ficheiro carregado"
+        original_question = str(pending.get("original_question", "") or "Analisa o dataset polimórfico").strip()
+        rewritten = (
+            f"{original_question}\n\n"
+            f"Confirmação do utilizador: respondeu '{str(question or '').strip()}'. "
+            f"Considera apenas o ficheiro '{table_name}' e o valor {pivot_column}={selected}. "
+            "Usa o dicionário de dados conhecido, se existir, e responde com os nomes mapeados."
+        )
+        return rewritten, ""
+
+    norm = _normalize_request_text(question)
+    if norm and len(norm.split()) <= 4:
+        pivot_column = str(pending.get("pivot_column", "") or "pivot").strip() or "pivot"
+        options = ", ".join(str(value) for value in (pending.get("available_values") or [])[:12])
+        return "", f"Estou à espera de um valor de {pivot_column}. Escolhe um destes: {options}."
+
+    await _remove_conversation_meta_key(conv_id, _PENDING_POLYMORPHIC_SELECTION_KEY)
+    return str(question or ""), ""
+
+
+async def _refresh_polymorphic_pending_state(conv_id: str, question: str, answer: str) -> None:
+    context = await _latest_polymorphic_upload_context(conv_id)
+    available_values = [
+        str(value or "").strip()
+        for value in (context.get("available_values") or [])
+        if str(value or "").strip()
+    ]
+    if len(available_values) < 2 or not str(answer or "").strip():
+        await _remove_conversation_meta_key(conv_id, _PENDING_POLYMORPHIC_SELECTION_KEY)
+        return
+
+    norm_answer = _normalize_request_text(answer)
+    pivot_norm = _normalize_request_text(str(context.get("pivot_column", "") or ""))
+    mentioned_values = [
+        value
+        for value in available_values
+        if re.search(rf"\b{re.escape(_normalize_request_text(value))}\b", norm_answer)
+    ]
+    asks_choice = any(
+        marker in norm_answer
+        for marker in ("qual", "quais", "indica", "escolhe", "seleciona", "selecciona", "diz me")
+    )
+    if asks_choice and (pivot_norm in norm_answer or len(mentioned_values) >= 2):
+        await _update_conversation_meta(
+            conv_id,
+            **{
+                _PENDING_POLYMORPHIC_SELECTION_KEY: {
+                    "table_name": context.get("table_name", ""),
+                    "pivot_column": context.get("pivot_column", ""),
+                    "available_values": available_values,
+                    "original_question": str(question or "").strip(),
+                }
+            },
+        )
+        return
+
+    await _remove_conversation_meta_key(conv_id, _PENDING_POLYMORPHIC_SELECTION_KEY)
 
 
 def _canonicalize_area_path(area_hint: str) -> str:
@@ -1626,88 +1759,44 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         await _inject_file_context(conv_id, conversations[conv_id])
+        effective_question, pending_reply = await _prepare_polymorphic_followup_question(conv_id, request.question)
 
-        conversations[conv_id].append({"role": "user", "content": request.question})
+        conversations[conv_id].append({"role": "user", "content": request.question if pending_reply else effective_question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
-        quota_reason = _check_token_quota(tier, conv_id)
-        if quota_reason:
-            answer = (
-                f"⚠️ Limite de utilização do tier atingido: {quota_reason}. "
-                "Tenta novamente mais tarde ou muda de tier."
-            )
+        if pending_reply:
+            answer = pending_reply
             conversations[conv_id].append({"role": "assistant", "content": answer})
             should_persist = True
         else:
-            try:
-                forced_tu, forced_td = await _run_forced_dual_hierarchy(
-                    request.question,
-                    conv_id,
-                    user_sub=str((user or {}).get("sub", "") or ""),
+            quota_reason = _check_token_quota(tier, conv_id)
+            if quota_reason:
+                answer = (
+                    f"⚠️ Limite de utilização do tier atingido: {quota_reason}. "
+                    "Tenta novamente mais tarde ou muda de tier."
                 )
-                if forced_td:
-                    tools_used.extend(forced_tu)
-                    tool_details.extend(forced_td)
-                    batch_start = len(tool_details) - len(forced_td)
-                    for local_idx, d in enumerate(forced_td):
-                        if d["result_summary"].get("items_returned", 0) > 0:
-                            has_exportable = True
-                            export_idx = batch_start + local_idx
-
-                # Agent loop
-                ephemeral = await _build_llm_messages(
-                    conv_id,
-                    request.question,
-                    request=request,
-                    tier=tier,
-                    tools_list=tool_definitions,
-                )
-                response = await asyncio.wait_for(
-                    llm_with_fallback(
-                        ephemeral, tools=tool_definitions, tier=tier,
-                        temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-                    ),
-                    timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
-                )
-                _log_fallback_chain_if_needed(response)
-                model_used = response.model
-                total_usage = response.usage
-
-                iteration = 0
-                while iteration < AGENT_MAX_ITERATIONS:
-                    current_calls = list(response.tool_calls or [])
-                    if not current_calls:
-                        # Removed: forced table-analysis stubs.
-                        # Uploaded table routing is handled by the LLM prompt + run_code fallback.
-                        break
-
-                    iteration += 1
-
-                    # Add assistant message with tool calls to history
-                    conversations[conv_id].append(
-                        make_assistant_message_from_response(response)
-                    )
-
-                    # Execute tools
-                    tu, td = await _execute_tool_calls(
-                        current_calls,
+                conversations[conv_id].append({"role": "assistant", "content": answer})
+                should_persist = True
+            else:
+                try:
+                    forced_tu, forced_td = await _run_forced_dual_hierarchy(
+                        effective_question,
                         conv_id,
                         user_sub=str((user or {}).get("sub", "") or ""),
                     )
-                    tools_used.extend(tu)
-                    tool_details.extend(td)
+                    if forced_td:
+                        tools_used.extend(forced_tu)
+                        tool_details.extend(forced_td)
+                        batch_start = len(tool_details) - len(forced_td)
+                        for local_idx, d in enumerate(forced_td):
+                            if d["result_summary"].get("items_returned", 0) > 0:
+                                has_exportable = True
+                                export_idx = batch_start + local_idx
 
-                    # Check for exportable data
-                    batch_start = len(tool_details) - len(td)
-                    for local_idx, d in enumerate(td):
-                        if d["result_summary"].get("items_returned", 0) > 0:
-                            has_exportable = True
-                            export_idx = batch_start + local_idx
-
-                    # Next LLM call
+                    # Agent loop
                     ephemeral = await _build_llm_messages(
                         conv_id,
-                        request.question,
+                        effective_question,
                         request=request,
                         tier=tier,
                         tools_list=tool_definitions,
@@ -1720,17 +1809,68 @@ async def agent_chat(request: AgentChatRequest, user: dict) -> AgentChatResponse
                         timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
                     )
                     _log_fallback_chain_if_needed(response)
-                    for k, v in response.usage.items():
-                        if isinstance(v, (int, float)):
-                            total_usage[k] = total_usage.get(k, 0) + v
+                    model_used = response.model
+                    total_usage = response.usage
 
-                answer = response.content or "Não consegui processar a tua pergunta."
-                conversations[conv_id].append({"role": "assistant", "content": answer})
-                should_persist = True
+                    iteration = 0
+                    while iteration < AGENT_MAX_ITERATIONS:
+                        current_calls = list(response.tool_calls or [])
+                        if not current_calls:
+                            # Removed: forced table-analysis stubs.
+                            # Uploaded table routing is handled by the LLM prompt + run_code fallback.
+                            break
 
-            except Exception as e:
-                logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
-                answer = "Ocorreu um erro inesperado. Por favor tenta novamente."
+                        iteration += 1
+
+                        # Add assistant message with tool calls to history
+                        conversations[conv_id].append(
+                            make_assistant_message_from_response(response)
+                        )
+
+                        # Execute tools
+                        tu, td = await _execute_tool_calls(
+                            current_calls,
+                            conv_id,
+                            user_sub=str((user or {}).get("sub", "") or ""),
+                        )
+                        tools_used.extend(tu)
+                        tool_details.extend(td)
+
+                        # Check for exportable data
+                        batch_start = len(tool_details) - len(td)
+                        for local_idx, d in enumerate(td):
+                            if d["result_summary"].get("items_returned", 0) > 0:
+                                has_exportable = True
+                                export_idx = batch_start + local_idx
+
+                        # Next LLM call
+                        ephemeral = await _build_llm_messages(
+                            conv_id,
+                            effective_question,
+                            request=request,
+                            tier=tier,
+                            tools_list=tool_definitions,
+                        )
+                        response = await asyncio.wait_for(
+                            llm_with_fallback(
+                                ephemeral, tools=tool_definitions, tier=tier,
+                                temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                            ),
+                            timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
+                        )
+                        _log_fallback_chain_if_needed(response)
+                        for k, v in response.usage.items():
+                            if isinstance(v, (int, float)):
+                                total_usage[k] = total_usage.get(k, 0) + v
+
+                    answer = response.content or "Não consegui processar a tua pergunta."
+                    await _refresh_polymorphic_pending_state(conv_id, effective_question, answer)
+                    conversations[conv_id].append({"role": "assistant", "content": answer})
+                    should_persist = True
+
+                except Exception as e:
+                    logger.error("[Agent] agent_chat exception: %s", e, exc_info=True)
+                    answer = "Ocorreu um erro inesperado. Por favor tenta novamente."
 
     if should_persist:
         try:
@@ -1772,6 +1912,7 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
     total_usage = {}
     model_used = ""
     should_persist = False
+    stream_completed = False
     tool_definitions = get_all_tool_definitions()
     
     def _sse(event: dict) -> str:
@@ -1781,18 +1922,18 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
         await _ensure_conversation(conv_id, mode, partition_key)
         await _ensure_uploaded_files_loaded(conv_id, user_sub=str((user or {}).get("sub", "") or ""))
         await _inject_file_context(conv_id, conversations[conv_id])
-        conversations[conv_id].append({"role": "user", "content": request.question})
+        effective_question, pending_reply = await _prepare_polymorphic_followup_question(conv_id, request.question)
+        conversations[conv_id].append({"role": "user", "content": request.question if pending_reply else effective_question})
         conversations[conv_id] = _trim_history(conversations[conv_id])
 
         # Emit conversation_id immediately
         yield _sse({"type": "init", "conversation_id": conv_id, "mode": mode})
 
-        quota_reason = _check_token_quota(tier, conv_id)
-        if quota_reason:
-            yield _sse({
-                "type": "error",
-                "text": f"Limite de utilização do tier atingido: {quota_reason}.",
-            })
+        if pending_reply:
+            conversations[conv_id].append({"role": "assistant", "content": pending_reply})
+            should_persist = True
+            yield _sse({"type": "token", "text": pending_reply})
+            total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
             yield _sse({
                 "type": "done",
                 "tools_used": [],
@@ -1800,152 +1941,176 @@ async def agent_chat_stream(request: AgentChatRequest, user: dict) -> AsyncGener
                 "has_exportable_data": False,
                 "export_index": None,
                 "tokens_used": {},
-                "total_time_ms": int((datetime.now(timezone.utc) - start).total_seconds() * 1000),
+                "total_time_ms": total_time,
                 "model_used": "",
                 "conversation_id": conv_id,
             })
-            return
+            stream_completed = True
+        else:
+            quota_reason = _check_token_quota(tier, conv_id)
+            if quota_reason:
+                yield _sse({
+                    "type": "error",
+                    "text": f"Limite de utilização do tier atingido: {quota_reason}.",
+                })
+                yield _sse({
+                    "type": "done",
+                    "tools_used": [],
+                    "tool_details": [],
+                    "has_exportable_data": False,
+                    "export_index": None,
+                    "tokens_used": {},
+                    "total_time_ms": int((datetime.now(timezone.utc) - start).total_seconds() * 1000),
+                    "model_used": "",
+                    "conversation_id": conv_id,
+                })
+                return
 
-        try:
-            forced_tu, forced_td = await _run_forced_dual_hierarchy(
-                request.question,
-                conv_id,
-                user_sub=str((user or {}).get("sub", "") or ""),
-            )
-            if forced_td:
-                tools_used.extend(forced_tu)
-                tool_details.extend(forced_td)
-                for d in forced_td:
-                    yield _sse({"type": "tool_start", "tool": d["tool"], "text": f"🔍 {d['tool']} (forced)..."})
-                    count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
-                    yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
-
-            provider = get_provider(tier)
-            model_used = getattr(provider, 'model', getattr(provider, 'deployment', ''))
-
-            iteration = 0
-            need_final_response = True
-
-            while iteration <= AGENT_MAX_ITERATIONS and need_final_response:
-                iteration += 1
-
-                yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
-
-                # Non-streaming call for tool detection
-                ephemeral = await _build_llm_messages(
+            try:
+                forced_tu, forced_td = await _run_forced_dual_hierarchy(
+                    effective_question,
                     conv_id,
-                    request.question,
-                    request=request,
-                    tier=tier,
-                    tools_list=tool_definitions,
+                    user_sub=str((user or {}).get("sub", "") or ""),
                 )
-                response = await asyncio.wait_for(
-                    llm_with_fallback(
-                        ephemeral, tools=tool_definitions, tier=tier,
-                        temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
-                    ),
-                    timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
-                )
-                _log_fallback_chain_if_needed(response)
-                for k, v in response.usage.items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
-
-                current_calls = list(response.tool_calls or [])
-                if current_calls:
-                    # Add assistant msg with tool calls
-                    conversations[conv_id].append(
-                        make_assistant_message_from_response(response)
-                    )
-
-                    # Signal tool execution
-                    for tc in current_calls:
-                        yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
-
-                    # Execute tools
-                    tu, td = await _execute_tool_calls(
-                        current_calls,
-                        conv_id,
-                        user_sub=str((user or {}).get("sub", "") or ""),
-                    )
-                    tools_used.extend(tu)
-                    tool_details.extend(td)
-
-                    for d in td:
+                if forced_td:
+                    tools_used.extend(forced_tu)
+                    tool_details.extend(forced_td)
+                    for d in forced_td:
+                        yield _sse({"type": "tool_start", "tool": d["tool"], "text": f"🔍 {d['tool']} (forced)..."})
                         count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
                         yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
 
-                    # Continue loop for next LLM call
-                    need_final_response = True
-                else:
-                    # Final text response — stream token by token
-                    need_final_response = False
+                provider = get_provider(tier)
+                model_used = getattr(provider, 'model', getattr(provider, 'deployment', ''))
 
-                    if response.content:
-                        # Response já obtida via non-streaming (necessário para tool detection).
-                        yield _sse({"type": "token", "text": response.content})
-                        conversations[conv_id].append({"role": "assistant", "content": response.content})
-                        should_persist = True
-                    elif not response.tool_calls:
-                        ttft_start = time.perf_counter()
-                        ttft_logged = False
-                        stream_content = ""
-                        try:
-                            stream_ephemeral = await _build_llm_messages(
-                                conv_id,
-                                request.question,
-                                request=request,
-                                tier=tier,
-                                tools_list=None,
-                            )
-                            async for event in llm_stream_with_fallback(
-                                stream_ephemeral,
-                                tools=None,
-                                tier=tier,
-                                temperature=AGENT_TEMPERATURE,
-                                max_tokens=AGENT_MAX_TOKENS,
-                            ):
-                                if event.type == "token" and event.text:
-                                    if not ttft_logged:
-                                        ttft_ms = int((time.perf_counter() - ttft_start) * 1000)
-                                        logger.info("[Agent] TTFT=%dms conv=%s", ttft_ms, conv_id)
-                                        ttft_logged = True
-                                    stream_content += event.text
-                                    yield _sse({"type": "token", "text": event.text})
-                                elif event.type == "done":
-                                    done_data = event.data or {}
-                                    if isinstance(done_data, dict):
-                                        for k, v in (done_data.get("usage", {}) or {}).items():
-                                            if isinstance(v, (int, float)):
-                                                total_usage[k] = total_usage.get(k, 0) + v
-                        except Exception as stream_err:
-                            logger.warning("[Agent] streaming fallback to static: %s", stream_err)
-                            if not stream_content:
-                                stream_content = "Não consegui processar a tua pergunta."
-                                yield _sse({"type": "token", "text": stream_content})
+                iteration = 0
+                need_final_response = True
 
-                        if stream_content:
-                            conversations[conv_id].append({"role": "assistant", "content": stream_content})
+                while iteration <= AGENT_MAX_ITERATIONS and need_final_response:
+                    iteration += 1
+
+                    yield _sse({"type": "thinking", "text": "A analisar..." if iteration == 1 else "A processar resultados..."})
+
+                    # Non-streaming call for tool detection
+                    ephemeral = await _build_llm_messages(
+                        conv_id,
+                        effective_question,
+                        request=request,
+                        tier=tier,
+                        tools_list=tool_definitions,
+                    )
+                    response = await asyncio.wait_for(
+                        llm_with_fallback(
+                            ephemeral, tools=tool_definitions, tier=tier,
+                            temperature=AGENT_TEMPERATURE, max_tokens=AGENT_MAX_TOKENS,
+                        ),
+                        timeout=_AGENT_LLM_STEP_TIMEOUT_SECONDS,
+                    )
+                    _log_fallback_chain_if_needed(response)
+                    for k, v in response.usage.items():
+                        if isinstance(v, (int, float)):
+                            total_usage[k] = total_usage.get(k, 0) + v
+
+                    current_calls = list(response.tool_calls or [])
+                    if current_calls:
+                        # Add assistant msg with tool calls
+                        conversations[conv_id].append(
+                            make_assistant_message_from_response(response)
+                        )
+
+                        # Signal tool execution
+                        for tc in current_calls:
+                            yield _sse({"type": "tool_start", "tool": tc.name, "text": f"🔍 {tc.name}..."})
+
+                        # Execute tools
+                        tu, td = await _execute_tool_calls(
+                            current_calls,
+                            conv_id,
+                            user_sub=str((user or {}).get("sub", "") or ""),
+                        )
+                        tools_used.extend(tu)
+                        tool_details.extend(td)
+
+                        for d in td:
+                            count = d["result_summary"].get("total_count", d["result_summary"].get("items_returned", ""))
+                            yield _sse({"type": "tool_result", "tool": d["tool"], "text": f"✅ {d['tool']}: {count} resultados"})
+
+                        # Continue loop for next LLM call
+                        need_final_response = True
+                    else:
+                        # Final text response — stream token by token
+                        need_final_response = False
+
+                        if response.content:
+                            # Response já obtida via non-streaming (necessário para tool detection).
+                            yield _sse({"type": "token", "text": response.content})
+                            await _refresh_polymorphic_pending_state(conv_id, effective_question, response.content)
+                            conversations[conv_id].append({"role": "assistant", "content": response.content})
                             should_persist = True
-                        else:
-                            yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
+                        elif not response.tool_calls:
+                            ttft_start = time.perf_counter()
+                            ttft_logged = False
+                            stream_content = ""
+                            try:
+                                stream_ephemeral = await _build_llm_messages(
+                                    conv_id,
+                                    effective_question,
+                                    request=request,
+                                    tier=tier,
+                                    tools_list=None,
+                                )
+                                async for event in llm_stream_with_fallback(
+                                    stream_ephemeral,
+                                    tools=None,
+                                    tier=tier,
+                                    temperature=AGENT_TEMPERATURE,
+                                    max_tokens=AGENT_MAX_TOKENS,
+                                ):
+                                    if event.type == "token" and event.text:
+                                        if not ttft_logged:
+                                            ttft_ms = int((time.perf_counter() - ttft_start) * 1000)
+                                            logger.info("[Agent] TTFT=%dms conv=%s", ttft_ms, conv_id)
+                                            ttft_logged = True
+                                        stream_content += event.text
+                                        yield _sse({"type": "token", "text": event.text})
+                                    elif event.type == "done":
+                                        done_data = event.data or {}
+                                        if isinstance(done_data, dict):
+                                            for k, v in (done_data.get("usage", {}) or {}).items():
+                                                if isinstance(v, (int, float)):
+                                                    total_usage[k] = total_usage.get(k, 0) + v
+                            except Exception as stream_err:
+                                logger.warning("[Agent] streaming fallback to static: %s", stream_err)
+                                if not stream_content:
+                                    stream_content = "Não consegui processar a tua pergunta."
+                                    yield _sse({"type": "token", "text": stream_content})
 
-            if need_final_response:
-                # Garantir sempre resposta textual quando o loop atinge limite de iterações.
-                fallback_text = _fallback_answer_from_tool_details(tool_details)
-                yield _sse({"type": "token", "text": fallback_text})
-                conversations[conv_id].append({"role": "assistant", "content": fallback_text})
-                should_persist = True
+                            if stream_content:
+                                await _refresh_polymorphic_pending_state(conv_id, effective_question, stream_content)
+                                conversations[conv_id].append({"role": "assistant", "content": stream_content})
+                                should_persist = True
+                            else:
+                                yield _sse({"type": "token", "text": "Não consegui processar a tua pergunta."})
 
-        except Exception as e:
-            logger.error("[Agent] agent_chat_stream exception: %s", e, exc_info=True)
-            yield _sse({"type": "error", "text": "Ocorreu um erro inesperado. Por favor tenta novamente."})
+                if need_final_response:
+                    # Garantir sempre resposta textual quando o loop atinge limite de iterações.
+                    fallback_text = _fallback_answer_from_tool_details(tool_details)
+                    yield _sse({"type": "token", "text": fallback_text})
+                    await _refresh_polymorphic_pending_state(conv_id, effective_question, fallback_text)
+                    conversations[conv_id].append({"role": "assistant", "content": fallback_text})
+                    should_persist = True
+
+            except Exception as e:
+                logger.error("[Agent] agent_chat_stream exception: %s", e, exc_info=True)
+                yield _sse({"type": "error", "text": "Ocorreu um erro inesperado. Por favor tenta novamente."})
 
     if should_persist:
         try:
             await asyncio.wait_for(_persist_conversation(conv_id, partition_key), timeout=8.0)
         except Exception:
             _create_logged_task(_persist_conversation(conv_id, partition_key), "persist_conversation_stream_timeout_fallback")
+    if stream_completed:
+        return
     _record_token_quota(tier, total_usage)
     
     total_time = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)

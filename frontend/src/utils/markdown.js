@@ -16,7 +16,7 @@ function renderInlineMarkdown(rawText) {
 
   let html = escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])((https?:\/\/[^\s<)]+))/g, (_, prefix, url) => {
+    .replace(/(^|[\s(])((?:https?:\/\/|\/api\/)[^\s<)]+)/g, (_, prefix, url) => {
       const safeHref = sanitizeLinkUrl(url);
       if (!safeHref) return `${prefix}${url}`;
       return `${prefix}<a href="${escapeHtml(safeHref)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;

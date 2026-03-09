@@ -96,7 +96,7 @@
 | PII Shield Phase 2 — tool output masking | 2026-03-07 | Masking em `role=tool`, blob PII protection, Brave query masking, shared httpx client, audit logging. PR #4. |
 | Feature activation — RERANK + WEB_SEARCH | 2026-03-07 | `RERANK_ENABLED=true`, `WEB_SEARCH_ENABLED=true`, `XDT_BaseExtensions=~1`. |
 | Token quotas restauradas | 2026-03-07 | Fast 500K/5M, Standard 200K/2M, Pro 100K/1M (anteriormente 0,0 = ilimitado). |
-| Model tiers configurados | 2026-03-07 | gpt-4.1 (fast), gpt-5-mini (standard), Claude Opus 4.6 (pro). |
+| Model tiers configurados | 2026-03-07 | gpt-4.1 (fast), Claude Sonnet 4.6 via Azure Foundry (standard), Claude Opus 4.6 (pro). |
 | Log Analytics workspace criado | 2026-03-07 | `dbde-ai-logs` em Sweden Central, 90 dias retencao. Workspace anterior (DefaultResourceGroup-SEC) estava orfao. |
 | Dependency scanning CI | 2026-03-07 | `pip-audit` (Python) + `npm audit --audit-level=high` (frontend) adicionados ao GitHub Actions. Commit `4677fc3`. |
 | Concurrency locks implementation | 2026-03-07 | 17 race conditions corrigidas em agent.py + llm_provider.py. 12 tests novos. PR #5 merged. |
