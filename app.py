@@ -130,7 +130,7 @@ from http_helpers import devops_request_with_retry as _devops_request_with_retry
 from tools_knowledge import _close_http_client as _close_knowledge_client
 from tools_figma import _close_http_client as _close_figma_client
 from tools_miro import _close_http_client as _close_miro_client
-from pii_shield import close_http_client as _close_pii_http_client
+from pii_shield import close_http_client as _close_pii_http_client, _regex_pre_mask, PIIMaskingContext
 from tool_registry import get_registered_tool_names
 from learning import invalidate_prompt_rules_cache
 from agent import (
@@ -700,7 +700,7 @@ def _render_chat_html(messages: list, title: str) -> str:
     body {{ font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif; background:#f6f7fb; color:#1f2937; margin:0; }}
     .wrap {{ max-width: 980px; margin: 24px auto; padding: 0 16px; }}
     .header {{ background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:16px 18px; margin-bottom:16px; }}
-    .title {{ margin:0; font-size:20px; color:{EXPORT_BRAND_COLOR}; }}
+    .title {{ margin:0; font-size:20px; color:{html.escape(EXPORT_BRAND_COLOR)}; }}
     .meta {{ margin-top:6px; font-size:12px; color:#6b7280; }}
     .chat {{ display:flex; flex-direction:column; gap:12px; }}
     .msg-row {{ max-width:80%; border-radius:14px; padding:10px 12px; border:1px solid #e5e7eb; background:#fff; }}
@@ -1170,7 +1170,8 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
 async def log_audit(user_id, action, question="", tools_used=None, tokens=None, duration_ms=0):
     try:
         ts = datetime.now(timezone.utc)
-        await table_insert("AuditLog", {"PartitionKey":ts.strftime("%Y-%m"),"RowKey":f"{ts.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}","UserId":user_id or "anon","Action":action,"Question":(question or "")[:500],"ToolsUsed":",".join(tools_used) if tools_used else "","TotalTokens":tokens.get("total_tokens",0) if tokens else 0,"DurationMs":duration_ms,"Timestamp":ts.isoformat()})
+        masked_question = _regex_pre_mask(question or "", PIIMaskingContext())
+        await table_insert("AuditLog", {"PartitionKey":ts.strftime("%Y-%m"),"RowKey":f"{ts.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}","UserId":user_id or "anon","Action":action,"Question":(masked_question or "")[:500],"ToolsUsed":",".join(tools_used) if tools_used else "","TotalTokens":tokens.get("total_tokens",0) if tokens else 0,"DurationMs":duration_ms,"Timestamp":ts.isoformat()})
     except Exception as e:
         logger.error("[App] log_audit failed: %s", e)
 
@@ -3139,6 +3140,9 @@ async def change_password(request: Request, payload: ChangePasswordRequest, cred
 async def admin_reset_password(request: Request, username: str, payload: LoginRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
+    safe_username = odata_escape(username)
+    existing = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
+    if not existing: raise HTTPException(404, "Utilizador não encontrado")
     await table_merge("Users", {"PartitionKey":"user","RowKey":username,"PasswordHash":hash_password(payload.password)})
     invalidate_user_tokens(username)
     return {"status":"ok"}

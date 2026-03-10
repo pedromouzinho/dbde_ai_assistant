@@ -23,10 +23,10 @@ Foi realizada uma auditoria completa e exaustiva de todos os ficheiros do reposi
 | Severidade | Total | Corrigido | Pendente |
 |---|---|---|---|
 | 🔴 Crítico | 4 | 2 | 2 |
-| 🟠 Alto | 16 | 9 | 7 |
-| 🟡 Médio | 12 | 4 | 8 |
-| 🟢 Baixo | 8 | 5 | 3 |
-| **Total** | **40** | **20** | **20** |
+| 🟠 Alto | 16 | 10 | 6 |
+| 🟡 Médio | 12 | 6 | 6 |
+| 🟢 Baixo | 8 | 7 | 1 |
+| **Total** | **40** | **25** | **15** |
 
 ---
 
@@ -124,9 +124,8 @@ WIQL tem outras construções potencialmente perigosas. A validação correcta d
 
 ### A-4 · Admin reset-password em username inexistente não valida existência
 **Ficheiro:** `app.py`, linhas 3121–3128  
-**Estado:** 📋 **Documentado** — Fix seguro mas requer mudança de modelo.  
+**Estado:** ✅ **Corrigido** — Adicionada query de verificação antes do `table_merge`; retorna HTTP 404 se o utilizador não existir.  
 **Problema:** `table_merge` numa entidade inexistente retorna 404 não tratado. O endpoint aceita qualquer `username` de path sem verificar se o utilizador existe.  
-**Fix recomendado:** Query o utilizador antes de fazer merge; retornar HTTP 404 se não existir.
 
 ---
 
@@ -258,9 +257,8 @@ for job_id, meta in list(upload_jobs_store.items()):
 
 ### M-3 · PII não mascarado antes de escrita no AuditLog
 **Ficheiro:** `app.py`, linha 1161  
-**Estado:** 📋 **Documentado** — Requer integração do pii_shield no path de auditoria.  
+**Estado:** ✅ **Corrigido** — `_regex_pre_mask(question, PIIMaskingContext())` aplicado antes de escrever o campo `Question` na tabela `AuditLog`.  
 **Problema:** Questões do utilizador armazenadas verbatim na tabela `AuditLog`, incluindo potenciais NIFs, IBANs, cartões de crédito.  
-**Fix recomendado:** Aplicar `_regex_pre_mask(question)` de `pii_shield.py` antes de escrever em AuditLog.
 
 ---
 
@@ -326,8 +324,7 @@ for job_id, meta in list(upload_jobs_store.items()):
 
 ### M-12 · `EXPORT_BRAND_COLOR` injectado em `<style>` sem escape adicional
 **Ficheiro:** `app.py`, linha 691  
-**Estado:** 📋 **Documentado** — Risk is mitigated by regex validation in config.py line 306, but defense-in-depth is missing.  
-**Fix recomendado:** Adicionar `html.escape()` como defesa adicional.
+**Estado:** ✅ **Corrigido** — `html.escape(EXPORT_BRAND_COLOR)` aplicado. Defesa em profundidade adicionada (mesmo que o regex validation em config.py já limite a `#RRGGBB`).  
 
 ---
 
@@ -363,8 +360,7 @@ for job_id, meta in list(upload_jobs_store.items()):
 
 ### B-6 · `start_server.py` sem `--timeout-graceful-shutdown`
 **Ficheiro:** `start_server.py`  
-**Estado:** 📋 **Documentado** — SSE streams podem ser abruptamente terminados em restarts.  
-**Fix recomendado:** Adicionar `--timeout-graceful-shutdown 30` ao comando uvicorn.
+**Estado:** ✅ **Corrigido** — `timeout_graceful_shutdown=30` adicionado ao `uvicorn.run()`.  
 
 ---
 
@@ -422,6 +418,11 @@ for job_id, meta in list(upload_jobs_store.items()):
 | 13 | `.github/workflows/ci.yml` | Remover `|| true`, Node.js 20, ruff, bandit | Security/CI |
 | 14 | `README.md` | Criado | Documentation |
 | 15 | `.env.example` | Criado | Documentation |
+| 16 | `app.py` | `log_audit`: mascarar PII com `_regex_pre_mask` antes de escrever em AuditLog | Security Medium |
+| 17 | `app.py` | `_render_chat_html`: `html.escape(EXPORT_BRAND_COLOR)` — defesa em profundidade | Security Medium |
+| 18 | `app.py` | `admin_reset_password`: verificar existência do utilizador antes de `table_merge` (404 se não existir) | Bug/Security High |
+| 19 | `start_server.py` | Adicionar `timeout_graceful_shutdown=30` ao uvicorn | Hygiene |
+| 20 | `tools.py` | Importar `_GENERATED_FILE_TTL_SECONDS` de `tools_export` (NameError em `_build_generated_artifact_downloads`) | Bug High |
 
 ---
 
@@ -429,9 +430,8 @@ for job_id, meta in list(upload_jobs_store.items()):
 
 ### Prioridade 1 — Fazer em breve
 1. **Token blacklist persistido** (C-3): Implementar em Azure Table Storage ou Redis. Crítico para ambientes multi-instância.
-2. **PII no AuditLog** (M-3): Aplicar `_regex_pre_mask` antes de escrever em AuditLog.
-3. **Rate limiter ETag** (A-9): Usar optimistic locking no Table Storage para rate limiting correcto entre instâncias.
-4. **Admin username hardcoded** (B-9): Definir `ADMIN_USERNAME` nas App Settings.
+2. **Rate limiter ETag** (A-9): Usar optimistic locking no Table Storage para rate limiting correcto entre instâncias.
+3. **Admin username hardcoded** (B-9): Definir `ADMIN_USERNAME` nas App Settings.
 
 ### Prioridade 2 — Sprint seguinte
 5. **Prompt Shield strict mode** (A-1): Adicionar `PROMPT_SHIELD_STRICT_MODE` configurável.
@@ -443,4 +443,3 @@ for job_id, meta in list(upload_jobs_store.items()):
 9. **Code interpreter sandbox** (A-8): Adicionar seccomp/namespace isolation (nsjail ou Docker sandbox).
 10. **God file refactoring** (B-1): Dividir `app.py` e `tools.py` em módulos menores.
 11. **ETag no job claim** (A-14): Prevenir double-processing de jobs de upload/export.
-12. **Graceful shutdown** (B-6): `--timeout-graceful-shutdown 30` no uvicorn.

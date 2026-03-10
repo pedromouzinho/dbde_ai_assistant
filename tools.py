@@ -53,7 +53,7 @@ from tools_devops import (
 )
 from tools_knowledge import tool_search_workitems, tool_search_website, tool_search_web
 from tools_upload import tool_search_uploaded_document
-from tools_export import tool_generate_chart, tool_generate_file, _store_generated_file, get_generated_file
+from tools_export import tool_generate_chart, tool_generate_file, _store_generated_file, get_generated_file, _GENERATED_FILE_TTL_SECONDS
 from tools_email import tool_prepare_outlook_draft, tool_classify_uploaded_emails
 from tools_learning import tool_get_writer_profile, tool_save_writer_profile
 from structured_schemas import SCREENSHOT_USER_STORIES_SCHEMA
