@@ -829,6 +829,7 @@ async def _load_conversation_from_storage(conv_id: str, partition_key: str) -> b
             conv_id,
             {
                 "mode": stored_mode,
+                "user_sub": partition_key,
                 "created_at": row.get("CreatedAt", datetime.now(timezone.utc).isoformat()),
                 "loaded_from_storage": True,
             },
@@ -853,7 +854,7 @@ async def _ensure_conversation(conv_id: str, mode: str, partition_key: str) -> s
             conversations[conv_id] = [{"role": "system", "content": sp}]
             await _set_conversation_meta(
                 conv_id,
-                {"mode": mode, "created_at": datetime.now(timezone.utc).isoformat()},
+                {"mode": mode, "user_sub": partition_key, "created_at": datetime.now(timezone.utc).isoformat()},
             )
     else:
         conversations.touch(conv_id)

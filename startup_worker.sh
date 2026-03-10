@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 cd /home/site/wwwroot
 export PYTHONPATH=/home/site/wwwroot:/home/site/wwwroot/antenv/lib/python3.12/site-packages:$PYTHONPATH
 echo "Starting DBDE upload worker..."

@@ -130,7 +130,7 @@ from http_helpers import devops_request_with_retry as _devops_request_with_retry
 from tools_knowledge import _close_http_client as _close_knowledge_client
 from tools_figma import _close_http_client as _close_figma_client
 from tools_miro import _close_http_client as _close_miro_client
-from pii_shield import close_http_client as _close_pii_http_client
+from pii_shield import close_http_client as _close_pii_http_client, _regex_pre_mask, PIIMaskingContext
 from tool_registry import get_registered_tool_names
 from learning import invalidate_prompt_rules_cache
 from agent import (
@@ -173,12 +173,17 @@ UPLOAD_WORKER_PID_FILE = os.getenv("UPLOAD_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/
 EXPORT_WORKER_PID_FILE = os.getenv("EXPORT_WORKER_PID_FILE", f"{WORKER_RUN_DIR}/export-worker.pid")
 _inline_worker_task: Optional[asyncio.Task] = None
 _inline_export_worker_task: Optional[asyncio.Task] = None
+_CONV_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 
 
 def _client_ip(request: Request) -> str:
+    # Use the rightmost entry in X-Forwarded-For: that is what the nearest trusted
+    # proxy (Azure Front Door / App Service) appended and cannot be spoofed by the client.
     xff = (request.headers.get("x-forwarded-for") or "").strip()
     if xff:
-        return xff.split(",")[0].strip() or "unknown"
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1] or "unknown"
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
@@ -555,6 +560,14 @@ async def _resolve_export_payload(export_request: ExportRequest, user: dict) -> 
             raise HTTPException(400, "Conversa não indicada para export.")
 
         messages = conversations.get(conv_id, [])
+        if messages:
+            # Verify ownership: ensure this in-memory conversation belongs to the requesting user.
+            current_user_sub = str((user or {}).get("sub") or "")
+            is_admin = (user or {}).get("role") == "admin"
+            if current_user_sub and not is_admin:
+                owner_sub = str(conversation_meta.get(conv_id, {}).get("user_sub") or "")
+                if owner_sub and owner_sub != current_user_sub:
+                    messages = []
         if not messages:
             messages = await _load_conversation_messages_for_export(conv_id, user)
         if not messages:
@@ -687,7 +700,7 @@ def _render_chat_html(messages: list, title: str) -> str:
     body {{ font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif; background:#f6f7fb; color:#1f2937; margin:0; }}
     .wrap {{ max-width: 980px; margin: 24px auto; padding: 0 16px; }}
     .header {{ background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:16px 18px; margin-bottom:16px; }}
-    .title {{ margin:0; font-size:20px; color:{EXPORT_BRAND_COLOR}; }}
+    .title {{ margin:0; font-size:20px; color:{html.escape(EXPORT_BRAND_COLOR)}; }}
     .meta {{ margin-top:6px; font-size:12px; color:#6b7280; }}
     .chat {{ display:flex; flex-direction:column; gap:12px; }}
     .msg-row {{ max-width:80%; border-radius:14px; padding:10px 12px; border:1px solid #e5e7eb; background:#fff; }}
@@ -1157,7 +1170,8 @@ async def _index_example(example_id, question, answer, rating, tools_used=None, 
 async def log_audit(user_id, action, question="", tools_used=None, tokens=None, duration_ms=0):
     try:
         ts = datetime.now(timezone.utc)
-        await table_insert("AuditLog", {"PartitionKey":ts.strftime("%Y-%m"),"RowKey":f"{ts.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}","UserId":user_id or "anon","Action":action,"Question":(question or "")[:500],"ToolsUsed":",".join(tools_used) if tools_used else "","TotalTokens":tokens.get("total_tokens",0) if tokens else 0,"DurationMs":duration_ms,"Timestamp":ts.isoformat()})
+        masked_question = _regex_pre_mask(question or "", PIIMaskingContext())
+        await table_insert("AuditLog", {"PartitionKey":ts.strftime("%Y-%m"),"RowKey":f"{ts.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}","UserId":user_id or "anon","Action":action,"Question":(masked_question or "")[:500],"ToolsUsed":",".join(tools_used) if tools_used else "","TotalTokens":tokens.get("total_tokens",0) if tokens else 0,"DurationMs":duration_ms,"Timestamp":ts.isoformat()})
     except Exception as e:
         logger.error("[App] log_audit failed: %s", e)
 
@@ -1346,7 +1360,7 @@ async def _append_uploaded_entry_safe(conv_id: str, store_entry: dict) -> list:
 def _cleanup_upload_jobs() -> None:
     now = datetime.now(timezone.utc)
     expired = []
-    for job_id, meta in upload_jobs_store.items():
+    for job_id, meta in list(upload_jobs_store.items()):
         updated_at = meta.get("updated_at", meta.get("created_at"))
         if not updated_at:
             continue
@@ -2901,6 +2915,9 @@ async def export_chat(request: Request, credentials: HTTPAuthorizationCredential
     format_type = str(body.get("format", "html") or "html").strip().lower()
     title = str(body.get("title", "Chat Export") or "Chat Export")
 
+    if format_type not in {"html", "pdf"}:
+        return JSONResponse({"error": f"Formato inválido: {format_type!r}. Válidos: html, pdf"}, status_code=400)
+
     if not isinstance(messages, list) or not messages:
         return JSONResponse({"error": "Sem mensagens para exportar"}, status_code=400)
 
@@ -3123,6 +3140,9 @@ async def change_password(request: Request, payload: ChangePasswordRequest, cred
 async def admin_reset_password(request: Request, username: str, payload: LoginRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
     if user.get("role") != "admin": raise HTTPException(403, "Apenas admins")
+    safe_username = odata_escape(username)
+    existing = await table_query("Users", f"PartitionKey eq 'user' and RowKey eq '{safe_username}'", top=1)
+    if not existing: raise HTTPException(404, "Utilizador não encontrado")
     await table_merge("Users", {"PartitionKey":"user","RowKey":username,"PasswordHash":hash_password(payload.password)})
     invalidate_user_tokens(username)
     return {"status":"ok"}
@@ -3215,6 +3235,8 @@ async def list_chats(request: Request, user_id: str, credentials: HTTPAuthorizat
 @limiter.limit("60/minute", key_func=_user_or_ip_rate_key)
 async def get_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
+    if not _CONV_ID_RE.match(conversation_id):
+        raise HTTPException(400, "conversation_id inválido")
     uid = user.get("sub") if user.get("role")!="admin" else user_id
     safe_uid = odata_escape(uid)
     safe_conv = odata_escape(conversation_id)
@@ -3226,6 +3248,8 @@ async def get_chat(request: Request, user_id: str, conversation_id: str, credent
 @limiter.limit("30/minute", key_func=_user_or_ip_rate_key)
 async def delete_chat(request: Request, user_id: str, conversation_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
     user = get_current_user(credentials)
+    if not _CONV_ID_RE.match(conversation_id):
+        raise HTTPException(400, "conversation_id inválido")
     uid = user.get("sub") if user.get("role")!="admin" else user_id
     await table_delete("ChatHistory", uid, conversation_id)
     return {"status":"ok"}

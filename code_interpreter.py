@@ -76,6 +76,7 @@ _BLOCKED_ATTR_CALLS = {
     "os.system", "os.popen", "os.remove", "os.unlink", "os.rmdir",
     "shutil.rmtree", "shutil.move", "shutil.copy", "subprocess.Popen",
     "subprocess.run", "subprocess.call", "pathlib.Path.unlink", "pathlib.Path.rmdir",
+    "time.sleep",
 }
 
 

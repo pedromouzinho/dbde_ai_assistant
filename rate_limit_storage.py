@@ -92,6 +92,8 @@ class TableStorageRateLimit:
     def cleanup_local_cache(self):
         """Remove janelas antigas do cache local."""
         now = time.time()
-        expired = [k for k in self._local_cache if float(k.rsplit(":", 1)[-1]) < now - 300]
+        # Use a snapshot of keys to avoid mutation-during-iteration race conditions.
+        snapshot = list(self._local_cache.keys())
+        expired = [k for k in snapshot if float(k.rsplit(":", 1)[-1]) < now - 300]
         for k in expired:
             self._local_cache.pop(k, None)

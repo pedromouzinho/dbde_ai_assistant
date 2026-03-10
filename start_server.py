@@ -6,4 +6,4 @@ if os.path.exists(site_pkg):
 sys.path.insert(0, os.path.dirname(__file__))
 
 import uvicorn
-uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=1)
+uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=1, timeout_graceful_shutdown=30)
